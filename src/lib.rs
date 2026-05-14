@@ -8,3 +8,4 @@ pub mod error;
 pub mod io;
 pub mod pixel;
 pub mod tms;
+pub mod warp;
