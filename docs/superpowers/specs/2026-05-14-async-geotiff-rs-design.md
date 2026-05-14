@@ -13,6 +13,13 @@ rendered on the fly with styling controlled by URL query parameters.
 Non-goals (v0): mosaic of multiple COGs, persistent tile cache, vector overlays,
 QML/SLD/JSON style files, MBTiles output.
 
+**No GDAL.** This project is pure Rust + the `libproj` C library (optional,
+feature-gated). All raster IO goes through `async-tiff`; all reprojection
+goes through `proj`; all affine math goes through `raffine`. No `gdal` crate
+binding, no GDAL system dependency, no rasterio/WarpedVRT analogue.
+References to "GDAL_NODATA" in this document name a literal TIFF tag in the
+GeoTIFF spec, parsed by async-tiff — not a GDAL dependency.
+
 ## 2. Scope (MVP)
 
 In scope:
@@ -21,7 +28,7 @@ In scope:
   provided by the `tile-grid` crate.
 - Source CRS = target CRS → fast path (no warp).
 - Arbitrary source CRS → warp via a 32×32 coarse PROJ grid + bilinear
-  interpolation (gdalwarp pattern); validated against per-pixel for accuracy.
+  interpolation (coarse-grid warp approximation); validated against per-pixel for accuracy.
 - Intermediate buffer: `ndarray::Array3<T>` (planar from async-tiff, permuted
   to interleaved `(H, W, C)` once at the read/warp seam) + boolean mask.
 - Single-band continuous data → colormap (LUT) → RGBA PNG.
@@ -177,7 +184,7 @@ Request (tms, z, x, y, RenderSpec)
    gives a GSD just smaller than the target tile GSD. Each overview is its own
    `ImageFileDirectory` in async-tiff (no built-in level abstraction).
 2. **Warp strategy**: inverse-mapping at destination pixels via a **coarse 32×32
-   sample grid through PROJ + bilinear interpolation** (gdalwarp pattern).
+   sample grid through PROJ + bilinear interpolation** (coarse-grid warp approximation).
    Validate corners + center; subdivide on residual > 0.1 px. Avoids per-pixel
    PROJ calls (~50–500× speedup, sub-pixel error).
 3. **PROJ threading**: `Proj` is `!Send + !Sync`. The warp + decode runs inside
@@ -205,7 +212,8 @@ Request (tms, z, x, y, RenderSpec)
    `!affine` for inverse, `affine * (x, y)` to apply. Derive from
    async-tiff's `model_tiepoint()` + `model_pixel_scale()` or
    `model_transformation()`.
-10. **Mask priority** (rio-tiler parity): alpha band > GDAL_NODATA value > none.
+10. **Mask priority** (rio-tiler parity): alpha band > `GDAL_NODATA` TIFF tag
+    (this is the literal tag name in the GeoTIFF spec, no GDAL dependency) > none.
     Generate alpha channel from mask in the encode step.
 11. **TMS**: `tile_grid::tms().lookup("WebMercatorQuad" | "WorldCRS84Quad")`.
     WebMercatorQuad is NW-origin and matches XYZ natively (no Y flip).
