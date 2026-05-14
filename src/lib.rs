@@ -5,3 +5,4 @@
 pub mod bounds;
 pub mod crs;
 pub mod error;
+pub mod pixel;
