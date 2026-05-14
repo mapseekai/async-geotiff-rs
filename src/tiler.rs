@@ -55,12 +55,16 @@ impl Tiler {
 
         tracing::debug!(?bbox_in_src, target_gsd, level, "picked overview");
 
-        // 3. Pixel window in source-pixel space, clamped to the IFD's extent.
-        let raw = self
+        // 3. Pixel window in source-pixel space.
+        //    Pad by 1 px on every side so the bilinear resampler always has
+        //    valid neighbours at tile edges — otherwise adjacent XYZ tiles
+        //    show white seams where samples fall just outside the read buffer.
+        let (rc, rr, rw, rh) = self
             .reader
             .level_transform(level)?
             .window_for_bbox(&bbox_in_src)
             .ok_or_else(|| AgError::Warp("source GeoTransform not invertible".into()))?;
+        let raw = (rc - 1, rr - 1, rw + 2, rh + 2);
         let (col, row, w, h) = self.clamp_window(level, raw.0, raw.1, raw.2, raw.3)?;
         if w == 0 || h == 0 {
             let level_dims = self.reader.level_dimensions(level).ok();
