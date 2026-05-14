@@ -8,7 +8,7 @@ description = "Async COG → XYZ tile renderer (pure Rust, no GDAL)"
 
 [dependencies]
 async-tiff        = "0.3"
-object_store      = { version = "0.11", features = ["http", "aws"] }
+object_store      = { version = "0.13", features = ["http", "aws"] }
 tile-grid         = "0.6"
 proj              = { version = "0.27", optional = true }
 raffine           = "0.2"
@@ -27,6 +27,7 @@ thiserror         = "1"
 serde             = { version = "1", features = ["derive"] }
 serde_urlencoded  = "0.7"
 tracing           = "0.1"
+url               = "2"
 axum              = { version = "0.7", optional = true }
 
 [dev-dependencies]
