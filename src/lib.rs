@@ -7,5 +7,6 @@ pub mod crs;
 pub mod error;
 pub mod io;
 pub mod pixel;
+pub mod render;
 pub mod tms;
 pub mod warp;
