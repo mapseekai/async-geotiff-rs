@@ -1,15 +1,18 @@
 //! `CogReader` — async-tiff wrapper with GeoTransform/CRS derivation.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_tiff::metadata::{cache::ReadaheadMetadataCache, TiffMetadataReader};
 use async_tiff::reader::ObjectReader;
 use async_tiff::tags::PhotometricInterpretation;
 use async_tiff::{ImageFileDirectory, TIFF};
+use lru::LruCache;
 use object_store::http::HttpBuilder;
 use object_store::path::Path;
 use object_store::ObjectStore;
+use tokio::sync::Mutex;
 
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
@@ -24,7 +27,7 @@ pub struct CogReader {
     pub(crate) transform: GeoTransform,
     data_ifds: Vec<usize>,
     mask_ifds: Vec<Option<usize>>,
-    tile_cache: tokio::sync::RwLock<HashMap<TileCacheKey, Arc<async_tiff::Array>>>,
+    tile_cache: Mutex<LruCache<TileCacheKey, Arc<async_tiff::Array>>>,
 }
 
 impl CogReader {
@@ -62,7 +65,9 @@ impl CogReader {
             transform,
             data_ifds,
             mask_ifds,
-            tile_cache: tokio::sync::RwLock::new(HashMap::new()),
+            tile_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(TILE_CACHE_CAPACITY).expect("non-zero cache cap"),
+            )),
         })
     }
 
@@ -206,14 +211,13 @@ impl CogReader {
         ifd: &ImageFileDirectory,
         coords: &[(usize, usize)],
     ) -> AgResult<Vec<Arc<async_tiff::Array>>> {
-        const MAX_TILE_CACHE_ITEMS: usize = 128;
-
         let mut arrays: Vec<Option<Arc<async_tiff::Array>>> = vec![None; coords.len()];
-        let mut missing = Vec::new();
+        let mut missing: Vec<(usize, usize, usize)> = Vec::new();
         {
-            let cache = self.tile_cache.read().await;
+            let mut cache = self.tile_cache.lock().await;
             for (pos, &(x, y)) in coords.iter().enumerate() {
                 let key = TileCacheKey { ifd_idx, x, y };
+                // `get` touches LRU order; `put` on miss happens below.
                 if let Some(array) = cache.get(&key) {
                     arrays[pos] = Some(array.clone());
                 } else {
@@ -231,13 +235,10 @@ impl CogReader {
                 .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
             let decoded = decode_tiles(tiles).await?;
 
-            let mut cache = self.tile_cache.write().await;
-            if cache.len() + decoded.len() > MAX_TILE_CACHE_ITEMS {
-                cache.clear();
-            }
+            let mut cache = self.tile_cache.lock().await;
             for ((pos, x, y), array) in missing.into_iter().zip(decoded.into_iter()) {
                 let array = Arc::new(array);
-                cache.insert(TileCacheKey { ifd_idx, x, y }, array.clone());
+                cache.put(TileCacheKey { ifd_idx, x, y }, array.clone());
                 arrays[pos] = Some(array);
             }
         }
@@ -248,6 +249,8 @@ impl CogReader {
             .collect()
     }
 }
+
+const TILE_CACHE_CAPACITY: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct TileCacheKey {

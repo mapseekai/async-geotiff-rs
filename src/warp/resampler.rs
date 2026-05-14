@@ -19,32 +19,39 @@ impl Resampling {
     }
 
     /// Sample value at fractional (col, row) coordinates.
+    ///
+    /// At image edges the bilinear neighbours are clamped to the last valid
+    /// index instead of returning `fill`. This prevents the "white seams"
+    /// that appear between adjacent XYZ tiles when a sample lands on the
+    /// last column/row of the read window.
     pub fn sample(self, view: ArrayView2<f64>, col: f64, row: f64, fill: f64) -> f64 {
         let (h, w) = (view.shape()[0] as i64, view.shape()[1] as i64);
+        if w == 0 || h == 0 {
+            return fill;
+        }
+        // Out-of-bounds outside the convex hull of pixel centres → fill.
+        if col < -0.5 || row < -0.5 || col > (w - 1) as f64 + 0.5 || row > (h - 1) as f64 + 0.5 {
+            return fill;
+        }
+        let cf = col.clamp(0.0, (w - 1) as f64);
+        let rf = row.clamp(0.0, (h - 1) as f64);
         match self {
             Self::Nearest => {
-                let c = col.round() as i64;
-                let r = row.round() as i64;
-                if c < 0 || r < 0 || c >= w || r >= h {
-                    fill
-                } else {
-                    view[[r as usize, c as usize]]
-                }
+                let c = cf.round().clamp(0.0, (w - 1) as f64) as usize;
+                let r = rf.round().clamp(0.0, (h - 1) as f64) as usize;
+                view[[r, c]]
             }
             Self::Bilinear => {
-                let c0 = col.floor() as i64;
-                let r0 = row.floor() as i64;
-                let c1 = c0 + 1;
-                let r1 = r0 + 1;
-                if c0 < 0 || r0 < 0 || c1 >= w || r1 >= h {
-                    return fill;
-                }
-                let dc = col - c0 as f64;
-                let dr = row - r0 as f64;
-                let v00 = view[[r0 as usize, c0 as usize]];
-                let v01 = view[[r0 as usize, c1 as usize]];
-                let v10 = view[[r1 as usize, c0 as usize]];
-                let v11 = view[[r1 as usize, c1 as usize]];
+                let c0 = cf.floor() as usize;
+                let r0 = rf.floor() as usize;
+                let c1 = (c0 + 1).min(w as usize - 1);
+                let r1 = (r0 + 1).min(h as usize - 1);
+                let dc = cf - c0 as f64;
+                let dr = rf - r0 as f64;
+                let v00 = view[[r0, c0]];
+                let v01 = view[[r0, c1]];
+                let v10 = view[[r1, c0]];
+                let v11 = view[[r1, c1]];
                 let top = v00 * (1.0 - dc) + v01 * dc;
                 let bot = v10 * (1.0 - dc) + v11 * dc;
                 top * (1.0 - dr) + bot * dr

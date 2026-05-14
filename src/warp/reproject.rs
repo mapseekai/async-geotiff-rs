@@ -35,19 +35,18 @@ pub fn warp(
         .inverse()
         .ok_or_else(|| AgError::Warp("src GeoTransform not invertible".into()))?;
 
-    // Fast path: same CRS — compose `src_inv * dst_transform` into one affine,
-    // skip the 32x32 PROJ grid entirely. Direct dst-pixel → src-pixel mapping.
+    // Fast path: same CRS — SIMD-accelerated crop+resize via fast_image_resize.
     if &src.crs == dst_crs {
-        return Ok(warp_affine(
+        return warp_affine(
             src,
             dst_crs,
             dst_bbox,
             dst_w,
             dst_h,
             resampling,
-            src_inv.0 * dst_transform.0,
+            src_inv,
             dst_transform,
-        ));
+        );
     }
 
     // Cross-CRS path: coarse 32×32 grid through PROJ + bilinear interpolation
@@ -118,7 +117,10 @@ pub fn warp(
     })
 }
 
-/// Same-CRS warp: composed affine maps dst pixel → src pixel directly.
+/// Same-CRS warp: pure crop+resize via `fast_image_resize` (SIMD: SSE4/AVX2/NEON).
+///
+/// Builds the source CropBox by mapping `dst_bbox` corners back through the
+/// source GeoTransform; passes per-band F32 buffers to the resizer.
 fn warp_affine(
     src: &ImageData,
     dst_crs: &Crs,
@@ -126,39 +128,86 @@ fn warp_affine(
     dst_w: usize,
     dst_h: usize,
     resampling: Resampling,
-    dst_pixel_to_src_pixel: raffine::Affine,
+    src_inv: GeoTransform,
     dst_transform: GeoTransform,
-) -> ImageData {
-    let bands = src.pixels.bands();
-    let src_f64 = src.pixels.to_f64();
-    let fill = src.nodata.unwrap_or(0.0);
-    let src_h = src_f64.shape()[1];
-    let src_w = src_f64.shape()[2];
+) -> AgResult<ImageData> {
+    use fast_image_resize as fr;
+    use ndarray::Axis;
 
-    let mut out = Array3::<f64>::zeros((bands, dst_h, dst_w));
-    let mut mask = Array2::<bool>::from_elem((dst_h, dst_w), true);
-    for r in 0..dst_h {
-        for c in 0..dst_w {
-            let (sc, sr) = dst_pixel_to_src_pixel * (c as f64 + 0.5, r as f64 + 0.5);
-            // Adjust back: the +0.5 above puts us at pixel centre; the resampler
-            // interprets fractional col/row as pixel-centred coordinates already.
-            let (sc, sr) = (sc - 0.5, sr - 0.5);
-            mask[[r, c]] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
-            for b in 0..bands {
-                let band_view = src_f64.index_axis(ndarray::Axis(0), b);
-                out[[b, r, c]] = resampling.sample(band_view, sc, sr, fill);
-            }
-        }
+    // CropBox in source pixel space (covering exactly dst_bbox).
+    let (left_a, top_a) = src_inv.forward(dst_bbox.xmin, dst_bbox.ymax);
+    let (right_a, bot_a) = src_inv.forward(dst_bbox.xmax, dst_bbox.ymin);
+    let crop_left = left_a.min(right_a).max(0.0);
+    let crop_top = top_a.min(bot_a).max(0.0);
+    let crop_w = (right_a - left_a).abs();
+    let crop_h = (bot_a - top_a).abs();
+
+    let bands = src.pixels.bands();
+    let src_h = src.pixels.height();
+    let src_w = src.pixels.width();
+    if src_w == 0 || src_h == 0 || crop_w <= 0.0 || crop_h <= 0.0 {
+        return Err(AgError::Warp("empty crop or source".into()));
     }
 
-    ImageData {
-        pixels: PixelData::F64(out),
-        mask: Some(mask),
+    // Clamp crop to source extent so fast_image_resize does not reject it.
+    let crop_right = (crop_left + crop_w).min(src_w as f64);
+    let crop_bot = (crop_top + crop_h).min(src_h as f64);
+    let crop_w_clamped = (crop_right - crop_left).max(1e-9);
+    let crop_h_clamped = (crop_bot - crop_top).max(1e-9);
+
+    let alg = match resampling {
+        Resampling::Nearest => fr::ResizeAlg::Nearest,
+        Resampling::Bilinear => fr::ResizeAlg::Convolution(fr::FilterType::Bilinear),
+    };
+    let options = fr::ResizeOptions::new()
+        .resize_alg(alg)
+        .crop(crop_left, crop_top, crop_w_clamped, crop_h_clamped);
+    let mut resizer = fr::Resizer::new();
+
+    let src_f64 = src.pixels.to_f64();
+    let mut out = Array3::<f32>::zeros((bands, dst_h, dst_w));
+
+    for b in 0..bands {
+        // Build an f32 buffer (Vec<u8> reinterpreted) per band.
+        let band = src_f64.index_axis(Axis(0), b);
+        let mut src_buf = vec![0u8; src_w * src_h * std::mem::size_of::<f32>()];
+        {
+            let f32_view: &mut [f32] = bytemuck::cast_slice_mut(&mut src_buf);
+            for (slot, value) in f32_view.iter_mut().zip(band.iter()) {
+                *slot = *value as f32;
+            }
+        }
+        let src_img = fr::images::Image::from_vec_u8(
+            src_w as u32,
+            src_h as u32,
+            src_buf,
+            fr::PixelType::F32,
+        )
+        .map_err(|e| AgError::Warp(format!("fast_image_resize src: {e}")))?;
+
+        let mut dst_img =
+            fr::images::Image::new(dst_w as u32, dst_h as u32, fr::PixelType::F32);
+        resizer
+            .resize(&src_img, &mut dst_img, Some(&options))
+            .map_err(|e| AgError::Warp(format!("fast_image_resize: {e}")))?;
+
+        let dst_buf = dst_img.into_vec();
+        let dst_f32: &[f32] = bytemuck::cast_slice(&dst_buf);
+        let mut out_band = out.index_axis_mut(Axis(0), b);
+        let out_slice = out_band
+            .as_slice_mut()
+            .expect("out_band must be contiguous");
+        out_slice.copy_from_slice(dst_f32);
+    }
+
+    Ok(ImageData {
+        pixels: PixelData::F32(out),
+        mask: None,
         bbox: dst_bbox,
         crs: dst_crs.clone(),
         transform: dst_transform,
         nodata: src.nodata,
-    }
+    })
 }
 
 fn sample_valid(

@@ -22,6 +22,7 @@ bytes             = "1"
 bytemuck          = "1"
 nom               = "7"
 bitflags          = "2"
+lru               = "0.12"
 tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 rayon             = "1"
 thiserror         = "1"
