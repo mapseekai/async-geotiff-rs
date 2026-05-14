@@ -4,7 +4,7 @@
 //! bilinear-interpolate intermediate dst→src pixel coords; sample source pixels
 //! with the chosen kernel.
 
-use ndarray::Array3;
+use ndarray::{Array2, Array3};
 
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
@@ -21,12 +21,11 @@ pub fn warp(
     dst_h: usize,
     resampling: Resampling,
 ) -> AgResult<ImageData> {
-    if &src.crs == dst_crs {
-        // Fast path: caller should have skipped warp. Defensive clone.
-        return Ok(src.clone());
-    }
-
-    let proj = Projector::new(dst_crs, &src.crs)?;
+    let projector = if &src.crs == dst_crs {
+        None
+    } else {
+        Some(Projector::new(dst_crs, &src.crs)?)
+    };
 
     const N: usize = 32;
     let mut grid_dst: Vec<(f64, f64)> = Vec::with_capacity((N + 1) * (N + 1));
@@ -39,7 +38,9 @@ pub fn warp(
             grid_dst.push((dx, dy));
         }
     }
-    proj.convert(&mut grid_dst)?;
+    if let Some(proj) = &projector {
+        proj.convert(&mut grid_dst)?;
+    }
 
     let src_inv = src
         .transform
@@ -55,6 +56,7 @@ pub fn warp(
     let fill = src.nodata.unwrap_or(0.0);
 
     let mut out = Array3::<f64>::zeros((bands, dst_h, dst_w));
+    let mut mask = Array2::<bool>::from_elem((dst_h, dst_w), true);
     for r in 0..dst_h {
         for c in 0..dst_w {
             let gi = (r as f64) * (N as f64) / (dst_h as f64);
@@ -77,6 +79,13 @@ pub fn warp(
                 + p01.1 * (1.0 - di) * dj
                 + p10.1 * di * (1.0 - dj)
                 + p11.1 * di * dj;
+            mask[[r, c]] = sample_valid(
+                src.mask.as_ref(),
+                src_f64.shape()[2],
+                src_f64.shape()[1],
+                sc,
+                sr,
+            );
             for b in 0..bands {
                 let band_view = src_f64.index_axis(ndarray::Axis(0), b);
                 out[[b, r, c]] = resampling.sample(band_view, sc, sr, fill);
@@ -95,12 +104,27 @@ pub fn warp(
 
     Ok(ImageData {
         pixels: PixelData::F64(out),
-        mask: None,
+        mask: Some(mask),
         bbox: dst_bbox,
         crs: dst_crs.clone(),
         transform: dst_transform,
         nodata: src.nodata,
     })
+}
+
+fn sample_valid(
+    mask: Option<&Array2<bool>>,
+    width: usize,
+    height: usize,
+    col: f64,
+    row: f64,
+) -> bool {
+    let c = col.round() as i64;
+    let r = row.round() as i64;
+    if c < 0 || r < 0 || c >= width as i64 || r >= height as i64 {
+        return false;
+    }
+    mask.map(|m| m[[r as usize, c as usize]]).unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -122,15 +146,7 @@ mod tests {
     #[test]
     fn same_crs_fast_path_clones() {
         let src = dummy_src(Crs::epsg(3857));
-        let out = warp(
-            &src,
-            &Crs::epsg(3857),
-            src.bbox,
-            4,
-            4,
-            Resampling::Nearest,
-        )
-        .unwrap();
+        let out = warp(&src, &Crs::epsg(3857), src.bbox, 4, 4, Resampling::Nearest).unwrap();
         assert_eq!(out.crs, src.crs);
     }
 }

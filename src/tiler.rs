@@ -6,7 +6,6 @@ use bytes::Bytes;
 
 use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
-use crate::io::overview::pick_overview;
 use crate::io::CogReader;
 use crate::pixel::ImageData;
 use crate::render::pipeline::{render, CompiledRenderSpec};
@@ -35,7 +34,12 @@ impl Tiler {
         let dst_bbox = tms.tile_bbox(z, x, y)?;
         let dst_crs = tms.crs();
 
-        let target_gsd = tms.resolution(z)?;
+        tracing::debug!(
+            ?dst_crs,
+            src_crs = %self.reader.src_crs(),
+            ?dst_bbox,
+            "tile request"
+        );
 
         // 1. Project dst_bbox into the source CRS so we know which pixel window to read.
         let bbox_in_src = if self.reader.src_crs() == &dst_crs {
@@ -44,48 +48,45 @@ impl Tiler {
             self.reproject_bbox(&dst_bbox, &dst_crs).await?
         };
 
-        // 2. Pick overview by GSD.
-        let full_gsd = self
-            .reader
-            .transform()
-            .0
-            .a
-            .abs()
-            .max(self.reader.transform().0.e.abs());
-        let full_w = self
-            .reader
-            .tiff
-            .ifds()
-            .first()
-            .map(|ifd| ifd.image_width() as u64)
-            .unwrap_or(1);
-        let level = pick_overview(&self.reader.tiff, full_w.max(1), full_gsd, target_gsd);
+        // 2. Pick overview in source CRS units. Each overview has its own transform.
+        let target_gsd =
+            bbox_in_src.width().abs().max(bbox_in_src.height().abs()) / f64::from(spec.tilesize);
+        let level = self.reader.pick_overview(target_gsd);
+
+        tracing::debug!(?bbox_in_src, target_gsd, level, "picked overview");
 
         // 3. Pixel window in source-pixel space, clamped to the IFD's extent.
-        let (col, row, w, h) = self
+        let raw = self
             .reader
-            .transform()
+            .level_transform(level)?
             .window_for_bbox(&bbox_in_src)
             .ok_or_else(|| AgError::Warp("source GeoTransform not invertible".into()))?;
-        let (col, row, w, h) = self.clamp_window(level, col, row, w, h)?;
+        let (col, row, w, h) = self.clamp_window(level, raw.0, raw.1, raw.2, raw.3)?;
         if w == 0 || h == 0 {
-            // Tile entirely outside the COG → return a transparent PNG of the right size.
+            let level_dims = self.reader.level_dimensions(level).ok();
+            tracing::warn!(
+                ?bbox_in_src, raw_window = ?raw, level, ?level_dims,
+                "tile entirely outside COG; returning transparent"
+            );
             return empty_tile(spec.tilesize as usize);
         }
+        tracing::debug!(col, row, w, h, "read window (clamped)");
         let src: ImageData = self.reader.read_window(level, col, row, w, h).await?;
 
-        // 4. Warp (or fast-path) to destination grid.
-        let warped: ImageData = if src.crs == dst_crs {
-            src
+        // 4. Project the read window into the exact destination tile grid. This is
+        // still needed for same-CRS reads because the requested COG window may not
+        // be the same size or placement as the output XYZ tile.
+        let resampling = if src.crs == dst_crs {
+            spec.resampling
         } else {
-            let resampling = spec.reproject;
-            let ts = spec.tilesize as usize;
-            tokio::task::spawn_blocking(move || {
-                warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
-            })
-            .await
-            .map_err(|e| AgError::Warp(format!("join: {e}")))??
+            spec.reproject
         };
+        let ts = spec.tilesize as usize;
+        let warped: ImageData = tokio::task::spawn_blocking(move || {
+            warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
+        })
+        .await
+        .map_err(|e| AgError::Warp(format!("join: {e}")))??;
 
         let compiled: CompiledRenderSpec = compile(spec)?;
         let png = tokio::task::spawn_blocking(move || render(&warped, &compiled))
@@ -96,7 +97,11 @@ impl Tiler {
 
     /// Reproject a bbox from `from_crs` into the source CRS, taking the AABB
     /// of the four transformed corners.
-    async fn reproject_bbox(&self, bbox: &crate::bounds::Bbox, from_crs: &crate::crs::Crs) -> AgResult<Bbox> {
+    async fn reproject_bbox(
+        &self,
+        bbox: &crate::bounds::Bbox,
+        from_crs: &crate::crs::Crs,
+    ) -> AgResult<Bbox> {
         use crate::warp::projection::Projector;
         let src_crs = self.reader.src_crs().clone();
         let from_crs = from_crs.clone();
@@ -127,12 +132,7 @@ impl Tiler {
         w: u64,
         h: u64,
     ) -> AgResult<(i64, i64, u64, u64)> {
-        let ifd = self
-            .reader
-            .tiff
-            .ifds()
-            .get(level)
-            .ok_or(AgError::MissingGeo("overview level"))?;
+        let ifd = self.reader.data_ifd(level)?;
         let iw = ifd.image_width() as i64;
         let ih = ifd.image_height() as i64;
         let col_end = (col + w as i64).min(iw);

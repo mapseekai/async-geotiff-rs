@@ -218,7 +218,18 @@ mod tests {
 
     #[test]
     fn sigmoidal_zero_contrast_is_identity() {
-        let (r, g, b) = apply(&[Op::Sigmoidal { bands: Bands::R | Bands::G | Bands::B, contrast: 0.0, bias: 0.5 }], 0.3, 0.5, 0.7);
-        assert_relative_eq!(r, 0.3); assert_relative_eq!(g, 0.5); assert_relative_eq!(b, 0.7);
+        let (r, g, b) = apply(
+            &[Op::Sigmoidal {
+                bands: Bands::R | Bands::G | Bands::B,
+                contrast: 0.0,
+                bias: 0.5,
+            }],
+            0.3,
+            0.5,
+            0.7,
+        );
+        assert_relative_eq!(r, 0.3);
+        assert_relative_eq!(g, 0.5);
+        assert_relative_eq!(b, 0.7);
     }
 }

@@ -19,7 +19,8 @@ mod tests {
 
     #[test]
     fn clamps_to_unit_range() {
-        let data = Array3::<f64>::from_shape_vec((1, 1, 4), vec![-10.0, 0.0, 50.0, 1000.0]).unwrap();
+        let data =
+            Array3::<f64>::from_shape_vec((1, 1, 4), vec![-10.0, 0.0, 50.0, 1000.0]).unwrap();
         let out = rescale(data, &[(0.0, 100.0)]);
         assert_eq!(out[[0, 0, 0]], 0.0);
         assert_eq!(out[[0, 0, 1]], 0.0);
@@ -29,7 +30,8 @@ mod tests {
 
     #[test]
     fn per_band_ranges() {
-        let data = Array3::<f64>::from_shape_vec((2, 1, 2), vec![50.0, 100.0, 0.0, 1000.0]).unwrap();
+        let data =
+            Array3::<f64>::from_shape_vec((2, 1, 2), vec![50.0, 100.0, 0.0, 1000.0]).unwrap();
         let out = rescale(data, &[(0.0, 100.0), (0.0, 2000.0)]);
         assert_eq!(out[[0, 0, 0]], 0.5);
         assert_eq!(out[[1, 0, 1]], 0.5);

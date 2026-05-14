@@ -53,7 +53,7 @@ impl HandleGet for Composite {
             CompositeKind::Gradient => {
                 let v = values[0];
                 if let Some(nd) = nodata {
-                    if !nd.is_empty() && (v - nd[0]).abs() < 1e-9 {
+                    if !nd.is_empty() && is_nodata(v, nd[0]) {
                         return [0, 0, 0, 0];
                     }
                 }
@@ -70,7 +70,7 @@ impl HandleGet for Composite {
                 let hi = self.vmax.as_ref().expect("rgb vmax");
                 if let Some(nd) = nodata {
                     for (i, v) in values.iter().enumerate().take(3) {
-                        if i < nd.len() && (*v - nd[i]).abs() < 1e-9 {
+                        if i < nd.len() && is_nodata(*v, nd[i]) {
                             return [0, 0, 0, 0];
                         }
                     }
@@ -85,6 +85,14 @@ impl HandleGet for Composite {
                 out
             }
         }
+    }
+}
+
+fn is_nodata(value: f64, nodata: f64) -> bool {
+    if nodata.is_nan() {
+        value.is_nan()
+    } else {
+        (value - nodata).abs() < 1e-9
     }
 }
 
@@ -125,8 +133,10 @@ impl Composite {
                     cb.last().map(|(p, _)| *p).unwrap_or(1.0),
                 );
                 let span = (hi - lo).max(1e-12);
-                let stops: Vec<(f64, Colour)> =
-                    cb.iter().map(|(p, c)| ((*p - lo) / span, c.clone())).collect();
+                let stops: Vec<(f64, Colour)> = cb
+                    .iter()
+                    .map(|(p, c)| ((*p - lo) / span, c.clone()))
+                    .collect();
                 Self {
                     vmin: Some(vec![lo]),
                     vmax: Some(vec![hi]),

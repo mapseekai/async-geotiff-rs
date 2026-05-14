@@ -28,6 +28,7 @@ thiserror         = "1"
 serde             = { version = "1", features = ["derive"] }
 serde_urlencoded  = "0.7"
 tracing           = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 url               = "2"
 axum              = { version = "0.7", optional = true }
 
@@ -41,8 +42,12 @@ serde_json        = "1"
 [features]
 default = ["proj"]
 proj    = ["dep:proj"]
-server  = ["dep:axum"]
+server  = ["dep:axum", "dep:tracing-subscriber"]
 webp    = ["image/webp"]
 jpeg    = ["image/jpeg"]
+
+[[example]]
+name = "serve"
+required-features = ["server"]
 
 # [[bench]] section deferred to Task 24 when benches/tile_bench.rs is added

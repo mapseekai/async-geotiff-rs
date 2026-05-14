@@ -2,16 +2,11 @@
 
 use ndarray::ArrayView2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Resampling {
+    #[default]
     Nearest,
     Bilinear,
-}
-
-impl Default for Resampling {
-    fn default() -> Self {
-        Self::Nearest
-    }
 }
 
 impl Resampling {

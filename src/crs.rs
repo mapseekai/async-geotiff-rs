@@ -11,7 +11,7 @@ impl Crs {
         Self(format!("EPSG:{}", code))
     }
 
-    pub fn from_str(s: impl Into<String>) -> Self {
+    pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 
@@ -26,6 +26,20 @@ impl std::fmt::Display for Crs {
     }
 }
 
+impl std::str::FromStr for Crs {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(s))
+    }
+}
+
+impl From<&str> for Crs {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,7 +51,7 @@ mod tests {
 
     #[test]
     fn equality_is_string_based() {
-        assert_eq!(Crs::epsg(4326), Crs::from_str("EPSG:4326"));
+        assert_eq!(Crs::epsg(4326), Crs::new("EPSG:4326"));
         assert_ne!(Crs::epsg(4326), Crs::epsg(3857));
     }
 }

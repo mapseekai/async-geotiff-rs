@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>async-geotiff MapLibre example</title>
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
+    <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+    <style>
+      html,
+      body,
+      #map {
+        height: 100%;
+      }
+
+      body {
+        margin: 0;
+        color: #17202a;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      #map {
+        background: #d8dee6;
+      }
+
+      .toolbar {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        z-index: 1;
+        display: grid;
+        grid-template-columns: repeat(5, minmax(92px, auto));
+        gap: 8px;
+        align-items: end;
+        max-width: calc(100vw - 96px);
+        padding: 10px;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(23, 32, 42, 0.14);
+        border-radius: 8px;
+        box-shadow: 0 6px 18px rgba(23, 32, 42, 0.16);
+        backdrop-filter: blur(12px);
+      }
+
+      .field {
+        display: grid;
+        gap: 4px;
+        min-width: 92px;
+      }
+
+      .field.wide {
+        min-width: 138px;
+      }
+
+      label {
+        color: #4a5568;
+        font-size: 11px;
+        font-weight: 650;
+        letter-spacing: 0;
+        line-height: 1.1;
+      }
+
+      input,
+      select,
+      button {
+        box-sizing: border-box;
+        height: 32px;
+        min-width: 0;
+        border: 1px solid #aeb7c2;
+        border-radius: 6px;
+        background: #ffffff;
+        color: #17202a;
+        font: inherit;
+        font-size: 13px;
+      }
+
+      input,
+      select {
+        padding: 0 8px;
+      }
+
+      input[type="range"] {
+        padding: 0;
+      }
+
+      button {
+        padding: 0 12px;
+        background: #1f6feb;
+        border-color: #1f6feb;
+        color: #ffffff;
+        cursor: pointer;
+        font-weight: 650;
+      }
+
+      button:hover {
+        background: #1759c8;
+      }
+
+      .status {
+        position: absolute;
+        left: 12px;
+        bottom: 22px;
+        z-index: 1;
+        max-width: min(520px, calc(100vw - 24px));
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: rgba(23, 32, 42, 0.82);
+        color: #ffffff;
+        font-size: 12px;
+      }
+
+      @media (max-width: 760px) {
+        .toolbar {
+          right: 12px;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          max-width: none;
+        }
+
+        .field,
+        .field.wide {
+          min-width: 0;
+        }
+
+        button {
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <form class="toolbar" id="style-form">
+      <div class="field">
+        <label for="colormap">Colormap</label>
+        <select id="colormap" name="colormap_name">
+          <option value="">greys</option>
+          <option value="viridis">viridis</option>
+          <option value="magma">magma</option>
+          <option value="inferno">inferno</option>
+          <option value="plasma">plasma</option>
+          <option value="cividis">cividis</option>
+          <option value="turbo">turbo</option>
+        </select>
+      </div>
+      <div class="field wide">
+        <label for="rescale">Rescale</label>
+        <input id="rescale" name="rescale" type="text" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="bidx">Bands</label>
+        <input id="bidx" name="bidx" type="text" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="resampling">Kernel</label>
+        <select id="resampling" name="resampling">
+          <option value="nearest">nearest</option>
+          <option value="bilinear">bilinear</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="opacity">Opacity</label>
+        <input id="opacity" name="opacity" type="range" min="0" max="1" step="0.05">
+      </div>
+      <button type="submit">Apply</button>
+    </form>
+    <div class="status" id="status"></div>
+
+    <script>
+      const DEFAULT_TILE_ORIGIN = "http://127.0.0.1:8080";
+      const TILE_PATH = "/tiles/WebMercatorQuad/{z}/{x}/{y}.png";
+      const SERVER_DEFAULT_CENTER = "__ASYNC_GEOTIFF_DEFAULT_CENTER__";
+      const SERVER_DEFAULT_ZOOM = "__ASYNC_GEOTIFF_DEFAULT_ZOOM__";
+      const pageParams = new URLSearchParams(window.location.search);
+
+      const controls = {
+        colormap: document.getElementById("colormap"),
+        rescale: document.getElementById("rescale"),
+        bidx: document.getElementById("bidx"),
+        resampling: document.getElementById("resampling"),
+        opacity: document.getElementById("opacity"),
+        status: document.getElementById("status")
+      };
+
+      controls.colormap.value = pageParams.get("colormap_name") ?? "";
+      controls.rescale.value = pageParams.getAll("rescale").join(";") || "0,255;0,255;0,255";
+      controls.bidx.value = pageParams.getAll("bidx").join(",") || "1,2,3";
+      controls.resampling.value = pageParams.get("resampling") ?? "bilinear";
+      controls.opacity.value = pageParams.get("opacity") ?? "0.85";
+
+      function tileOrigin() {
+        const configured = pageParams.get("tile_origin");
+        if (configured) {
+          return configured.replace(/\/$/, "");
+        }
+        if (window.location.protocol === "http:" || window.location.protocol === "https:") {
+          return window.location.origin;
+        }
+        return DEFAULT_TILE_ORIGIN;
+      }
+
+      function parseCenter() {
+        const raw = pageParams.get("center");
+        if (raw) {
+          const parts = raw.split(",").map((value) => Number(value.trim()));
+          return parts.length === 2 && parts.every(Number.isFinite) ? parts : defaultCenter();
+        }
+        return defaultCenter();
+      }
+
+      function defaultCenter() {
+        if (SERVER_DEFAULT_CENTER.startsWith("__")) {
+          return [0, 0];
+        }
+        const parts = SERVER_DEFAULT_CENTER.split(",").map((value) => Number(value.trim()));
+        return parts.length === 2 && parts.every(Number.isFinite) ? parts : [0, 0];
+      }
+
+      function parseZoom() {
+        const defaultZoom = SERVER_DEFAULT_ZOOM.startsWith("__")
+          ? 2
+          : Number(SERVER_DEFAULT_ZOOM);
+        const zoom = Number(pageParams.get("zoom") ?? defaultZoom);
+        return Number.isFinite(zoom) ? zoom : 2;
+      }
+
+      function appendRepeated(params, name, value, separator) {
+        value
+          .split(separator)
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .forEach((item) => params.append(name, item));
+      }
+
+      function tileParams() {
+        const params = new URLSearchParams();
+        appendRepeated(params, "bidx", controls.bidx.value, ",");
+        appendRepeated(params, "rescale", controls.rescale.value, ";");
+        if (controls.colormap.value) {
+          params.set("colormap_name", controls.colormap.value);
+        }
+        params.set("resampling", controls.resampling.value);
+        params.set("reproject", controls.resampling.value);
+        params.set("tilesize", "256");
+        return params;
+      }
+
+      function tileUrl() {
+        const params = tileParams();
+        return `${tileOrigin()}${TILE_PATH}?${params.toString()}`;
+      }
+
+      function syncStatus() {
+        controls.status.textContent = tileUrl();
+      }
+
+      function syncPermalink() {
+        if (!(window.location.protocol === "http:" || window.location.protocol === "https:")) {
+          return;
+        }
+        const params = tileParams();
+        params.set("opacity", controls.opacity.value);
+        const center = map.getCenter();
+        params.set("center", `${center.lng.toFixed(5)},${center.lat.toFixed(5)}`);
+        params.set("zoom", map.getZoom().toFixed(2));
+        window.history.replaceState(null, "", `/?${params.toString()}`);
+      }
+
+      const map = new maplibregl.Map({
+        container: "map",
+        style: {
+          version: 8,
+          sources: {
+            "osm-raster": {
+              type: "raster",
+              tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+              tileSize: 256,
+              minzoom: 0,
+              maxzoom: 19,
+              attribution: '<a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+            },
+            "cog-raster": {
+              type: "raster",
+              tiles: [tileUrl()],
+              tileSize: 256,
+              minzoom: 0,
+              maxzoom: 22,
+              attribution: "async-geotiff"
+            }
+          },
+          layers: [
+            {
+              id: "osm-raster",
+              type: "raster",
+              source: "osm-raster"
+            },
+            {
+              id: "cog-raster",
+              type: "raster",
+              source: "cog-raster",
+              paint: {
+                "raster-opacity": Number(controls.opacity.value)
+              }
+            }
+          ],
+          id: "async-geotiff-maplibre"
+        },
+        center: parseCenter(),
+        zoom: parseZoom()
+      });
+
+      map.addControl(new maplibregl.NavigationControl(), "top-right");
+      map.addControl(new maplibregl.ScaleControl(), "bottom-right");
+
+      document.getElementById("style-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        map.getSource("cog-raster").setTiles([tileUrl()]);
+        map.setPaintProperty("cog-raster", "raster-opacity", Number(controls.opacity.value));
+        syncStatus();
+        syncPermalink();
+      });
+
+      controls.opacity.addEventListener("input", () => {
+        map.setPaintProperty("cog-raster", "raster-opacity", Number(controls.opacity.value));
+      });
+
+      map.on("moveend", syncPermalink);
+      map.on("load", syncStatus);
+      syncStatus();
+    </script>
+  </body>
+</html>

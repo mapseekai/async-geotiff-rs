@@ -110,6 +110,18 @@ fn urldecode(s: &str) -> String {
 }
 
 pub fn compile(spec: &RenderSpec) -> AgResult<CompiledRenderSpec> {
+    if spec.tilesize == 0 {
+        return Err(AgError::query("tilesize", "must be positive"));
+    }
+    if let Some(&bad) = spec.bidx.iter().find(|&&b| b == 0) {
+        return Err(AgError::query("bidx", format!("{bad} is not 1-indexed")));
+    }
+
+    let auto_rgb = spec.bidx.is_empty()
+        && spec.rescale.is_empty()
+        && spec.colormap_name.is_none()
+        && spec.color_formula.is_none();
+
     let composite = if let Some(name) = &spec.colormap_name {
         Composite::from_definition(
             &ColourDefinition::Named(name.clone()),
@@ -123,9 +135,9 @@ pub fn compile(spec: &RenderSpec) -> AgResult<CompiledRenderSpec> {
             spec.rescale.get(2).map(|r| r.0).unwrap_or(0.0),
         ];
         let hi: [f64; 3] = [
-            spec.rescale.first().map(|r| r.1).unwrap_or(1.0),
-            spec.rescale.get(1).map(|r| r.1).unwrap_or(1.0),
-            spec.rescale.get(2).map(|r| r.1).unwrap_or(1.0),
+            spec.rescale.first().map(|r| r.1).unwrap_or(255.0),
+            spec.rescale.get(1).map(|r| r.1).unwrap_or(255.0),
+            spec.rescale.get(2).map(|r| r.1).unwrap_or(255.0),
         ];
         Composite::from_definition(&ColourDefinition::Rgb(lo, hi), None, None)?
     } else {
@@ -146,13 +158,11 @@ pub fn compile(spec: &RenderSpec) -> AgResult<CompiledRenderSpec> {
         composite,
         rescale: spec.rescale.clone(),
         formula,
-        bidx: spec
-            .bidx
-            .iter()
-            .map(|b| (*b as usize).saturating_sub(1))
-            .collect(),
+        bidx: spec.bidx.iter().map(|b| *b as usize - 1).collect(),
         nodata: spec.nodata,
         tile_size: spec.tilesize,
+        resampling: spec.resampling,
+        auto_rgb,
     })
 }
 
@@ -192,5 +202,11 @@ mod tests {
         let s = RenderSpec::from_query("colormap_name=viridis&rescale=0,1000").unwrap();
         let c = compile(&s).unwrap();
         assert_eq!(c.tile_size, 256);
+    }
+
+    #[test]
+    fn compile_rejects_zero_bidx() {
+        let s = RenderSpec::from_query("bidx=0").unwrap();
+        assert!(compile(&s).is_err());
     }
 }

@@ -1,6 +1,7 @@
 use crate::bounds::Bbox;
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
+use std::str::FromStr;
 use tile_grid::{tms as registry, Tms as InnerTms, Xyz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +18,7 @@ impl TmsKind {
         }
     }
 
-    pub fn from_str(s: &str) -> AgResult<Self> {
+    pub fn parse_name(s: &str) -> AgResult<Self> {
         match s {
             "WebMercatorQuad" | "webmercatorquad" => Ok(Self::WebMercatorQuad),
             "WorldCRS84Quad" | "worldcrs84quad" => Ok(Self::WorldCrs84Quad),
@@ -30,6 +31,14 @@ impl TmsKind {
             Self::WebMercatorQuad => Crs::epsg(3857),
             Self::WorldCrs84Quad => Crs::epsg(4326),
         }
+    }
+}
+
+impl FromStr for TmsKind {
+    type Err = AgError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_name(s)
     }
 }
 
@@ -57,16 +66,14 @@ impl Tms {
     /// Bbox of (z, x, y) in the TMS CRS. `y` is XYZ-slippy convention.
     pub fn tile_bbox(&self, z: u8, x: u32, y: u32) -> AgResult<Bbox> {
         let y_tms = self.slippy_to_tms_y(z, y)?;
-        let bb = self
-            .inner
-            .xy_bounds(&Xyz::new(x.into(), y_tms.into(), z.into()));
+        let bb = self.inner.xy_bounds(&Xyz::new(x.into(), y_tms.into(), z));
         Ok(Bbox::new(bb.left, bb.bottom, bb.right, bb.top))
     }
 
     /// CRS-unit resolution at zoom `z` (units per pixel of the matrix).
     pub fn resolution(&self, z: u8) -> AgResult<f64> {
         self.inner
-            .resolution_z(z.into())
+            .resolution_z(z)
             .ok_or(AgError::TileOutOfBounds { z, x: 0, y: 0 })
     }
 
@@ -92,7 +99,7 @@ mod tests {
 
     #[test]
     fn unknown_tms_errors() {
-        assert!(TmsKind::from_str("foo").is_err());
+        assert!("foo".parse::<TmsKind>().is_err());
     }
 
     #[test]

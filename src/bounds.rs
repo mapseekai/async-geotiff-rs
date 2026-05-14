@@ -69,6 +69,14 @@ impl GeoTransform {
         self.0 * (col, row)
     }
 
+    pub fn translated(&self, col_off: f64, row_off: f64) -> Self {
+        Self(self.0 * Affine::translation(col_off, row_off))
+    }
+
+    pub fn scaled(&self, sx: f64, sy: f64) -> Self {
+        Self(self.0 * Affine::scale(sx, Some(sy)))
+    }
+
     pub fn inverse(&self) -> Option<GeoTransform> {
         (!self.0).ok().map(GeoTransform)
     }
