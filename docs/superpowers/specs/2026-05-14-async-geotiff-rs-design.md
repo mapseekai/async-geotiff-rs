@@ -20,20 +20,25 @@ In scope:
 - Two tile matrix sets: `WebMercatorQuad` (EPSG:3857) and `WorldCRS84Quad` (EPSG:4326),
   provided by the `tile-grid` crate.
 - Source CRS = target CRS → fast path (no warp).
-- Arbitrary source CRS → reprojected per-pixel via `proj`.
-- Intermediate buffer: `ndarray::Array3<T>` (bands, height, width) + boolean mask.
-- Single-band continuous data → colormap → RGBA PNG.
-- Multi-band data → RGB band selection (`bidx=1,2,3`) → RGBA PNG.
-- Titiler-style URL query parameter styling:
-  - `bidx` band selection (1-indexed)
-  - `rescale` per-band min/max stretch
-  - `nodata` override
-  - `colormap_name` (built-in palettes via `enterpolation`)
-  - `resampling` (nearest/bilinear/lanczos)
-  - `color_formula` (subset of rio-color: gamma, sigmoidal, saturation)
-- Resize to tile size (default 256) via `fast_image_resize`.
-- Output: PNG (v0). WebP/JPEG behind a feature flag, post-MVP.
-- Demo HTTP server (axum) at `/tiles/{tms}/{z}/{x}/{y}.png?...`.
+- Arbitrary source CRS → warp via a 32×32 coarse PROJ grid + bilinear
+  interpolation (gdalwarp pattern); validated against per-pixel for accuracy.
+- Intermediate buffer: `ndarray::Array3<T>` (planar from async-tiff, permuted
+  to interleaved `(H, W, C)` once at the read/warp seam) + boolean mask.
+- Single-band continuous data → colormap (LUT) → RGBA PNG.
+- Multi-band data → RGB band selection via repeated `?bidx=` → RGBA PNG.
+- Titiler-style URL query parameter styling (repeated where titiler repeats):
+  - `bidx` band selection, 1-indexed, **repeated** (`?bidx=1&bidx=2&bidx=3`)
+  - `rescale` per-band min/max stretch, **repeated** (`?rescale=0,3000&rescale=0,3000`)
+  - `nodata` override (float, or `nan`/`inf`/`-inf`)
+  - `colormap_name` — built-ins from `colorous`; user-supplied stops via
+    `enterpolation` (post-MVP)
+  - `resampling` enum (nearest/bilinear/cubic/lanczos)
+  - `color_formula` — subset of rio-color: gamma, sigmoidal, saturation
+  - `tilesize` (default 256)
+- Resize to tile size via `fast_image_resize` v5 (rayon-parallel).
+- Output: PNG (v0). WebP/JPEG behind feature flags, post-MVP.
+- Demo HTTP server (axum) at `/tiles/{tms}/{z}/{x}/{y}.{ext}?...` where
+  `ext ∈ {png, jpeg, webp}`.
 
 Reserved (trait stubs, no impl):
 - `trait TileCache` — cache layer hook.
@@ -214,51 +219,50 @@ Request (tms, z, x, y, RenderSpec)
 
 ## 6b. Performance Principles
 
-Adopted from `async-geotiff` (Python wrapper of async-tiff) — their explicit
-performance commitments are exactly the right model for our Rust crate:
+Distilled from `async-geotiff`'s stated commitments — keeping only what
+applies to a pure-Rust crate (buffer-protocol / Python FFI points dropped).
 
-1. **Rust core throughout** — no Python in the hot path. We don't pay Python
-   ↔ Rust crossings; the entire pipeline (read → decode → warp → render →
-   encode) is monomorphic Rust.
+1. **Monomorphic Rust hot path** — the entire pipeline (read → decode → warp
+   → render → encode) is compiled Rust; no FFI on the hot path beyond the
+   single `libproj` call per warp tile. Generics over pixel dtype are
+   monomorphised per `PixelData` variant.
 2. **CPU/IO split with two pools** — tokio for IO (object_store range
-   fetches), rayon for CPU (decode + warp + render + encode). Pattern mirrors
-   async-geotiff's `tokio_rayon` integration:
+   fetches), rayon for CPU (decode + warp + render + encode). Sketch:
    ```rust
-   // sketch
    let cpu = Arc::new(rayon::ThreadPoolBuilder::new().build()?);
    let bytes = tokio::task::spawn_blocking({
        let cpu = cpu.clone();
-       move || cpu.install(|| { decode_warp_render(...) })
+       move || cpu.install(|| decode_warp_render(...))
    }).await??;
    ```
-   The async executor is never blocked by decode, predictor unpacking, PROJ
-   warp, or PNG encode.
+   The async executor is never blocked by decode, predictor unpacking,
+   PROJ warp, or PNG encode.
 3. **Request coalescing for adjacent tiles** — two tiers:
    - **Within one tile**: `object_store::ObjectStore::get_ranges` merges
      adjacent COG tile byte-ranges into batched GETs. `async-tiff`'s
      `ObjectReader::fetch_tiles(coords)` already drives this.
-   - **Across concurrent tile requests** *(post-MVP optimisation)*: a per-COG
-     request coalescer that batches in-flight `Range<u64>` reads sharing a
-     near-window. Behind `trait CoalescingReader: AsyncFileReader` so the
-     base path stays simple.
-4. **Zero-copy data flow** — keep `ndarray::ArrayView*` borrowing across
-   pipeline stages; only materialise (`to_owned`) at the unavoidable seams
+   - **Across concurrent tile requests** *(post-MVP)*: a per-COG coalescer
+     that batches in-flight `Range<u64>` reads sharing a near-window. Behind
+     `trait CoalescingReader: AsyncFileReader` so the base path stays simple.
+4. **Zero-copy where ndarray allows** — keep `ArrayView*` borrowing across
+   pipeline stages; only materialise (`to_owned`) at unavoidable seams
    (planar → interleaved permute, encode). `Bytes` is reference-counted, so
    compressed tile payloads pass through to the decoder without copy.
-5. **Buffer-protocol-ready boundary** — define `RasterArray { data: Array3<T>,
-   mask, transform, crs, nodata }` as the seam between read / warp / render.
-   When/if we add PyO3 bindings later, `Array3<T>` exports a Python buffer
-   protocol view (same trick as `async_tiff::PyArray`) with no copy. Not
-   implemented in MVP, but the API surface is shaped for it.
-6. **Static colormap LUTs** — `colorous` constants compile in as
-   `&[[u8;3]]`. No runtime LUT generation on the hot path; user-supplied
-   stops compile to a 256-entry LUT once at request parse and are cached.
-7. **Precomputed style** — for a given `RenderSpec`, the parser produces a
-   `CompiledRenderSpec` (LUT baked, color formula AST resolved, rescale
-   factors precomputed). The hot path is a single fused pass.
-8. **Bounded concurrency** — `tokio::sync::Semaphore` caps in-flight
+5. **Static colormap LUTs** — `colorous` constants compile in as `&[[u8;3]]`;
+   user-supplied stops compile to a 256-entry LUT once at request parse.
+6. **Precomputed `CompiledRenderSpec`** — query → AST → resolved LUT +
+   formula plan + rescale factors. Hot path is a single fused
+   `Zip::par_for_each` pass per tile.
+7. **Bounded concurrency** — `tokio::sync::Semaphore` caps in-flight
    `spawn_blocking` decode tasks at `num_cpus`. Avoids unbounded rayon queue
    growth under burst load.
+8. **SIMD via fast_image_resize + ndarray** — runtime-detected SSE4/AVX2/NEON
+   in `fast_image_resize`; explicit `Zip::par_for_each` in our colormap /
+   rescale stages.
+
+Dropped on purpose (Python-FFI-only): buffer-protocol zero-copy boundary —
+n/a in a pure-Rust crate. If PyO3 bindings are added later, that concern
+re-enters the picture at that boundary.
 
 ## 6c. Render Module Types (borrowed from map-engine)
 
