@@ -12,3 +12,6 @@ pub mod style;
 pub mod tiler;
 pub mod tms;
 pub mod warp;
+
+#[cfg(feature = "server")]
+pub mod server;
