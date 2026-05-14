@@ -53,7 +53,7 @@ src/
   lib.rs              # re-exports, prelude
   error.rs            # AgError (thiserror), AgResult
   pixel.rs            # PixelData enum (U8/U16/I16/U32/I32/F32/F64) + dtype traits
-  bounds.rs           # Bbox, Affine helpers wrapping `affine` crate
+  bounds.rs           # Bbox, GeoTransform newtype wrapping raffine::Affine
   crs.rs              # Crs wrapper around `proj`; equality + transform builder
 
   io/
@@ -199,9 +199,11 @@ Request (tms, z, x, y, RenderSpec)
 8. **Colormaps**: `colorous` crate for matplotlib-faithful builtins (viridis /
    magma / plasma / inferno / cividis / turbo). `enterpolation::Linear` +
    `Clamp` only for **user-supplied** control points.
-9. **GeoTransform**: `geo::AffineTransform<f64>` (no standalone `affine`
-   crate exists). Internal `GeoTransform([f64;6])` newtype for ergonomics.
-   Derive from async-tiff's `model_tiepoint()` + `model_pixel_scale()` or
+9. **GeoTransform**: `raffine::Affine` — the user-authored Rust port of
+   Python's `affine` crate (`crates.io/crates/raffine`). API parity with
+   rasterio: `Affine::from_gdal(&[c,a,b,f,d,e])`, `*` for compose,
+   `!affine` for inverse, `affine * (x, y)` to apply. Derive from
+   async-tiff's `model_tiepoint()` + `model_pixel_scale()` or
    `model_transformation()`.
 10. **Mask priority** (rio-tiler parity): alpha band > GDAL_NODATA value > none.
     Generate alpha channel from mask in the encode step.
@@ -391,7 +393,7 @@ async-tiff        = "0.3"
 object_store      = { version = "0.11", features = ["http","aws"] }
 tile-grid         = "0.6"
 proj              = { version = "0.27", optional = true }
-geo               = "0.29"   # AffineTransform (no separate `affine` crate)
+raffine           = "0.2"    # author's own Rust port of Python `affine`
 ndarray           = { version = "0.16", features = ["rayon"] }
 fast_image_resize = { version = "5", features = ["rayon"] }
 palette           = "0.7"    # for Lab/Lch saturation per rio-color
