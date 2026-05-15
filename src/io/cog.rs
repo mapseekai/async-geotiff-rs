@@ -81,6 +81,19 @@ pub struct CogReader {
     /// Associated/UnassociatedAlpha. Mirrors rio-tiler's
     /// "alpha band > nodata > none" mask priority.
     alpha_bands: Vec<Option<usize>>,
+    /// Decoded-window cache. Keyed by `(level, col, row, w, h)`; value is a
+    /// shared `Arc<ImageData>` so cache hits clone a pointer, not a buffer.
+    window_cache: WindowCache,
+}
+
+fn build_window_cache(cfg: CacheConfig) -> WindowCache {
+    let mut builder = moka::future::Cache::builder()
+        .max_capacity(cfg.max_bytes)
+        .weigher(|_k: &WindowKey, v: &Arc<ImageData>| image_data_weight(v));
+    if let Some(ttl) = cfg.ttl {
+        builder = builder.time_to_live(ttl);
+    }
+    builder.build()
 }
 
 impl CogReader {
@@ -96,6 +109,16 @@ impl CogReader {
     /// Like [`open_http`] but lets the caller override [`ClientOptions`]
     /// (e.g. timeouts, proxy, custom headers).
     pub async fn open_http_with_options(url: &str, options: ClientOptions) -> AgResult<Self> {
+        Self::open_http_with_cache(url, options, CacheConfig::default()).await
+    }
+
+    /// Like [`open_http_with_options`] but also lets the caller size the
+    /// decoded-window cache.
+    pub async fn open_http_with_cache(
+        url: &str,
+        options: ClientOptions,
+        cache: CacheConfig,
+    ) -> AgResult<Self> {
         let (base, path) = split_http_url(url)?;
         let store: Arc<dyn ObjectStore> = Arc::new(
             HttpBuilder::new()
@@ -105,17 +128,25 @@ impl CogReader {
                 .map_err(|e| AgError::Tiff(format!("http store: {e}")))?,
         );
         let reader = ObjectReader::new(store, Path::from(path));
-        Self::open_with_reader(reader).await
+        Self::open_with_reader_and_cache(reader, cache).await
     }
 
     /// Open from an existing `ObjectReader` (lets callers wire any object_store).
     pub async fn open_with_reader(reader: ObjectReader) -> AgResult<Self> {
-        let cache = ReadaheadMetadataCache::new(reader.clone());
-        let mut md = TiffMetadataReader::try_open(&cache)
+        Self::open_with_reader_and_cache(reader, CacheConfig::default()).await
+    }
+
+    /// Open from an existing `ObjectReader` with an explicit cache config.
+    pub async fn open_with_reader_and_cache(
+        reader: ObjectReader,
+        cache: CacheConfig,
+    ) -> AgResult<Self> {
+        let md_cache = ReadaheadMetadataCache::new(reader.clone());
+        let mut md = TiffMetadataReader::try_open(&md_cache)
             .await
             .map_err(|e| AgError::Tiff(format!("metadata open: {e}")))?;
         let ifds = md
-            .read_all_ifds(&cache)
+            .read_all_ifds(&md_cache)
             .await
             .map_err(|e| AgError::Tiff(format!("read ifds: {e}")))?;
         let tiff = TIFF::new(ifds, md.endianness());
@@ -138,6 +169,7 @@ impl CogReader {
             data_ifds,
             mask_ifds,
             alpha_bands,
+            window_cache: build_window_cache(cache),
         })
     }
 
