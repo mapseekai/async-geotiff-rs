@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use async_tiff::metadata::{cache::ReadaheadMetadataCache, TiffMetadataReader};
 use async_tiff::reader::ObjectReader;
 use async_tiff::tags::PhotometricInterpretation;
 use async_tiff::{ImageFileDirectory, TIFF};
 use object_store::http::HttpBuilder;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ClientOptions, ObjectStore};
 
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
@@ -28,11 +30,22 @@ pub struct CogReader {
 
 impl CogReader {
     /// Open a remote COG over HTTPS (or any URL `object_store::http` supports).
+    ///
+    /// Uses tuned `ClientOptions` for tile-server workloads: large per-host
+    /// idle pool so concurrent tile requests reuse connections instead of
+    /// paying TLS handshake per fetch, and a 30s timeout.
     pub async fn open_http(url: &str) -> AgResult<Self> {
+        Self::open_http_with_options(url, default_client_options()).await
+    }
+
+    /// Like [`open_http`] but lets the caller override [`ClientOptions`]
+    /// (e.g. timeouts, proxy, custom headers).
+    pub async fn open_http_with_options(url: &str, options: ClientOptions) -> AgResult<Self> {
         let (base, path) = split_http_url(url)?;
         let store: Arc<dyn ObjectStore> = Arc::new(
             HttpBuilder::new()
                 .with_url(base)
+                .with_client_options(options)
                 .build()
                 .map_err(|e| AgError::Tiff(format!("http store: {e}")))?,
         );
@@ -218,6 +231,17 @@ fn transform_bbox(transform: GeoTransform, col: i64, row: i64, w: u64, h: u64) -
     let (x0, y0) = transform.forward(col as f64, row as f64);
     let (x1, y1) = transform.forward((col + w as i64) as f64, (row + h as i64) as f64);
     Bbox::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+}
+
+/// Defaults tuned for COG tile servers: keep many idle keep-alive sockets per
+/// origin so back-to-back tile requests skip the TLS handshake. Mirrors the
+/// `obstore` connection-pool tuning recommended for async-geotiff.
+fn default_client_options() -> ClientOptions {
+    ClientOptions::new()
+        .with_pool_max_idle_per_host(64)
+        .with_pool_idle_timeout(Duration::from_secs(90))
+        .with_timeout(Duration::from_secs(30))
+        .with_connect_timeout(Duration::from_secs(10))
 }
 
 fn split_http_url(url: &str) -> AgResult<(String, String)> {

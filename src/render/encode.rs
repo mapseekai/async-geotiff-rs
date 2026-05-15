@@ -1,10 +1,15 @@
 //! PNG encoder for interleaved RGBA `Array3<u8>` of shape `(H, W, 4)`.
+//!
+//! Tile servers favour fast encode over small files: a 256×256 RGBA tile
+//! goes back over the wire to the browser which immediately repaints. We
+//! configure `image::codecs::png::PngEncoder` with `CompressionType::Fast`
+//! and `FilterType::NoFilter` — roughly 3-5× faster than the default.
 
 use crate::error::AgResult;
 use bytes::Bytes;
-use image::{ImageBuffer, ImageFormat, Rgba};
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{ColorType, ImageEncoder};
 use ndarray::Array3;
-use std::io::Cursor;
 
 pub fn encode_png(rgba: &Array3<u8>) -> AgResult<Bytes> {
     let (h, w, c) = (
@@ -13,15 +18,15 @@ pub fn encode_png(rgba: &Array3<u8>) -> AgResult<Bytes> {
         rgba.shape()[2],
     );
     assert_eq!(c, 4, "expected RGBA channels");
-    let raw = rgba
-        .as_standard_layout()
+    let standard = rgba.as_standard_layout();
+    let raw = standard
         .as_slice()
-        .expect("rgba array must be contiguous")
-        .to_vec();
-    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(w, h, raw).expect("buffer size mismatches dims");
+        .expect("rgba array must be contiguous after as_standard_layout");
     let mut buf = Vec::with_capacity((w * h * 4) as usize);
-    img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)?;
+    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::NoFilter);
+    encoder
+        .write_image(raw, w, h, ColorType::Rgba8.into())
+        .map_err(|e| crate::error::AgError::Tiff(format!("png encode: {e}")))?;
     Ok(Bytes::from(buf))
 }
 
