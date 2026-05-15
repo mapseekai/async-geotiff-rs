@@ -39,8 +39,18 @@ pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
     let w = image.pixels.width();
     let n = h * w;
 
-    let src = image.pixels.to_f64();
     let auto_rgb = spec.auto_rgb && bands >= 3;
+
+    // Fast path: source already u8, 3 bands, identity rescale, no formula.
+    // Skip the f64 cast + per-pixel scale_to_u8: copy R/G/B bytes directly
+    // into the interleaved RGBA buffer. This is the dominant case for 8-bit
+    // RGB COGs (Sentinel TCI, NAIP, drone orthos), where every other render
+    // path is wasted CPU.
+    if let Some(rgba) = try_u8_rgb_fastpath(image, spec, auto_rgb, h, w) {
+        return encode_png(&rgba);
+    }
+
+    let src = image.pixels.to_f64();
     let bidx: Vec<usize> = if spec.bidx.is_empty() {
         match (auto_rgb, spec.composite.bands) {
             (true, _) => vec![0, 1, 2],
@@ -96,6 +106,104 @@ pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
     // `spec.tile_size`; if not, the encoded PNG simply matches input dims.
     let _ = spec.tile_size;
     encode_png(&rgba)
+}
+
+/// Returns Some(rgba) when the u8 RGB fast path applies. Conditions:
+/// - source PixelData is U8
+/// - bidx selects exactly three bands (explicit or auto_rgb)
+/// - composite is Rgb or auto_rgb is on (no colormap, no formula)
+/// - rescale is missing or identity-on-byte-range for all three bands
+///
+/// The buffer is filled with a single linear sweep over the source bands;
+/// nodata/mask only affect the alpha channel.
+fn try_u8_rgb_fastpath(
+    image: &ImageData,
+    spec: &CompiledRenderSpec,
+    auto_rgb: bool,
+    h: usize,
+    w: usize,
+) -> Option<Array3<u8>> {
+    use crate::pixel::PixelData;
+    use crate::render::composite::CompositeKind;
+
+    let src = match &image.pixels {
+        PixelData::U8(a) => a,
+        _ => return None,
+    };
+    if !spec.formula.is_empty() {
+        return None;
+    }
+    let bands = src.shape()[0];
+    let bidx: [usize; 3] = if spec.bidx.is_empty() {
+        if auto_rgb && bands >= 3 {
+            [0, 1, 2]
+        } else if matches!(spec.composite.kind, CompositeKind::Rgb) && bands >= 3 {
+            [0, 1, 2]
+        } else {
+            return None;
+        }
+    } else if spec.bidx.len() == 3 && spec.bidx.iter().all(|&b| b < bands) {
+        [spec.bidx[0], spec.bidx[1], spec.bidx[2]]
+    } else {
+        return None;
+    };
+    // Identity rescale check: empty, or each (lo, hi) is (0, 255).
+    let identity = spec.rescale.is_empty()
+        || (spec.rescale.len() == 3
+            && spec.rescale.iter().all(|(lo, hi)| *lo == 0.0 && *hi == 255.0));
+    if !identity {
+        return None;
+    }
+    let nodata = spec.nodata.or(image.nodata);
+    // Build RGBA. Layout: (H, W, 4). Sweep each source band once and scatter.
+    let mut rgba = Array3::<u8>::from_elem((h, w, 4), 0u8);
+    {
+        let dst = rgba
+            .as_slice_mut()
+            .expect("freshly-allocated Array3 standard layout");
+        // Source bands are planar (bands, H, W); take a flat slice per band.
+        let stride = h * w;
+        for (ch, b) in bidx.iter().enumerate() {
+            let band_off = b * stride;
+            let band = &src
+                .as_slice()
+                .expect("u8 PixelData contiguous")[band_off..band_off + stride];
+            for i in 0..stride {
+                dst[i * 4 + ch] = band[i];
+            }
+        }
+        // Alpha: 255 by default, 0 where mask is false or pixel matches nodata.
+        for i in 0..stride {
+            dst[i * 4 + 3] = 255;
+        }
+    }
+    // Apply mask / nodata to alpha as a single Zip pass.
+    if image.mask.is_some() || nodata.is_some() {
+        let nd_u8: Option<u8> = nodata.and_then(|nd| {
+            if nd.is_finite() && (0.0..=255.0).contains(&nd) {
+                Some(nd as u8)
+            } else {
+                None
+            }
+        });
+        Zip::indexed(rgba.slice_mut(s![.., .., 3])).for_each(|(r, c), a| {
+            if let Some(m) = &image.mask {
+                if !m[[r, c]] {
+                    *a = 0;
+                    return;
+                }
+            }
+            if let Some(nd) = nd_u8 {
+                let r_val = src[[bidx[0], r, c]];
+                let g_val = src[[bidx[1], r, c]];
+                let b_val = src[[bidx[2], r, c]];
+                if r_val == nd && g_val == nd && b_val == nd {
+                    *a = 0;
+                }
+            }
+        });
+    }
+    Some(rgba)
 }
 
 /// Build a `(h, w)` validity mask. Returns `None` if every pixel is valid so
