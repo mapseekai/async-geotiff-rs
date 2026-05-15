@@ -63,12 +63,32 @@ impl Tiler {
         //    Pad by 1 px on every side so the bilinear resampler always has
         //    valid neighbours at tile edges — otherwise adjacent XYZ tiles
         //    show white seams where samples fall just outside the read buffer.
+        //
+        //    Skip the halo when the read is "aligned": same CRS AND the
+        //    requested resolution matches this overview's native resolution
+        //    (scale ≈ 1). In that case the dst→src map is an integer
+        //    translation with unit scale — no fractional sampling, so the
+        //    resampler never reaches outside the window and the halo is pure
+        //    waste. Mirrors rio-tiler's `_requested_tile_aligned_with_
+        //    internal_tile` optimisation (reader.py:453-459); we use the
+        //    resolution-match condition because it is the actual cause of
+        //    edge-resampling artifacts, not internal-tile-grid alignment.
         let (rc, rr, rw, rh) = self
             .reader
             .level_transform(level)?
             .window_for_bbox(&bbox_in_src)
             .ok_or_else(|| AgError::Warp("source GeoTransform not invertible".into()))?;
-        let raw = (rc - 1, rr - 1, rw + 2, rh + 2);
+        let same_crs = self.reader.src_crs() == &dst_crs;
+        let level_gsd = self.reader.level_gsd(level).unwrap_or(target_gsd);
+        let res_matches = level_gsd > 0.0
+            && ((target_gsd - level_gsd).abs() / level_gsd) < 0.01;
+        let aligned = same_crs && res_matches;
+        let raw = if aligned {
+            tracing::debug!(target_gsd, level_gsd, "aligned read — skipping halo");
+            (rc, rr, rw, rh)
+        } else {
+            (rc - 1, rr - 1, rw + 2, rh + 2)
+        };
         let (col, row, w, h) = self.clamp_window(level, raw.0, raw.1, raw.2, raw.3)?;
         if w == 0 || h == 0 {
             let level_dims = self.reader.level_dimensions(level).ok();

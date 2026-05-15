@@ -113,6 +113,17 @@ impl CogReader {
         Ok((ifd.image_width(), ifd.image_height()))
     }
 
+    /// Internal tile dimensions of the chosen overview, or the full image
+    /// dims if the IFD is strip-based. Used by the `is_aligned` padding
+    /// optimisation (rio-tiler `_requested_tile_aligned_with_internal_tile`).
+    pub fn internal_tile_dims(&self, level: usize) -> AgResult<(u32, u32)> {
+        let ifd = self.data_ifd(level)?;
+        Ok((
+            ifd.tile_width().unwrap_or_else(|| ifd.image_width()),
+            ifd.tile_height().unwrap_or_else(|| ifd.image_height()),
+        ))
+    }
+
     pub fn level_transform(&self, level: usize) -> AgResult<GeoTransform> {
         let (full_w, full_h) = self.level_dimensions(0)?;
         let (level_w, level_h) = self.level_dimensions(level)?;
