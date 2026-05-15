@@ -28,6 +28,10 @@ pub struct CogReader {
     pub(crate) transform: GeoTransform,
     data_ifds: Vec<usize>,
     mask_ifds: Vec<Option<usize>>,
+    /// Per data-level, the band index (0-based) whose `ExtraSamples` is
+    /// Associated/UnassociatedAlpha. Mirrors rio-tiler's
+    /// "alpha band > nodata > none" mask priority.
+    alpha_bands: Vec<Option<usize>>,
 }
 
 impl CogReader {
@@ -69,6 +73,14 @@ impl CogReader {
 
         let (transform, src_crs) = derive_geo(&tiff)?;
         let (data_ifds, mask_ifds) = classify_ifds(&tiff)?;
+        let alpha_bands: Vec<Option<usize>> = data_ifds
+            .iter()
+            .map(|&idx| {
+                tiff.ifds()
+                    .get(idx)
+                    .and_then(|ifd| alpha_band_index(ifd))
+            })
+            .collect();
         Ok(Self {
             tiff,
             reader,
@@ -76,6 +88,7 @@ impl CogReader {
             transform,
             data_ifds,
             mask_ifds,
+            alpha_bands,
         })
     }
 
@@ -229,6 +242,23 @@ impl CogReader {
         .await
         .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
 
+        // Alpha-band → mask promotion (rio-tiler priority: alpha > nodata).
+        // Only applies when no separate mask IFD was present and the data
+        // IFD's ExtraSamples tags one band as alpha. `split_off_band` only
+        // runs when the index is in range, so the consume-on-call is safe.
+        let alpha_idx = self.alpha_bands.get(level).copied().flatten();
+        let (stitched, mask) = match (mask, alpha_idx) {
+            (None, Some(b)) if b < stitched.bands() => {
+                if let Some((rest, alpha)) = stitched.split_off_band(b) {
+                    (rest, Some(alpha))
+                } else {
+                    // Unreachable given the guard above, but keep the path total.
+                    return Err(AgError::Tiff("alpha-band split failed".into()));
+                }
+            }
+            (m, _) => (stitched, m),
+        };
+
         let level_transform = self.level_transform(level)?;
         let window_transform = level_transform.translated(col_off as f64, row_off as f64);
         let bbox_world = transform_bbox(level_transform, col_off, row_off, width, height);
@@ -379,6 +409,22 @@ fn classify_ifds(tiff: &TIFF) -> AgResult<(Vec<usize>, Vec<Option<usize>>)> {
 fn is_mask_ifd(ifd: &ImageFileDirectory) -> bool {
     ifd.new_subfile_type().is_some_and(|t| t & 4 != 0)
         && ifd.photometric_interpretation() == PhotometricInterpretation::TransparencyMask
+}
+
+/// 0-based index of the band tagged as Associated/UnassociatedAlpha via
+/// `ExtraSamples`. The alpha band is positioned after the
+/// PhotometricInterpretation-defined bands (3 for RGB, 1 for greyscale),
+/// so the alpha index is `(bands - extra_samples.len()) + offset_within_extra`.
+/// Returns None when there are no extra samples or none is tagged alpha.
+fn alpha_band_index(ifd: &ImageFileDirectory) -> Option<usize> {
+    use async_tiff::tags::ExtraSamples;
+    let extras = ifd.extra_samples()?;
+    let total_bands = ifd.samples_per_pixel() as usize;
+    let base = total_bands.checked_sub(extras.len())?;
+    extras.iter().enumerate().find_map(|(i, e)| {
+        matches!(e, ExtraSamples::AssociatedAlpha | ExtraSamples::UnassociatedAlpha)
+            .then_some(base + i)
+    })
 }
 
 #[cfg(test)]

@@ -7,11 +7,16 @@ pub enum Resampling {
     #[default]
     Nearest,
     Bilinear,
-    /// Catmull-Rom bicubic (16-tap). Sharper than bilinear with negligible
-    /// extra cost in `fast_image_resize`'s SIMD path; for the cross-CRS
-    /// fallback sampler, falls back to bilinear (cubic is overkill there
-    /// because PROJ error already dominates).
+    /// Catmull-Rom bicubic (4-tap). Sharper than bilinear, sharper than
+    /// Mitchell, default for most XYZ tile servers.
     Cubic,
+    /// Mitchell-Netravali bicubic (4-tap, B=1/3 C=1/3). Smoother than
+    /// Catmull-Rom — slightly blurrier but less ringing on edges.
+    /// Matches titiler's `resampling=cubic_spline`.
+    CubicSpline,
+    /// Lanczos3 windowed sinc (6-tap). Highest quality, slowest of the
+    /// SIMD kernels. Matches titiler's `resampling=lanczos`.
+    Lanczos,
 }
 
 impl Resampling {
@@ -20,6 +25,8 @@ impl Resampling {
             "nearest" => Some(Self::Nearest),
             "bilinear" => Some(Self::Bilinear),
             "cubic" | "bicubic" => Some(Self::Cubic),
+            "cubic_spline" | "mitchell" => Some(Self::CubicSpline),
+            "lanczos" | "lanczos3" => Some(Self::Lanczos),
             _ => None,
         }
     }
@@ -70,7 +77,10 @@ impl Resampling {
             }
             // Cross-CRS cubic uses the bilinear weight kernel (PROJ error
             // dominates; a true 16-tap scalar loop adds cost for no quality).
-            Self::Cubic | Self::Bilinear => {
+            // Cross-CRS sampler: all non-nearest kernels share the 4-tap
+            // bilinear path (PROJ error dominates; the SIMD wide kernels
+            // are exercised only in the same-CRS / subtile-affine fast path).
+            Self::Cubic | Self::Bilinear | Self::CubicSpline | Self::Lanczos => {
                 let c0 = cf.floor() as usize;
                 let r0 = rf.floor() as usize;
                 let c1 = (c0 + 1).min(w as usize - 1);

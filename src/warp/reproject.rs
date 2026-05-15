@@ -286,6 +286,8 @@ fn try_subtile_affine(
         Resampling::Nearest => fr::ResizeAlg::Nearest,
         Resampling::Bilinear => fr::ResizeAlg::Convolution(fr::FilterType::Bilinear),
         Resampling::Cubic => fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom),
+        Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
+        Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
     };
     let options = fr::ResizeOptions::new()
         .resize_alg(alg)
@@ -419,6 +421,8 @@ fn warp_affine(
         Resampling::Nearest => fr::ResizeAlg::Nearest,
         Resampling::Bilinear => fr::ResizeAlg::Convolution(fr::FilterType::Bilinear),
         Resampling::Cubic => fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom),
+        Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
+        Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
     };
     let options = fr::ResizeOptions::new()
         .resize_alg(alg)

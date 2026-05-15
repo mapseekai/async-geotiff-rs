@@ -216,6 +216,59 @@ mod tests {
         assert_relative_eq!(r, 0.015542, epsilon = 1e-4);
     }
 
+    /// Saturation property tests. We deliberately do NOT pin a byte-exact
+    /// number here: the only available reference value came from research
+    /// notes whose sigmoidal figure was already proven wrong (see the
+    /// derivation in `rio_color_sigmoidal_regression`), so a magic constant
+    /// from the same source is untrustworthy. Instead we assert the
+    /// invariants the Lab→Lch→RGB chroma scale must satisfy:
+    ///   - factor 1.0 is the identity,
+    ///   - factor 0.0 collapses to a neutral grey (R≈G≈B),
+    ///   - factor > 1 increases chroma (spread between max and min channel),
+    ///   - a pure grey input is invariant under any factor.
+    #[test]
+    fn saturation_identity_at_factor_one() {
+        let ops = parse("saturation 1.0").unwrap();
+        let (r, g, b) = apply(&ops, 0.392, 0.776, 0.164);
+        assert_relative_eq!(r, 0.392, epsilon = 1e-3);
+        assert_relative_eq!(g, 0.776, epsilon = 1e-3);
+        assert_relative_eq!(b, 0.164, epsilon = 1e-3);
+    }
+
+    #[test]
+    fn saturation_zero_is_greyscale() {
+        let ops = parse("saturation 0.0").unwrap();
+        let (r, g, b) = apply(&ops, 0.392, 0.776, 0.164);
+        // Chroma removed → all channels collapse to the same luminance grey.
+        assert_relative_eq!(r, g, epsilon = 2e-2);
+        assert_relative_eq!(g, b, epsilon = 2e-2);
+    }
+
+    #[test]
+    fn saturation_increases_channel_spread() {
+        let spread = |c: (f64, f64, f64)| {
+            let mx = c.0.max(c.1).max(c.2);
+            let mn = c.0.min(c.1).min(c.2);
+            mx - mn
+        };
+        let base = (0.392, 0.776, 0.164);
+        let more = apply(&parse("saturation 1.5").unwrap(), base.0, base.1, base.2);
+        assert!(
+            spread(more) > spread(base),
+            "saturation 1.5 should widen channel spread: {:?} vs base {:?}",
+            more,
+            base
+        );
+    }
+
+    #[test]
+    fn saturation_grey_input_invariant() {
+        let (r, g, b) = apply(&parse("saturation 2.0").unwrap(), 0.5, 0.5, 0.5);
+        assert_relative_eq!(r, 0.5, epsilon = 1e-3);
+        assert_relative_eq!(g, 0.5, epsilon = 1e-3);
+        assert_relative_eq!(b, 0.5, epsilon = 1e-3);
+    }
+
     #[test]
     fn sigmoidal_zero_contrast_is_identity() {
         let (r, g, b) = apply(
