@@ -65,7 +65,7 @@ pub fn stitch<A: Borrow<Array>>(
                 let arr = arr.borrow();
                 let tile_col = (*tx as i64) * tw;
                 let tile_row = (*ty as i64) * th;
-                let typed = match arr.data() {
+                let typed: &[$t] = match arr.data() {
                     TypedArray::$variant(v) => v.as_slice(),
                     _ => {
                         return Err(AgError::Tiff(
@@ -74,8 +74,11 @@ pub fn stitch<A: Borrow<Array>>(
                     }
                 };
                 let shape = arr.shape();
-                let typed_arr = arrange_planar::<$t>(typed, shape, planar)?;
-                let s = typed_arr.shape();
+                // Zero-copy view over the decoded tile's raw slice; `permuted_axes`
+                // is also a view (no alloc). The single allocation per tile is
+                // gone — only the final `assign` does a memcpy into `out`.
+                let typed_view = arrange_planar_view::<$t>(typed, shape, planar)?;
+                let s = typed_view.shape();
                 let (a_h, a_w) = (s[1] as i64, s[2] as i64);
 
                 let world_r0 = tile_row.max(row_off);
@@ -94,10 +97,10 @@ pub fn stitch<A: Borrow<Array>>(
                 let dst_c0 = (world_c0 - col_off) as usize;
                 let dst_c1 = (world_c1 - col_off) as usize;
                 let band_take = bands.min(s[0]);
-                let src_view =
-                    typed_arr.slice(s![..band_take, src_r0..src_r1, src_c0..src_c1]);
+                let src_sub =
+                    typed_view.slice(s![..band_take, src_r0..src_r1, src_c0..src_c1]);
                 out.slice_mut(s![..band_take, dst_r0..dst_r1, dst_c0..dst_c1])
-                    .assign(&src_view);
+                    .assign(&src_sub);
             }
             Ok(PixelData::$wrap(out))
         }};
@@ -121,19 +124,39 @@ pub fn stitch<A: Borrow<Array>>(
     }
 }
 
-/// Reorganise a typed slice into an `Array3<T>` in planar `(bands, H, W)`
-/// layout. Handles both `Planar` (already planar) and `Chunky` (samples
-/// interleaved per pixel) configurations via a single `permuted_axes` view.
-fn arrange_planar<T: Copy + 'static>(
+/// Owned `Array3<U>` from a typed slice via an element-wise mapping —
+/// used by the upcast-to-f32 fallback where allocation is unavoidable.
+fn upcast_owned<T, U: 'static + Copy>(
     src: &[T],
     shape: [usize; 3],
     planar: PlanarConfiguration,
-) -> AgResult<Array3<T>> {
-    let arr = Array3::from_shape_vec(shape, src.to_vec())
-        .map_err(|e| AgError::Tiff(format!("stitch shape: {e}")))?;
+    f: impl Fn(&T) -> U,
+) -> AgResult<Array3<U>> {
+    let mapped: Vec<U> = src.iter().map(f).collect();
+    let arr = Array3::from_shape_vec(shape, mapped)
+        .map_err(|e| AgError::Tiff(format!("upcast shape: {e}")))?;
     match planar {
         PlanarConfiguration::Planar => Ok(arr),
         PlanarConfiguration::Chunky => Ok(arr.permuted_axes([2, 0, 1])),
+        _ => Err(AgError::UnsupportedPixel(
+            "unknown planar configuration".into(),
+        )),
+    }
+}
+
+/// Zero-copy view of a typed decoded-tile slice in planar `(bands, H, W)`
+/// layout. Planar inputs view directly; chunky inputs use `permuted_axes`,
+/// which is still a view (axis re-ordering only) — no allocation.
+fn arrange_planar_view<'a, T: 'static>(
+    src: &'a [T],
+    shape: [usize; 3],
+    planar: PlanarConfiguration,
+) -> AgResult<ndarray::ArrayView3<'a, T>> {
+    let view = ndarray::ArrayView3::<T>::from_shape(shape, src)
+        .map_err(|e| AgError::Tiff(format!("stitch shape: {e}")))?;
+    match planar {
+        PlanarConfiguration::Planar => Ok(view),
+        PlanarConfiguration::Chunky => Ok(view.permuted_axes([2, 0, 1])),
         _ => Err(AgError::UnsupportedPixel(
             "unknown planar configuration".into(),
         )),
@@ -162,26 +185,12 @@ fn stitch_upcast_to_f32<A: Borrow<Array>>(
         let tile_row = (*ty as i64) * th;
         let shape = arr.shape();
         let typed_f32: Array3<f32> = match arr.data() {
-            TypedArray::Int8(v) => arrange_planar(
-                &v.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-                shape,
-                planar,
-            )?,
-            TypedArray::Int64(v) => arrange_planar(
-                &v.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-                shape,
-                planar,
-            )?,
-            TypedArray::UInt64(v) => arrange_planar(
-                &v.iter().map(|&x| x as f32).collect::<Vec<_>>(),
-                shape,
-                planar,
-            )?,
-            TypedArray::Bool(v) => arrange_planar(
-                &v.iter().map(|&x| if x { 1.0f32 } else { 0.0 }).collect::<Vec<_>>(),
-                shape,
-                planar,
-            )?,
+            TypedArray::Int8(v) => upcast_owned(v, shape, planar, |&x| x as f32)?,
+            TypedArray::Int64(v) => upcast_owned(v, shape, planar, |&x| x as f32)?,
+            TypedArray::UInt64(v) => upcast_owned(v, shape, planar, |&x| x as f32)?,
+            TypedArray::Bool(v) => {
+                upcast_owned(v, shape, planar, |&x| if x { 1.0f32 } else { 0.0 })?
+            }
             _ => unreachable!("stitch_upcast_to_f32 called with non-upcast variant"),
         };
         let s = typed_f32.shape();
