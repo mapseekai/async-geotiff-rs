@@ -181,7 +181,10 @@ fn try_u8_rgb_fastpath(
         let g_val = g_band[i];
         let b_val = b_band[i];
         let masked = matches!(mask_slice, Some(m) if !m[i]);
-        let nd_hit = matches!(nd_u8, Some(nd) if r_val == nd && g_val == nd && b_val == nd);
+        // Per-band nodata semantics matching GDAL/rio-tiler: a pixel is
+        // invalid if ANY band reads the nodata sentinel — not only when
+        // all three happen to coincide.
+        let nd_hit = matches!(nd_u8, Some(nd) if r_val == nd || g_val == nd || b_val == nd);
         let alpha: u8 = if masked || nd_hit { 0 } else { 255 };
         let base = i * 4;
         dst[base] = r_val;

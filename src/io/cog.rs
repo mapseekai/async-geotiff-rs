@@ -115,19 +115,34 @@ impl CogReader {
         Ok(x_res.max(y_res))
     }
 
+    /// Pick the finest overview whose ground-sample distance is still ≥ the
+    /// target (or the coarsest available if every overview is finer than
+    /// target). Matches rio-tiler / gdalwarp behaviour — previously we
+    /// returned the coarsest level ≤ target, which under-resolved every
+    /// tile by one overview level.
     pub fn pick_overview(&self, target_gsd: f64) -> usize {
-        let mut best = 0usize;
-        let mut best_gsd = self.level_gsd(0).unwrap_or(0.0);
-        for level in 0..self.level_count() {
-            let Ok(gsd) = self.level_gsd(level) else {
-                continue;
-            };
-            if gsd <= target_gsd && gsd >= best_gsd {
-                best = level;
-                best_gsd = gsd;
+        let levels: Vec<(usize, f64)> = (0..self.level_count())
+            .filter_map(|l| self.level_gsd(l).ok().map(|g| (l, g)))
+            .collect();
+        if levels.is_empty() {
+            return 0;
+        }
+        // Find finest (smallest gsd) level whose gsd >= target.
+        let mut best: Option<(usize, f64)> = None;
+        for &(l, gsd) in &levels {
+            if gsd >= target_gsd && best.map_or(true, |(_, b)| gsd < b) {
+                best = Some((l, gsd));
             }
         }
-        best
+        if let Some((l, _)) = best {
+            return l;
+        }
+        // All overviews are finer than target → coarsest available.
+        levels
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|&(l, _)| l)
+            .unwrap_or(0)
     }
 
     /// Read a pixel window from the chosen overview level.
@@ -260,10 +275,22 @@ impl CogReader {
 
 }
 
+/// World-space AABB of a pixel rectangle under any (possibly rotated/sheared)
+/// GeoTransform. Previously only sampled two opposite corners, which produced
+/// the wrong bbox for rotated COGs (where the world-space pixel grid is not
+/// axis-aligned).
 fn transform_bbox(transform: GeoTransform, col: i64, row: i64, w: u64, h: u64) -> Bbox {
-    let (x0, y0) = transform.forward(col as f64, row as f64);
-    let (x1, y1) = transform.forward((col + w as i64) as f64, (row + h as i64) as f64);
-    Bbox::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
+    let c0 = col as f64;
+    let r0 = row as f64;
+    let c1 = (col + w as i64) as f64;
+    let r1 = (row + h as i64) as f64;
+    let corners = [
+        transform.forward(c0, r0),
+        transform.forward(c1, r0),
+        transform.forward(c1, r1),
+        transform.forward(c0, r1),
+    ];
+    Bbox::from_corners(&corners)
 }
 
 /// Defaults tuned for COG tile servers: keep many idle keep-alive sockets per

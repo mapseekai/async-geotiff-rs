@@ -111,9 +111,13 @@ pub fn warp(
     let mut mask = Array2::<bool>::from_elem((dst_h, dst_w), true);
 
     // Per-column precomputation: j0/j1/dj table reused for every row.
+    // Pixel-center sampling: dst column c spans world width 1/dst_w of the
+    // tile; its centre maps to fractional grid index `(c + 0.5) / dst_w * N`.
+    // Earlier (c / dst_w) put the sample at the pixel corner, causing a
+    // 0.5-px global offset versus gdalwarp / rio-tiler.
     let col_table: Vec<(usize, usize, f64)> = (0..dst_w)
         .map(|c| {
-            let gj = (c as f64) * (N as f64) / (dst_w as f64);
+            let gj = (c as f64 + 0.5) * (N as f64) / (dst_w as f64);
             let j0 = (gj.floor() as usize).min(N - 1);
             (j0, j0 + 1, gj - j0 as f64)
         })
@@ -132,7 +136,7 @@ pub fn warp(
     let rows: Vec<(usize, Vec<bool>, Vec<Vec<f64>>)> = (0..dst_h)
         .into_par_iter()
         .map(|r| {
-            let gi = (r as f64) * (N as f64) / (dst_h as f64);
+            let gi = (r as f64 + 0.5) * (N as f64) / (dst_h as f64);
             let i0 = (gi.floor() as usize).min(N - 1);
             let i1 = i0 + 1;
             let di = gi - i0 as f64;
@@ -356,9 +360,16 @@ fn try_subtile_affine(
         "cross-CRS subtile-affine fast path"
     );
 
+    let mask = resample_mask_nearest(
+        src.mask.as_ref(),
+        (crop_left, crop_top, crop_w, crop_h),
+        dst_w,
+        dst_h,
+    )?;
+
     Ok(Some(ImageData {
         pixels,
-        mask: None,
+        mask,
         bbox: dst_bbox,
         crs: dst_crs.clone(),
         transform: dst_transform,
@@ -480,15 +491,62 @@ fn warp_affine(
         }
     };
 
+    let mask = resample_mask_nearest(
+        src.mask.as_ref(),
+        (crop_left, crop_top, crop_w_clamped, crop_h_clamped),
+        dst_w,
+        dst_h,
+    )?;
+
     let _ = bands;
     Ok(ImageData {
         pixels,
-        mask: None,
+        mask,
         bbox: dst_bbox,
         crs: dst_crs.clone(),
         transform: dst_transform,
         nodata: src.nodata,
     })
+}
+
+/// Resample an `Array2<bool>` validity mask through the same crop+resize
+/// transform as the data bands, using `fast_image_resize`'s nearest-neighbour
+/// SIMD path on a u8 (0/255) representation. Returns `None` when `src_mask`
+/// is `None`; this is the helper that closes the "mask dropped on fast
+/// path" correctness gap between the SIMD warp and the scalar fallback.
+/// Resample an `Array2<bool>` validity mask through the same crop+resize
+/// transform as the data bands, using `fast_image_resize`'s nearest-neighbour
+/// SIMD path on a u8 (0/255) representation. Closes the "mask dropped on
+/// fast path" correctness gap between SIMD warp and the scalar fallback.
+fn resample_mask_nearest(
+    src_mask: Option<&ndarray::Array2<bool>>,
+    crop: (f64, f64, f64, f64),
+    dst_w: usize,
+    dst_h: usize,
+) -> AgResult<Option<ndarray::Array2<bool>>> {
+    use fast_image_resize as fr;
+    let Some(mask) = src_mask else {
+        return Ok(None);
+    };
+    let (h, w) = mask.dim();
+    let bytes: Vec<u8> = mask.iter().map(|&v| if v { 255u8 } else { 0u8 }).collect();
+    let src_img =
+        fr::images::Image::from_vec_u8(w as u32, h as u32, bytes, fr::PixelType::U8)
+            .map_err(|e| AgError::Warp(format!("mask resize src: {e}")))?;
+    let mut dst_img = fr::images::Image::new(dst_w as u32, dst_h as u32, fr::PixelType::U8);
+    // Always nearest for masks — bilinear/cubic smudges sharp boundaries.
+    let mask_opts = fr::ResizeOptions::new()
+        .resize_alg(fr::ResizeAlg::Nearest)
+        .crop(crop.0, crop.1, crop.2, crop.3);
+    let mut resizer = fr::Resizer::new();
+    resizer
+        .resize(&src_img, &mut dst_img, Some(&mask_opts))
+        .map_err(|e| AgError::Warp(format!("mask resize: {e}")))?;
+    let dst_bytes = dst_img.into_vec();
+    let bools: Vec<bool> = dst_bytes.iter().map(|&v| v != 0).collect();
+    let out = ndarray::Array2::from_shape_vec((dst_h, dst_w), bools)
+        .map_err(|e| AgError::Warp(format!("mask reshape: {e}")))?;
+    Ok(Some(out))
 }
 
 /// Per-band loop driving `fast_image_resize`, parallelised over bands via
@@ -554,6 +612,12 @@ fn sample_valid(
     col: f64,
     row: f64,
 ) -> bool {
+    // NaN guard: PROJ at antimeridian / pole can return NaN. Without the
+    // `is_finite` check the `as i64` cast silently produces 0, marking the
+    // tile corner as a "valid" sample at (0, 0).
+    if !col.is_finite() || !row.is_finite() {
+        return false;
+    }
     let c = col.round() as i64;
     let r = row.round() as i64;
     if c < 0 || r < 0 || c >= width as i64 || r >= height as i64 {

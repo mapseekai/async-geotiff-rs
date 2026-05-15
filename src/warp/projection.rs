@@ -16,6 +16,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
@@ -60,7 +61,7 @@ thread_local! {
     /// Per-blocking-thread cache of `(src, dst) → Projector`. `Proj` is
     /// `!Send`, so we cannot share across threads — this is the only
     /// place a Projector lives.
-    static PROJ_CACHE: RefCell<HashMap<(Crs, Crs), Projector>> = RefCell::new(HashMap::new());
+    static PROJ_CACHE: RefCell<HashMap<(Crs, Crs), Rc<Projector>>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(feature = "proj")]
@@ -74,20 +75,22 @@ pub fn with_cached<R>(
     dst: &Crs,
     f: impl FnOnce(&Projector) -> AgResult<R>,
 ) -> AgResult<R> {
-    PROJ_CACHE.with(|cell| {
-        let key = (src.clone(), dst.clone());
-        // Build on miss outside the borrow scope to keep RefCell usage tight.
-        let need_build = !cell.borrow().contains_key(&key);
-        if need_build {
+    let key = (src.clone(), dst.clone());
+    // 1) Materialise/insert under a short mutable borrow.
+    PROJ_CACHE.with(|cell| -> AgResult<()> {
+        if !cell.borrow().contains_key(&key) {
             let p = Projector::new(src, dst)?;
-            cell.borrow_mut().insert(key.clone(), p);
+            cell.borrow_mut().insert(key.clone(), Rc::new(p));
         }
-        let map = cell.borrow();
-        let proj = map
-            .get(&key)
-            .expect("just inserted if missing");
-        f(proj)
-    })
+        Ok(())
+    })?;
+    // 2) Clone the Rc and release the borrow before calling `f` — `f` is
+    //    free to re-enter `with_cached` for any other key without
+    //    triggering RefCell BorrowMutError.
+    let proj: Rc<Projector> = PROJ_CACHE
+        .with(|cell| cell.borrow().get(&key).cloned())
+        .expect("just inserted if missing");
+    f(&proj)
 }
 
 /// Convert a batch of points from `src` to `dst` in place. For the very
