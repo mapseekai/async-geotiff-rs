@@ -89,43 +89,93 @@ pub fn warp(
         return Ok(out);
     }
 
+    // -- Scalar fallback (cross-CRS, not approximable by single rectangle) --
+    // Optimisations vs. the previous nested triple loop:
+    //   1. Per-column (sc, sr, j0/dj) are precomputed once per row, not per
+    //      band — the original layout recomputed grid coords inside the
+    //      band loop and re-took `src_f64.index_axis(b)` on every pixel.
+    //   2. Per-band views (`src_f64.index_axis`) are hoisted outside the
+    //      pixel loop — one view per band per row.
+    //   3. Output rows are independent → `par_chunks_mut` over rayon.
+    //   4. The mask is computed once per pixel (not per band) and read from
+    //      `src.mask` only at the row level.
     let bands = src.pixels.bands();
     let src_f64 = src.pixels.to_f64();
     let fill = src.nodata.unwrap_or(0.0);
     let src_h = src_f64.shape()[1];
     let src_w = src_f64.shape()[2];
 
+    // Output: planar (bands, h, w) flat allocation. Slice per band so each
+    // rayon row writes contiguous memory.
     let mut out = Array3::<f64>::zeros((bands, dst_h, dst_w));
     let mut mask = Array2::<bool>::from_elem((dst_h, dst_w), true);
-    for r in 0..dst_h {
-        let gi = (r as f64) * (N as f64) / (dst_h as f64);
-        let i0 = (gi.floor() as usize).min(N - 1);
-        let i1 = i0 + 1;
-        let di = gi - i0 as f64;
-        for c in 0..dst_w {
+
+    // Per-column precomputation: j0/j1/dj table reused for every row.
+    let col_table: Vec<(usize, usize, f64)> = (0..dst_w)
+        .map(|c| {
             let gj = (c as f64) * (N as f64) / (dst_w as f64);
             let j0 = (gj.floor() as usize).min(N - 1);
-            let j1 = j0 + 1;
-            let dj = gj - j0 as f64;
-            let p00 = grid_src_pix[i0 * (N + 1) + j0];
-            let p01 = grid_src_pix[i0 * (N + 1) + j1];
-            let p10 = grid_src_pix[i1 * (N + 1) + j0];
-            let p11 = grid_src_pix[i1 * (N + 1) + j1];
-            let sc = p00.0 * (1.0 - di) * (1.0 - dj)
-                + p01.0 * (1.0 - di) * dj
-                + p10.0 * di * (1.0 - dj)
-                + p11.0 * di * dj;
-            let sr = p00.1 * (1.0 - di) * (1.0 - dj)
-                + p01.1 * (1.0 - di) * dj
-                + p10.1 * di * (1.0 - dj)
-                + p11.1 * di * dj;
-            mask[[r, c]] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
-            let valid_view = src.mask.as_ref().map(|m| m.view());
-            for b in 0..bands {
-                let band_view = src_f64.index_axis(ndarray::Axis(0), b);
-                out[[b, r, c]] =
-                    resampling.sample_masked(band_view, valid_view, sc, sr, fill);
+            (j0, j0 + 1, gj - j0 as f64)
+        })
+        .collect();
+
+    // Hoist band views out of the hot loop.
+    let band_views: Vec<ndarray::ArrayView2<f64>> = (0..bands)
+        .map(|b| src_f64.index_axis(ndarray::Axis(0), b))
+        .collect();
+    let src_mask_view = src.mask.as_ref().map(|m| m.view());
+
+    // Process each row in parallel. Output band slices are disjoint along
+    // the row dimension, so we collect per-row (mask_row, [band_row,...])
+    // results and copy into `out`/`mask` after the parallel section.
+    use rayon::prelude::*;
+    let rows: Vec<(usize, Vec<bool>, Vec<Vec<f64>>)> = (0..dst_h)
+        .into_par_iter()
+        .map(|r| {
+            let gi = (r as f64) * (N as f64) / (dst_h as f64);
+            let i0 = (gi.floor() as usize).min(N - 1);
+            let i1 = i0 + 1;
+            let di = gi - i0 as f64;
+            let row_i0 = i0 * (N + 1);
+            let row_i1 = i1 * (N + 1);
+
+            let mut mask_row = vec![true; dst_w];
+            let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
+
+            for (c, &(j0, j1, dj)) in col_table.iter().enumerate() {
+                let p00 = grid_src_pix[row_i0 + j0];
+                let p01 = grid_src_pix[row_i0 + j1];
+                let p10 = grid_src_pix[row_i1 + j0];
+                let p11 = grid_src_pix[row_i1 + j1];
+                let w00 = (1.0 - di) * (1.0 - dj);
+                let w01 = (1.0 - di) * dj;
+                let w10 = di * (1.0 - dj);
+                let w11 = di * dj;
+                let sc = p00.0 * w00 + p01.0 * w01 + p10.0 * w10 + p11.0 * w11;
+                let sr = p00.1 * w00 + p01.1 * w01 + p10.1 * w10 + p11.1 * w11;
+
+                mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
+                for (b, band_view) in band_views.iter().enumerate() {
+                    band_rows[b][c] =
+                        resampling.sample_masked(*band_view, src_mask_view, sc, sr, fill);
+                }
             }
+            (r, mask_row, band_rows)
+        })
+        .collect();
+
+    // Scatter back into output buffers (cheap; rows already contiguous).
+    for (r, mask_row, band_rows) in rows {
+        for (c, m) in mask_row.into_iter().enumerate() {
+            mask[[r, c]] = m;
+        }
+        for (b, row_vals) in band_rows.into_iter().enumerate() {
+            let mut dst_band = out.index_axis_mut(ndarray::Axis(0), b);
+            let mut dst_row = dst_band.row_mut(r);
+            let dst_slice = dst_row
+                .as_slice_mut()
+                .expect("row_mut of Array3 is contiguous along last axis");
+            dst_slice.copy_from_slice(&row_vals);
         }
     }
 
