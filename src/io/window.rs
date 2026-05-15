@@ -6,7 +6,7 @@ use crate::error::{AgError, AgResult};
 use crate::pixel::PixelData;
 use async_tiff::tags::PlanarConfiguration;
 use async_tiff::{Array, ImageFileDirectory, TypedArray};
-use ndarray::{Array2, Array3};
+use ndarray::{s, Array2, Array3};
 
 /// Convert pixel window to inclusive tile coordinate range
 /// (tx_min..=tx_max, ty_min..=ty_max). Returns None if the IFD lacks tile dims.
@@ -43,31 +43,42 @@ pub fn stitch<A: Borrow<Array>>(
     let th = tile_height(ifd) as i64;
     let bands = ifd.samples_per_pixel() as usize;
 
-    let mut out = Array3::<f64>::zeros((bands, height as usize, width as usize));
+    let dst_h = height as usize;
+    let dst_w = width as usize;
+    let mut out = Array3::<f64>::zeros((bands, dst_h, dst_w));
+
     for ((tx, ty), arr) in coords.iter().zip(arrays.iter()) {
         let arr = arr.borrow();
         let tile_col = (*tx as i64) * tw;
         let tile_row = (*ty as i64) * th;
         let arr_f64 = array_to_f64(arr, ifd.planar_configuration())?;
         let shape = arr_f64.shape();
-        let (a_h, a_w) = (shape[1], shape[2]);
-        for b in 0..bands.min(shape[0]) {
-            for r in 0..a_h {
-                let world_row = tile_row + r as i64;
-                if world_row < row_off || world_row >= row_off + height as i64 {
-                    continue;
-                }
-                for c in 0..a_w {
-                    let world_col = tile_col + c as i64;
-                    if world_col < col_off || world_col >= col_off + width as i64 {
-                        continue;
-                    }
-                    let dst_r = (world_row - row_off) as usize;
-                    let dst_c = (world_col - col_off) as usize;
-                    out[[b, dst_r, dst_c]] = arr_f64[[b, r, c]];
-                }
-            }
+        let (a_h, a_w) = (shape[1] as i64, shape[2] as i64);
+
+        // Intersect tile with requested window in world-pixel coordinates.
+        let world_r0 = tile_row.max(row_off);
+        let world_r1 = (tile_row + a_h).min(row_off + height as i64);
+        let world_c0 = tile_col.max(col_off);
+        let world_c1 = (tile_col + a_w).min(col_off + width as i64);
+        if world_r1 <= world_r0 || world_c1 <= world_c0 {
+            continue;
         }
+
+        let src_r0 = (world_r0 - tile_row) as usize;
+        let src_r1 = (world_r1 - tile_row) as usize;
+        let src_c0 = (world_c0 - tile_col) as usize;
+        let src_c1 = (world_c1 - tile_col) as usize;
+        let dst_r0 = (world_r0 - row_off) as usize;
+        let dst_r1 = (world_r1 - row_off) as usize;
+        let dst_c0 = (world_c0 - col_off) as usize;
+        let dst_c1 = (world_c1 - col_off) as usize;
+        let band_take = bands.min(shape[0]);
+
+        // Single bulk-copy per (band, sub-rect) — ndarray's `assign` is a
+        // memcpy when both src and dst are contiguous along the inner axis.
+        let src_view = arr_f64.slice(s![..band_take, src_r0..src_r1, src_c0..src_c1]);
+        out.slice_mut(s![..band_take, dst_r0..dst_r1, dst_c0..dst_c1])
+            .assign(&src_view);
     }
     Ok(PixelData::F64(out))
 }
@@ -90,22 +101,26 @@ pub fn stitch_mask<A: Borrow<Array>>(
         let tile_row = (*ty as i64) * th;
         let mask = array_to_mask(arr, ifd.planar_configuration())?;
         let shape = mask.shape();
-        let (a_h, a_w) = (shape[0], shape[1]);
-        for r in 0..a_h {
-            let world_row = tile_row + r as i64;
-            if world_row < row_off || world_row >= row_off + height as i64 {
-                continue;
-            }
-            for c in 0..a_w {
-                let world_col = tile_col + c as i64;
-                if world_col < col_off || world_col >= col_off + width as i64 {
-                    continue;
-                }
-                let dst_r = (world_row - row_off) as usize;
-                let dst_c = (world_col - col_off) as usize;
-                out[[dst_r, dst_c]] = mask[[r, c]];
-            }
+        let (a_h, a_w) = (shape[0] as i64, shape[1] as i64);
+
+        let world_r0 = tile_row.max(row_off);
+        let world_r1 = (tile_row + a_h).min(row_off + height as i64);
+        let world_c0 = tile_col.max(col_off);
+        let world_c1 = (tile_col + a_w).min(col_off + width as i64);
+        if world_r1 <= world_r0 || world_c1 <= world_c0 {
+            continue;
         }
+        let src_r0 = (world_r0 - tile_row) as usize;
+        let src_r1 = (world_r1 - tile_row) as usize;
+        let src_c0 = (world_c0 - tile_col) as usize;
+        let src_c1 = (world_c1 - tile_col) as usize;
+        let dst_r0 = (world_r0 - row_off) as usize;
+        let dst_r1 = (world_r1 - row_off) as usize;
+        let dst_c0 = (world_c0 - col_off) as usize;
+        let dst_c1 = (world_c1 - col_off) as usize;
+
+        out.slice_mut(s![dst_r0..dst_r1, dst_c0..dst_c1])
+            .assign(&mask.slice(s![src_r0..src_r1, src_c0..src_c1]));
     }
     Ok(out)
 }
