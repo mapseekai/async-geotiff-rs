@@ -14,9 +14,8 @@
 //! rate is high after warm-up. This is the Rust-side analogue of the
 //! async-geotiff guidance to "do PROJ init once, reuse the handle".
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+#[cfg(feature = "proj")]
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};

@@ -20,9 +20,24 @@ MVP (v0.0.1). See:
 ## Quick start
 
 ```bash
-cargo run --example serve --features server -- https://example.com/cog.tif
-# then
-curl 'http://localhost:8080/tiles/WebMercatorQuad/0/0/0.png?colormap_name=viridis&rescale=0,3000'
+cargo run --release --example serve -- https://example.com/cog.tif
+
+# Or omit the URL to browse local data/*.tif files with the dataset picker.
+cargo run --release --example serve
+
+# then open one of:
+# http://127.0.0.1:8080/maplibre
+# http://127.0.0.1:8080/openlayers
+# http://127.0.0.1:8080/leaflet
+
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?colormap_name=viridis&rescale=0,3000'
+```
+
+The example server binds to `127.0.0.1:8080` by default. To expose it on a
+network interface, set `ASYNC_GEOTIFF_BIND`, for example:
+
+```bash
+ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 ```
 
 ## URL contract (titiler-compatible subset)
@@ -39,10 +54,12 @@ behind feature flags post-MVP).
 | `color_formula` | no  | `?color_formula=gamma%20RGB%201.5` | rio-color subset (`gamma`, `sigmoidal`, `saturation`) |
 | `resampling`    | no  | `?resampling=bilinear` | `nearest` (default), `bilinear` |
 | `reproject`     | no  | `?reproject=bilinear` | warp-time kernel |
-| `tilesize`      | no  | `?tilesize=512` | default 256 |
+| `tilesize`      | no  | `?tilesize=512` | default 256; allowed values: 64, 128, 256, 512, 1024 |
 
 Default tile size is **256** (not titiler's 512) for wider XYZ-client
-compatibility; pass `?tilesize=512` to override.
+compatibility; pass `?tilesize=512` to override. Tile sizes are restricted to
+the power-of-two values above to prevent unbounded allocations and keep viewer
+tile grids predictable.
 
 ## Supported TileMatrixSets
 
@@ -56,8 +73,7 @@ unified to F64 at the read/warp seam.
 
 ## Build requirements
 
-- Rust ≥ 1.85 (the 2026 crate ecosystem needs `edition2024` transitives;
-  no `rust-toolchain.toml` is committed, so any stable ≥1.85 works).
+- Rust ≥ 1.88, matching `Cargo.toml`'s `rust-version`.
 - For the default `proj` feature: `libproj` 9.x on the system
   (`brew install proj` on macOS; `apt install libproj-dev libsqlite3-dev
   libtiff-dev clang` on Debian/Ubuntu).
@@ -66,7 +82,7 @@ unified to F64 at the read/warp seam.
 ## Architecture
 
 ```
-HTTP request (axum)
+Example HTTP request (axum, `examples/serve.rs`)
   ├─ TMS.tile_bbox(z, x, y)            tile-grid
   ├─ CogReader.read_window              async-tiff + object_store
   │    └─ Tile::decode in spawn_blocking
@@ -93,8 +109,17 @@ src/
   render/             colour, colormap, color_formula, composite, encode, pipeline
   style/              titiler-style URL query parser + compiler
   tiler.rs            orchestrator
-  server/             axum routes (feature `server`)
+examples/
+  serve.rs            demo entrypoint and viewer wiring
+  serve/server.rs     axum routes for the demo server
+  maplibre.html       MapLibre viewer
+  openlayers.html     OpenLayers viewer
+  leaflet.html        Leaflet viewer
 ```
+
+The library crate does not expose an axum server module; HTTP serving lives in
+the example so downstream library users do not inherit web-framework
+dependencies.
 
 ## License
 

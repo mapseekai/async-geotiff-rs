@@ -6,6 +6,8 @@ use crate::render::composite::{ColourDefinition, Composite};
 use crate::render::pipeline::CompiledRenderSpec;
 use crate::warp::resampler::Resampling;
 
+pub const ALLOWED_TILE_SIZES: [u32; 5] = [64, 128, 256, 512, 1024];
+
 #[derive(Debug, Clone)]
 pub struct RenderSpec {
     pub bidx: Vec<u32>, // 1-indexed as given in URL
@@ -36,46 +38,65 @@ impl Default for RenderSpec {
 impl RenderSpec {
     /// Parse a URL query string (`?` not included).
     pub fn from_query(q: &str) -> AgResult<Self> {
-        let mut s = Self::default();
         if q.is_empty() {
-            return Ok(s);
+            return Ok(Self::default());
         }
-        for pair in q.split('&') {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let v = urldecode(v);
-            match k {
-                "bidx" => s
-                    .bidx
-                    .push(v.parse().map_err(|_| AgError::query("bidx", v.clone()))?),
-                "rescale" => {
-                    let (a, b) = v
-                        .split_once(',')
-                        .ok_or_else(|| AgError::query("rescale", v.clone()))?;
-                    s.rescale.push((
-                        a.parse().map_err(|_| AgError::query("rescale", a))?,
-                        b.parse().map_err(|_| AgError::query("rescale", b))?,
-                    ));
-                }
-                "nodata" => s.nodata = Some(parse_nodata(&v)?),
-                "colormap_name" => s.colormap_name = Some(v.clone()),
-                "color_formula" => s.color_formula = Some(v.clone()),
-                "resampling" => {
-                    s.resampling = Resampling::parse(&v)
-                        .ok_or_else(|| AgError::query("resampling", v.clone()))?
-                }
-                "reproject" => {
-                    s.reproject = Resampling::parse(&v)
-                        .ok_or_else(|| AgError::query("reproject", v.clone()))?
-                }
-                "tilesize" => {
-                    s.tilesize = v
-                        .parse()
-                        .map_err(|_| AgError::query("tilesize", v.clone()))?
-                }
-                _ => {} // unknown params silently ignored (titiler-compatible)
-            }
+        Self::from_pairs(
+            url::form_urlencoded::parse(q.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned())),
+        )
+    }
+
+    /// Parse already-decoded query key/value pairs.
+    ///
+    /// Axum's `Query<Vec<(String, String)>>` has already URL-decoded values.
+    /// Re-stringifying those pairs would let decoded `&` or `=` characters
+    /// become new query delimiters, so HTTP callers should use this entrypoint.
+    pub fn from_pairs<I, K, V>(pairs: I) -> AgResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut s = Self::default();
+        for (k, v) in pairs {
+            s.apply_param(k.as_ref(), v.as_ref())?;
         }
         Ok(s)
+    }
+
+    fn apply_param(&mut self, k: &str, v: &str) -> AgResult<()> {
+        match k {
+            "bidx" => self
+                .bidx
+                .push(v.parse().map_err(|_| AgError::query("bidx", v))?),
+            "rescale" => {
+                let (a, b) = v
+                    .split_once(',')
+                    .ok_or_else(|| AgError::query("rescale", v))?;
+                self.rescale.push((
+                    a.parse().map_err(|_| AgError::query("rescale", a))?,
+                    b.parse().map_err(|_| AgError::query("rescale", b))?,
+                ));
+            }
+            "nodata" => self.nodata = Some(parse_nodata(v)?),
+            "colormap_name" => self.colormap_name = Some(v.to_owned()),
+            "color_formula" => self.color_formula = Some(v.to_owned()),
+            "resampling" => {
+                self.resampling =
+                    Resampling::parse(v).ok_or_else(|| AgError::query("resampling", v))?
+            }
+            "reproject" => {
+                self.reproject =
+                    Resampling::parse(v).ok_or_else(|| AgError::query("reproject", v))?
+            }
+            "tilesize" => {
+                self.tilesize = v.parse().map_err(|_| AgError::query("tilesize", v))?;
+                validate_tilesize(self.tilesize)?;
+            }
+            _ => {} // unknown params silently ignored (titiler-compatible)
+        }
+        Ok(())
     }
 }
 
@@ -88,31 +109,19 @@ fn parse_nodata(v: &str) -> AgResult<f64> {
     }
 }
 
-fn urldecode(s: &str) -> String {
-    let s = s.replace('+', " ");
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) =
-                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                out.push(b as char);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
+fn validate_tilesize(tilesize: u32) -> AgResult<()> {
+    if ALLOWED_TILE_SIZES.contains(&tilesize) {
+        Ok(())
+    } else {
+        Err(AgError::query(
+            "tilesize",
+            format!("must be one of {ALLOWED_TILE_SIZES:?}"),
+        ))
     }
-    out
 }
 
 pub fn compile(spec: &RenderSpec) -> AgResult<CompiledRenderSpec> {
-    if spec.tilesize == 0 {
-        return Err(AgError::query("tilesize", "must be positive"));
-    }
+    validate_tilesize(spec.tilesize)?;
     if let Some(&bad) = spec.bidx.iter().find(|&&b| b == 0) {
         return Err(AgError::query("bidx", format!("{bad} is not 1-indexed")));
     }
@@ -215,6 +224,35 @@ mod tests {
     #[test]
     fn invalid_bidx_errors() {
         assert!(RenderSpec::from_query("bidx=abc").is_err());
+    }
+
+    #[test]
+    fn decoded_pairs_preserve_delimiters_inside_values() {
+        let s = RenderSpec::from_pairs([
+            ("color_formula", "gamma RGB 1.2&not_a_param=1"),
+            ("bidx", "1"),
+        ])
+        .unwrap();
+        assert_eq!(
+            s.color_formula.as_deref(),
+            Some("gamma RGB 1.2&not_a_param=1")
+        );
+        assert_eq!(s.bidx, vec![1]);
+    }
+
+    #[test]
+    fn tilesize_is_bounded() {
+        for size in ALLOWED_TILE_SIZES {
+            assert!(RenderSpec::from_query(&format!("tilesize={size}")).is_ok());
+        }
+        assert!(RenderSpec::from_query("tilesize=1024").is_ok());
+        assert!(RenderSpec::from_query("tilesize=96").is_err());
+        assert!(RenderSpec::from_query("tilesize=4096").is_err());
+        let s = RenderSpec {
+            tilesize: 4096,
+            ..RenderSpec::default()
+        };
+        assert!(compile(&s).is_err());
     }
 
     #[test]

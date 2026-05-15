@@ -203,7 +203,9 @@
               maxZoom: 19,
             });
           }
-        } catch (_) {}
+        } catch (err) {
+          console.warn("dataset bounds unavailable", err);
+        }
       }
 
       document.getElementById("style-form").addEventListener("submit", (e) => {
@@ -234,7 +236,9 @@
           c.dataset.value = names[0];
           applyStyle();
           flyToDataset();
-        } catch (_) {}
+        } catch (err) {
+          console.warn("dataset list unavailable", err);
+        }
       })();
     </script>
   </body>
