@@ -2,26 +2,24 @@
   "version": 1,
   "active": true,
   "skill": "code-review",
-  "keyword": "Code review",
+  "keyword": "$code-review",
   "phase": "planning",
-  "activated_at": "2026-05-15T14:21:07.619Z",
-  "updated_at": "2026-05-15T14:21:07.619Z",
+  "activated_at": "2026-05-15T14:41:05.201Z",
+  "updated_at": "2026-05-15T14:41:05.201Z",
   "source": "keyword-detector",
   "session_id": "",
-  "thread_id": "019e2be9-634c-79d3-874f-a6f73e978fb8",
-  "turn_id": "019e2bf5-ab3d-7bd1-abbd-362f9891d04c",
+  "thread_id": "019e2c15-536f-76d2-b508-fb90017283fd",
+  "turn_id": "019e2c15-53d6-7da0-b7a7-29db03ca5990",
   "active_skills": [
     {
       "skill": "code-review",
       "phase": "planning",
       "active": true,
-      "activated_at": "2026-05-15T14:21:07.619Z",
-      "updated_at": "2026-05-15T14:21:07.619Z",
+      "activated_at": "2026-05-15T14:41:05.201Z",
+      "updated_at": "2026-05-15T14:41:05.201Z",
       "session_id": "",
-      "thread_id": "019e2be9-634c-79d3-874f-a6f73e978fb8",
-      "turn_id": "019e2bf5-ab3d-7bd1-abbd-362f9891d04c"
+      "thread_id": "019e2c15-536f-76d2-b508-fb90017283fd",
+      "turn_id": "019e2c15-53d6-7da0-b7a7-29db03ca5990"
     }
-  ],
-  "iteration": 1,
-  "last_turn_at": "2026-05-15T14:40:01.240Z"
+  ]
 }
