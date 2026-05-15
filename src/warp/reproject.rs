@@ -68,6 +68,27 @@ pub fn warp(
         .map(|(x, y)| src_inv.forward(x, y))
         .collect();
 
+    // -- 方案2 fast path --
+    // If the whole-tile mapping is well-approximated by an axis-aligned
+    // rectangle in src pixel space (true for 4326↔3857 in mid-latitudes
+    // over one XYZ tile), reuse the same-CRS warp_affine SIMD path with a
+    // CropBox derived from the grid corners. We accept the path when the
+    // max residual at the interior grid samples is below 0.5 src pixels —
+    // i.e. sub-pixel error, invisible after resampling.
+    if let Some(out) = try_subtile_affine(
+        src,
+        dst_crs,
+        dst_bbox,
+        dst_w,
+        dst_h,
+        resampling,
+        dst_transform,
+        &grid_src_pix,
+        N,
+    )? {
+        return Ok(out);
+    }
+
     let bands = src.pixels.bands();
     let src_f64 = src.pixels.to_f64();
     let fill = src.nodata.unwrap_or(0.0);
@@ -116,6 +137,183 @@ pub fn warp(
         transform: dst_transform,
         nodata: src.nodata,
     })
+}
+
+/// 方案2 — Whole-tile affine approximation for cross-CRS warps.
+///
+/// Returns `Ok(Some(...))` and short-circuits when the cross-CRS mapping
+/// over this tile is well-approximated by an axis-aligned rectangle in src
+/// pixel space (the common case for 4326↔3857 within one XYZ tile away
+/// from the poles). Returns `Ok(None)` and lets the caller fall through to
+/// the per-pixel scalar sampler when the approximation fails.
+///
+/// Mirrors GDAL `gdalwarp`'s default "approx_transformer" heuristic: do
+/// one PROJ sweep at the corners, validate against an interior grid, and
+/// promote to the rectilinear fast path when error is sub-pixel.
+fn try_subtile_affine(
+    src: &ImageData,
+    dst_crs: &Crs,
+    dst_bbox: Bbox,
+    dst_w: usize,
+    dst_h: usize,
+    resampling: Resampling,
+    dst_transform: GeoTransform,
+    grid_src_pix: &[(f64, f64)],
+    n: usize,
+) -> AgResult<Option<ImageData>> {
+    // Tolerance for switching to the SIMD path: under one third of a
+    // source pixel, indistinguishable after the resampling kernel.
+    const MAX_ERR_PX: f64 = 0.33;
+
+    let idx = |i: usize, j: usize| i * (n + 1) + j;
+    let p00 = grid_src_pix[idx(0, 0)];
+    let p0n = grid_src_pix[idx(0, n)];
+    let pn0 = grid_src_pix[idx(n, 0)];
+    let pnn = grid_src_pix[idx(n, n)];
+
+    // The samples at the four grid corners give us the linear approximation
+    // src = lerp(corners; di, dj). Check that this linear model approximates
+    // every interior grid point within MAX_ERR_PX.
+    let mut max_err2 = 0.0_f64;
+    for i in 0..=n {
+        let di = i as f64 / n as f64;
+        for j in 0..=n {
+            let dj = j as f64 / n as f64;
+            let predict_x = p00.0 * (1.0 - di) * (1.0 - dj)
+                + p0n.0 * (1.0 - di) * dj
+                + pn0.0 * di * (1.0 - dj)
+                + pnn.0 * di * dj;
+            let predict_y = p00.1 * (1.0 - di) * (1.0 - dj)
+                + p0n.1 * (1.0 - di) * dj
+                + pn0.1 * di * (1.0 - dj)
+                + pnn.1 * di * dj;
+            let actual = grid_src_pix[idx(i, j)];
+            let dx = predict_x - actual.0;
+            let dy = predict_y - actual.1;
+            let err2 = dx * dx + dy * dy;
+            if err2 > max_err2 {
+                max_err2 = err2;
+            }
+        }
+    }
+    if max_err2.sqrt() > MAX_ERR_PX {
+        return Ok(None);
+    }
+
+    // Additionally check the mapping is axis-aligned (no shear/rotation):
+    // along the top edge the src_y should be ~constant; along the left edge
+    // the src_x should be ~constant.
+    let top_y_drift = (p00.1 - p0n.1).abs();
+    let left_x_drift = (p00.0 - pn0.0).abs();
+    if top_y_drift > MAX_ERR_PX || left_x_drift > MAX_ERR_PX {
+        return Ok(None);
+    }
+
+    // Build the CropBox: src-pixel bbox of the 4 corner mappings.
+    let min_x = p00.0.min(p0n.0).min(pn0.0).min(pnn.0);
+    let max_x = p00.0.max(p0n.0).max(pn0.0).max(pnn.0);
+    let min_y = p00.1.min(p0n.1).min(pn0.1).min(pnn.1);
+    let max_y = p00.1.max(p0n.1).max(pn0.1).max(pnn.1);
+    if max_x <= min_x || max_y <= min_y {
+        return Ok(None);
+    }
+
+    let src_h = src.pixels.height() as f64;
+    let src_w = src.pixels.width() as f64;
+    let crop_left = min_x.max(0.0);
+    let crop_top = min_y.max(0.0);
+    let crop_right = max_x.min(src_w);
+    let crop_bot = max_y.min(src_h);
+    let crop_w = (crop_right - crop_left).max(1e-9);
+    let crop_h = (crop_bot - crop_top).max(1e-9);
+
+    use fast_image_resize as fr;
+    let alg = match resampling {
+        Resampling::Nearest => fr::ResizeAlg::Nearest,
+        Resampling::Bilinear => fr::ResizeAlg::Convolution(fr::FilterType::Bilinear),
+        Resampling::Cubic => fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom),
+    };
+    let options = fr::ResizeOptions::new()
+        .resize_alg(alg)
+        .crop(crop_left, crop_top, crop_w, crop_h);
+    let mut resizer = fr::Resizer::new();
+
+    // Dispatch on source dtype — same fan-out as warp_affine.
+    let pixels = match &src.pixels {
+        PixelData::U8(a) => PixelData::U8(resize_bands(
+            a,
+            fr::PixelType::U8,
+            dst_w,
+            dst_h,
+            &options,
+            &mut resizer,
+            |b| b.iter().copied().collect::<Vec<u8>>(),
+            |bytes| bytes.to_vec(),
+        )?),
+        PixelData::U16(a) => PixelData::U16(resize_bands(
+            a,
+            fr::PixelType::U16,
+            dst_w,
+            dst_h,
+            &options,
+            &mut resizer,
+            |b| {
+                let mut buf = vec![0u8; b.len() * 2];
+                bytemuck::cast_slice_mut::<u8, u16>(&mut buf)
+                    .copy_from_slice(b.as_slice().expect("u16 band contiguous"));
+                buf
+            },
+            |bytes| bytemuck::cast_slice::<u8, u16>(bytes).to_vec(),
+        )?),
+        PixelData::F32(a) => PixelData::F32(resize_bands(
+            a,
+            fr::PixelType::F32,
+            dst_w,
+            dst_h,
+            &options,
+            &mut resizer,
+            |b| {
+                let mut buf = vec![0u8; b.len() * 4];
+                bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
+                    .copy_from_slice(b.as_slice().expect("f32 band contiguous"));
+                buf
+            },
+            |bytes| bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
+        )?),
+        other => {
+            let f32_arr = other.to_f64().mapv(|v| v as f32);
+            PixelData::F32(resize_bands(
+                &f32_arr,
+                fr::PixelType::F32,
+                dst_w,
+                dst_h,
+                &options,
+                &mut resizer,
+                |band| {
+                    let mut buf = vec![0u8; band.len() * 4];
+                    bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
+                        .copy_from_slice(band.as_slice().expect("f32 band contiguous"));
+                    buf
+                },
+                |bytes| bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
+            )?)
+        }
+    };
+
+    tracing::debug!(
+        max_err_px = max_err2.sqrt(),
+        crop = ?(crop_left, crop_top, crop_w, crop_h),
+        "cross-CRS subtile-affine fast path"
+    );
+
+    Ok(Some(ImageData {
+        pixels,
+        mask: None,
+        bbox: dst_bbox,
+        crs: dst_crs.clone(),
+        transform: dst_transform,
+        nodata: src.nodata,
+    }))
 }
 
 /// Same-CRS warp: pure crop+resize via `fast_image_resize` (SIMD: SSE4/AVX2/NEON).
