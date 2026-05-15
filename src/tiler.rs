@@ -42,10 +42,14 @@ impl Tiler {
         );
 
         // 1. Project dst_bbox into the source CRS so we know which pixel window to read.
+        //    Bbox projection is 4 points — sub-microsecond when the cached
+        //    Projector hits or when the (4326, 3857) direct-formula fast
+        //    path triggers — so we run it synchronously on the async worker
+        //    instead of paying ~10-50 us in spawn_blocking task scheduling.
         let bbox_in_src = if self.reader.src_crs() == &dst_crs {
             dst_bbox
         } else {
-            self.reproject_bbox(&dst_bbox, &dst_crs).await?
+            Self::reproject_bbox_sync(&dst_bbox, &dst_crs, self.reader.src_crs())?
         };
 
         // 2. Pick overview in source CRS units. Each overview has its own transform.
@@ -99,30 +103,23 @@ impl Tiler {
         Ok(png)
     }
 
-    /// Reproject a bbox from `from_crs` into the source CRS, taking the AABB
-    /// of the four transformed corners. Uses the thread-local Projector
-    /// cache so this and the subsequent warp share one PROJ context.
-    async fn reproject_bbox(
-        &self,
+    /// Reproject a bbox synchronously — 4 corner points through PROJ (or the
+    /// 4326↔3857 direct formula). At a microsecond or two of work it's far
+    /// cheaper to run inline than to pay tokio's spawn_blocking dispatch.
+    /// Used only on the cross-CRS path; same-CRS callers don't reach here.
+    fn reproject_bbox_sync(
         bbox: &crate::bounds::Bbox,
         from_crs: &crate::crs::Crs,
+        src_crs: &crate::crs::Crs,
     ) -> AgResult<Bbox> {
-        let src_crs = self.reader.src_crs().clone();
-        let from_crs = from_crs.clone();
-        let bb = *bbox;
-        let res = tokio::task::spawn_blocking(move || -> AgResult<Bbox> {
-            let mut pts = [
-                (bb.xmin, bb.ymin),
-                (bb.xmax, bb.ymin),
-                (bb.xmax, bb.ymax),
-                (bb.xmin, bb.ymax),
-            ];
-            crate::warp::projection::convert_batch(&from_crs, &src_crs, &mut pts)?;
-            Ok(Bbox::from_corners(&pts))
-        })
-        .await
-        .map_err(|e| AgError::Warp(format!("join: {e}")))?;
-        res
+        let mut pts = [
+            (bbox.xmin, bbox.ymin),
+            (bbox.xmax, bbox.ymin),
+            (bbox.xmax, bbox.ymax),
+            (bbox.xmin, bbox.ymax),
+        ];
+        crate::warp::projection::convert_batch(from_crs, src_crs, &mut pts)?;
+        Ok(Bbox::from_corners(&pts))
     }
 
     /// Clamp pixel window to the IFD extent; returns (0, 0, 0, 0)-equivalent
