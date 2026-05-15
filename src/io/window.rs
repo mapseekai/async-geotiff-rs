@@ -143,40 +143,68 @@ fn array_to_f64(arr: &Array, planar: PlanarConfiguration) -> AgResult<Array3<f64
     }
 }
 
+/// Build an `Array2<bool>` (valid-pixel mask) from the first mask band of a
+/// decoded tile. Avoids the previous `iter().map(|x| x != 0).collect()` →
+/// `Array3::from_shape_vec` → `index_axis` → `to_owned` chain (3 allocations
+/// per tile); instead does one shape-and-axes-aware single-pass fill into a
+/// pre-sized `Array2<bool>`.
 fn array_to_mask(arr: &Array, planar: PlanarConfiguration) -> AgResult<Array2<bool>> {
     let shape = arr.shape();
     let (_, h, w) = band_height_width(shape, planar);
-    let values: Vec<bool> = match arr.data() {
-        TypedArray::Bool(v) => v.clone(),
-        TypedArray::UInt8(v) => v.iter().map(|&x| x != 0).collect(),
-        TypedArray::UInt16(v) => v.iter().map(|&x| x != 0).collect(),
-        TypedArray::UInt32(v) => v.iter().map(|&x| x != 0).collect(),
-        TypedArray::UInt64(v) => v.iter().map(|&x| x != 0).collect(),
-        TypedArray::Int8(v) => v.iter().map(|&x| x != 0).collect(),
-        TypedArray::Int16(v) => v.iter().map(|&x| x != 0).collect(),
-        TypedArray::Int32(v) => v.iter().map(|&x| x != 0).collect(),
-        TypedArray::Int64(v) => v.iter().map(|&x| x != 0).collect(),
-        TypedArray::Float32(v) => v.iter().map(|&x| x != 0.0).collect(),
-        TypedArray::Float64(v) => v.iter().map(|&x| x != 0.0).collect(),
-    };
-    let arr3 = match planar {
-        PlanarConfiguration::Planar => Array3::from_shape_vec(shape, values)
-            .map_err(|e| AgError::Tiff(format!("mask shape: {e}")))?,
-        PlanarConfiguration::Chunky => {
-            let chunky = Array3::from_shape_vec(shape, values)
-                .map_err(|e| AgError::Tiff(format!("mask shape: {e}")))?;
-            chunky.permuted_axes([2, 0, 1])
-        }
+    // For planar [bands, H, W] the first band is the contiguous prefix of
+    // length H*W; for chunky [H, W, bands] each pixel's first sample lives at
+    // stride `bands`. `fill_mask_from` handles both by indexing into the
+    // typed slice directly.
+    let stride = match planar {
+        PlanarConfiguration::Planar => 1,
+        // chunky: samples interleaved as [s0,s1,...,sN, s0,s1,...] per pixel
+        PlanarConfiguration::Chunky => shape[2],
         _ => {
             return Err(AgError::UnsupportedPixel(
                 "unknown planar configuration".into(),
             ))
         }
     };
-    Ok(arr3
-        .index_axis(ndarray::Axis(0), 0)
-        .to_owned()
-        .slice_move(ndarray::s![0..h, 0..w]))
+    let mut out = Array2::<bool>::from_elem((h, w), false);
+    match arr.data() {
+        TypedArray::Bool(v) => fill_mask(&mut out, v, h, w, stride, |&x| x),
+        TypedArray::UInt8(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
+        TypedArray::UInt16(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
+        TypedArray::UInt32(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
+        TypedArray::UInt64(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
+        TypedArray::Int8(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
+        TypedArray::Int16(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
+        TypedArray::Int32(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
+        TypedArray::Int64(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
+        TypedArray::Float32(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0.0),
+        TypedArray::Float64(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0.0),
+    }
+    Ok(out)
+}
+
+fn fill_mask<T: Copy, F: Fn(&T) -> bool>(
+    out: &mut Array2<bool>,
+    src: &[T],
+    h: usize,
+    w: usize,
+    stride: usize,
+    pred: F,
+) {
+    // Single linear sweep over `src` with stride `stride`. The destination is
+    // row-major Array2; we use `as_slice_mut` to avoid bounds checks per cell.
+    let dst = out
+        .as_slice_mut()
+        .expect("freshly-allocated Array2 is standard layout");
+    let mut i = 0usize;
+    for r in 0..h {
+        for c in 0..w {
+            let s = (r * w + c) * stride;
+            if let Some(v) = src.get(s) {
+                dst[i] = pred(v);
+            }
+            i += 1;
+        }
+    }
 }
 
 fn mk<T: Copy>(
