@@ -117,7 +117,7 @@ impl Tiler {
                 (bb.xmax, bb.ymax),
                 (bb.xmin, bb.ymax),
             ];
-            crate::warp::projection::with_cached(&from_crs, &src_crs, |p| p.convert(&mut pts))?;
+            crate::warp::projection::convert_batch(&from_crs, &src_crs, &mut pts)?;
             Ok(Bbox::from_corners(&pts))
         })
         .await

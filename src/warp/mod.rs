@@ -1,3 +1,4 @@
+pub mod mercator;
 pub mod projection;
 pub mod reproject;
 pub mod resampler;

@@ -61,7 +61,7 @@ pub fn warp(
             grid_dst.push((dx, dy));
         }
     }
-    crate::warp::projection::with_cached(dst_crs, &src.crs, |p| p.convert(&mut grid_dst))?;
+    crate::warp::projection::convert_batch(dst_crs, &src.crs, &mut grid_dst)?;
 
     let grid_src_pix: Vec<(f64, f64)> = grid_dst
         .into_iter()
