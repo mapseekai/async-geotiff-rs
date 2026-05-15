@@ -19,7 +19,56 @@ use crate::error::{AgError, AgResult};
 use crate::io::window::{
     stitch_mask_with_info, stitch_with_info, tile_range_for_window, IfdInfo,
 };
-use crate::pixel::ImageData;
+use crate::pixel::{ImageData, PixelData};
+
+/// Cache key for a decoded source-pixel window. One `CogReader` serves a
+/// single COG, so the URL is not part of the key.
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
+struct WindowKey {
+    level: usize,
+    col: i64,
+    row: i64,
+    w: u64,
+    h: u64,
+}
+
+type WindowCache = moka::future::Cache<WindowKey, Arc<ImageData>>;
+
+/// Tuning for the decoded-window cache. `max_bytes` bounds total resident
+/// pixel memory (moka evicts via TinyLFU). `ttl` is opt-in; COG data is
+/// immutable so the default relies on process lifetime + capacity eviction.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheConfig {
+    pub max_bytes: u64,
+    pub ttl: Option<Duration>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: 256 << 20,
+            ttl: None,
+        }
+    }
+}
+
+/// Approximate resident byte size of an `ImageData`: pixel buffer
+/// (element width × bands × h × w) plus the optional validity mask
+/// (1 byte per pixel). Saturates into the `u32` moka weigher expects.
+fn image_data_weight(d: &ImageData) -> u32 {
+    let elem = match d.pixels {
+        PixelData::U8(_) => 1,
+        PixelData::U16(_) | PixelData::I16(_) => 2,
+        PixelData::U32(_) | PixelData::I32(_) | PixelData::F32(_) => 4,
+        PixelData::F64(_) => 8,
+    };
+    let px = elem
+        * d.pixels.bands()
+        * d.pixels.height()
+        * d.pixels.width();
+    let mask = d.mask.as_ref().map_or(0, |m| m.len());
+    u32::try_from(px + mask).unwrap_or(u32::MAX)
+}
 
 pub struct CogReader {
     pub(crate) tiff: TIFF,
@@ -491,6 +540,36 @@ mod tests {
     #[test]
     fn overview_single_level_is_zero() {
         assert_eq!(pick_overview_from_gsds(&[10.0], 100.0), 0);
+    }
+
+    #[test]
+    fn weight_counts_pixel_bytes() {
+        use crate::pixel::{ImageData, PixelData};
+        use ndarray::{Array2, Array3};
+
+        let mk = |pixels: PixelData, mask: Option<Array2<bool>>| ImageData {
+            pixels,
+            mask,
+            bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
+            crs: Crs::new("UNKNOWN"),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
+            nodata: None,
+        };
+
+        // U8, 1 band, 4×4 → 1*1*16 = 16.
+        let d = mk(PixelData::U8(Array3::zeros((1, 4, 4))), None);
+        assert_eq!(image_data_weight(&d), 16);
+
+        // U16, 3 bands, 2×2 → 2*3*4 = 24.
+        let d = mk(PixelData::U16(Array3::zeros((3, 2, 2))), None);
+        assert_eq!(image_data_weight(&d), 24);
+
+        // With mask: + h*w bytes. U8 1band 4×4 (16) + 16 mask = 32.
+        let d = mk(
+            PixelData::U8(Array3::zeros((1, 4, 4))),
+            Some(Array2::default((4, 4))),
+        );
+        assert_eq!(image_data_weight(&d), 32);
     }
 
     #[test]
