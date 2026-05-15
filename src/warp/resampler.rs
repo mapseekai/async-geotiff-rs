@@ -30,6 +30,7 @@ impl Resampling {
     /// index instead of returning `fill`. This prevents the "white seams"
     /// that appear between adjacent XYZ tiles when a sample lands on the
     /// last column/row of the read window.
+    #[inline]
     pub fn sample(self, view: ArrayView2<f64>, col: f64, row: f64, fill: f64) -> f64 {
         self.sample_masked(view, None, col, row, fill)
     }
@@ -38,6 +39,7 @@ impl Resampling {
     /// `valid` (and renormalises the remaining weights). When all 4
     /// neighbours are invalid, returns `fill`. Matches GDAL `gdalwarp -wo
     /// SAMPLE_GRID=YES` semantics for nodata-aware interpolation.
+    #[inline]
     pub fn sample_masked(
         self,
         view: ArrayView2<f64>,

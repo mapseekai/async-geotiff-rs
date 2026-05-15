@@ -135,13 +135,12 @@ fn try_u8_rgb_fastpath(
     }
     let bands = src.shape()[0];
     let bidx: [usize; 3] = if spec.bidx.is_empty() {
-        if auto_rgb && bands >= 3 {
-            [0, 1, 2]
-        } else if matches!(spec.composite.kind, CompositeKind::Rgb) && bands >= 3 {
-            [0, 1, 2]
-        } else {
+        let want_rgb =
+            (auto_rgb || matches!(spec.composite.kind, CompositeKind::Rgb)) && bands >= 3;
+        if !want_rgb {
             return None;
         }
+        [0, 1, 2]
     } else if spec.bidx.len() == 3 && spec.bidx.iter().all(|&b| b < bands) {
         [spec.bidx[0], spec.bidx[1], spec.bidx[2]]
     } else {
@@ -155,53 +154,40 @@ fn try_u8_rgb_fastpath(
         return None;
     }
     let nodata = spec.nodata.or(image.nodata);
-    // Build RGBA. Layout: (H, W, 4). Sweep each source band once and scatter.
+    let nd_u8: Option<u8> = nodata.and_then(|nd| {
+        if nd.is_finite() && (0.0..=255.0).contains(&nd) {
+            Some(nd as u8)
+        } else {
+            None
+        }
+    });
+    // Build RGBA in a single linear sweep over the contiguous byte buffer:
+    // for each pixel write R, G, B, A together. Stride-4 scatter across
+    // 3 separate passes is cache-unfriendly and was the same anti-pattern
+    // H5 fixed in the f64 path.
     let mut rgba = Array3::<u8>::from_elem((h, w, 4), 0u8);
-    {
-        let dst = rgba
-            .as_slice_mut()
-            .expect("freshly-allocated Array3 standard layout");
-        // Source bands are planar (bands, H, W); take a flat slice per band.
-        let stride = h * w;
-        for (ch, b) in bidx.iter().enumerate() {
-            let band_off = b * stride;
-            let band = &src
-                .as_slice()
-                .expect("u8 PixelData contiguous")[band_off..band_off + stride];
-            for i in 0..stride {
-                dst[i * 4 + ch] = band[i];
-            }
-        }
-        // Alpha: 255 by default, 0 where mask is false or pixel matches nodata.
-        for i in 0..stride {
-            dst[i * 4 + 3] = 255;
-        }
-    }
-    // Apply mask / nodata to alpha as a single Zip pass.
-    if image.mask.is_some() || nodata.is_some() {
-        let nd_u8: Option<u8> = nodata.and_then(|nd| {
-            if nd.is_finite() && (0.0..=255.0).contains(&nd) {
-                Some(nd as u8)
-            } else {
-                None
-            }
-        });
-        Zip::indexed(rgba.slice_mut(s![.., .., 3])).for_each(|(r, c), a| {
-            if let Some(m) = &image.mask {
-                if !m[[r, c]] {
-                    *a = 0;
-                    return;
-                }
-            }
-            if let Some(nd) = nd_u8 {
-                let r_val = src[[bidx[0], r, c]];
-                let g_val = src[[bidx[1], r, c]];
-                let b_val = src[[bidx[2], r, c]];
-                if r_val == nd && g_val == nd && b_val == nd {
-                    *a = 0;
-                }
-            }
-        });
+    let stride = h * w;
+    let src_slice = src.as_slice().expect("u8 PixelData contiguous");
+    let r_band = &src_slice[bidx[0] * stride..][..stride];
+    let g_band = &src_slice[bidx[1] * stride..][..stride];
+    let b_band = &src_slice[bidx[2] * stride..][..stride];
+    let mask_slice: Option<&[bool]> = image.mask.as_ref().and_then(|m| m.as_slice());
+    let dst = rgba
+        .as_slice_mut()
+        .expect("freshly-allocated Array3 standard layout");
+
+    for i in 0..stride {
+        let r_val = r_band[i];
+        let g_val = g_band[i];
+        let b_val = b_band[i];
+        let masked = matches!(mask_slice, Some(m) if !m[i]);
+        let nd_hit = matches!(nd_u8, Some(nd) if r_val == nd && g_val == nd && b_val == nd);
+        let alpha: u8 = if masked || nd_hit { 0 } else { 255 };
+        let base = i * 4;
+        dst[base] = r_val;
+        dst[base + 1] = g_val;
+        dst[base + 2] = b_val;
+        dst[base + 3] = alpha;
     }
     Some(rgba)
 }

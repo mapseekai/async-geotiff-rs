@@ -65,6 +65,7 @@ impl GeoTransform {
         Self(Affine::from_gdal(gt))
     }
 
+    #[inline]
     pub fn forward(&self, col: f64, row: f64) -> (f64, f64) {
         self.0 * (col, row)
     }

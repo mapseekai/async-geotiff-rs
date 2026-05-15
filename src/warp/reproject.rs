@@ -494,7 +494,7 @@ fn warp_affine(
 /// Per-band loop driving `fast_image_resize`, parallelised over bands via
 /// rayon. Each thread gets its own `Resizer` (cheap to construct), so RGB
 /// or RGBA tiles see a 3-4x speedup on multi-core machines.
-fn resize_bands<T: Copy + Default + 'static + Send + Sync>(
+fn resize_bands<T: bytemuck::Pod + Default + Send + Sync>(
     src_arr: &Array3<T>,
     pixel_type: fast_image_resize::PixelType,
     dst_w: usize,
@@ -503,10 +503,7 @@ fn resize_bands<T: Copy + Default + 'static + Send + Sync>(
     _resizer: &mut fast_image_resize::Resizer,
     to_bytes: impl Fn(&ndarray::ArrayView2<T>) -> Vec<u8> + Send + Sync,
     from_bytes: impl Fn(&[u8]) -> Vec<T> + Send + Sync,
-) -> AgResult<Array3<T>>
-where
-    T: bytemuck::Pod,
-{
+) -> AgResult<Array3<T>> {
     use fast_image_resize as fr;
     use ndarray::Axis;
     use rayon::prelude::*;

@@ -66,8 +66,13 @@ impl HandleGet for Composite {
                 self.lut.unwrap_or([[0; 4]; 256])[t]
             }
             CompositeKind::Rgb => {
-                let lo = self.vmin.as_ref().expect("rgb vmin");
-                let hi = self.vmax.as_ref().expect("rgb vmax");
+                // Fall back to byte-range defaults if vmin/vmax aren't set —
+                // a malformed URL or test path that constructs Rgb without
+                // ranges shouldn't crash the renderer.
+                const DEFAULT_LO: [f64; 3] = [0.0; 3];
+                const DEFAULT_HI: [f64; 3] = [255.0; 3];
+                let lo: &[f64] = self.vmin.as_deref().unwrap_or(&DEFAULT_LO);
+                let hi: &[f64] = self.vmax.as_deref().unwrap_or(&DEFAULT_HI);
                 if let Some(nd) = nodata {
                     for (i, v) in values.iter().enumerate().take(3) {
                         if i < nd.len() && is_nodata(*v, nd[i]) {
