@@ -1,4 +1,7 @@
+mod cache;
 pub mod cog;
+mod decode;
 pub mod window;
 
-pub use cog::CogReader;
+pub use cache::CacheConfig;
+pub use cog::{CogReader, ReaderConfig};

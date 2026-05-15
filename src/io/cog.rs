@@ -1,4 +1,4 @@
-//! `CogReader` — async-tiff wrapper with GeoTransform/CRS derivation.
+//! `CogReader` — async-tiff reader orchestration with GeoTransform/CRS derivation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,57 +12,41 @@ use async_tiff::{ImageFileDirectory, TIFF};
 use object_store::http::HttpBuilder;
 use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore};
+use tokio::sync::Semaphore;
 
+use crate::blocking::default_blocking_permits;
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
-use crate::io::window::{stitch_mask_with_info, stitch_with_info, tile_range_for_window, IfdInfo};
-use crate::pixel::{ImageData, PixelData};
+use crate::io::cache::{build_window_cache, CacheConfig, WindowCache, WindowKey};
+use crate::io::decode::{decode_window, DecodeWindowJob};
+use crate::io::window::{tile_range_for_window, IfdInfo};
+use crate::pixel::ImageData;
 
-/// Cache key for a decoded source-pixel window. One `CogReader` serves a
-/// single COG, so the URL is not part of the key.
-#[derive(Clone, Hash, PartialEq, Eq, Debug)]
-struct WindowKey {
-    level: usize,
-    col: i64,
-    row: i64,
-    w: u64,
-    h: u64,
-}
-
-type WindowCache = moka::future::Cache<WindowKey, Arc<ImageData>>;
-
-/// Tuning for the decoded-window cache. `max_bytes` bounds total resident
-/// pixel memory (moka evicts via TinyLFU). `ttl` is opt-in; COG data is
-/// immutable so the default relies on process lifetime + capacity eviction.
+/// Runtime limits for a [`CogReader`].
+///
+/// `max_decode_tasks` caps concurrent CPU-heavy decode/stitch jobs submitted
+/// through `spawn_blocking`. Waiting for a permit is async, so excess requests
+/// yield the Tokio worker instead of flooding the blocking pool.
 #[derive(Clone, Copy, Debug)]
-pub struct CacheConfig {
-    pub max_bytes: u64,
-    pub ttl: Option<Duration>,
+pub struct ReaderConfig {
+    pub cache: CacheConfig,
+    pub max_decode_tasks: usize,
 }
 
-impl Default for CacheConfig {
+impl Default for ReaderConfig {
     fn default() -> Self {
         Self {
-            max_bytes: 256 << 20,
-            ttl: None,
+            cache: CacheConfig::default(),
+            max_decode_tasks: default_blocking_permits(),
         }
     }
 }
 
-/// Approximate resident byte size of an `ImageData`: pixel buffer
-/// (element width × bands × h × w) plus the optional validity mask
-/// (1 byte per pixel). Saturates into the `u32` moka weigher expects.
-fn image_data_weight(d: &ImageData) -> u32 {
-    let elem = match d.pixels {
-        PixelData::U8(_) => 1,
-        PixelData::U16(_) | PixelData::I16(_) => 2,
-        PixelData::U32(_) | PixelData::I32(_) | PixelData::F32(_) => 4,
-        PixelData::F64(_) => 8,
-    };
-    let px = elem * d.pixels.bands() * d.pixels.height() * d.pixels.width();
-    let mask = d.mask.as_ref().map_or(0, |m| m.len());
-    u32::try_from(px + mask).unwrap_or(u32::MAX)
+impl ReaderConfig {
+    fn decode_task_limit(self) -> usize {
+        self.max_decode_tasks.max(1)
+    }
 }
 
 pub struct CogReader {
@@ -79,16 +63,7 @@ pub struct CogReader {
     /// Decoded-window cache. Keyed by `(level, col, row, w, h)`; value is a
     /// shared `Arc<ImageData>` so cache hits clone a pointer, not a buffer.
     window_cache: WindowCache,
-}
-
-fn build_window_cache(cfg: CacheConfig) -> WindowCache {
-    let mut builder = moka::future::Cache::builder()
-        .max_capacity(cfg.max_bytes)
-        .weigher(|_k: &WindowKey, v: &Arc<ImageData>| image_data_weight(v));
-    if let Some(ttl) = cfg.ttl {
-        builder = builder.time_to_live(ttl);
-    }
-    builder.build()
+    decode_semaphore: Arc<Semaphore>,
 }
 
 impl CogReader {
@@ -114,6 +89,24 @@ impl CogReader {
         options: ClientOptions,
         cache: CacheConfig,
     ) -> AgResult<Self> {
+        Self::open_http_with_config(
+            url,
+            options,
+            ReaderConfig {
+                cache,
+                ..ReaderConfig::default()
+            },
+        )
+        .await
+    }
+
+    /// Like [`open_http_with_cache`] but lets callers configure both cache
+    /// capacity and CPU decode concurrency.
+    pub async fn open_http_with_config(
+        url: &str,
+        options: ClientOptions,
+        config: ReaderConfig,
+    ) -> AgResult<Self> {
         let (base, path) = split_http_url(url)?;
         let store: Arc<dyn ObjectStore> = Arc::new(
             HttpBuilder::new()
@@ -123,7 +116,7 @@ impl CogReader {
                 .map_err(|e| AgError::Tiff(format!("http store: {e}")))?,
         );
         let reader = ObjectReader::new(store, Path::from(path));
-        Self::open_with_reader_and_cache(reader, cache).await
+        Self::open_with_reader_and_config(reader, config).await
     }
 
     /// Open from an existing `ObjectReader` (lets callers wire any object_store).
@@ -135,6 +128,22 @@ impl CogReader {
     pub async fn open_with_reader_and_cache(
         reader: ObjectReader,
         cache: CacheConfig,
+    ) -> AgResult<Self> {
+        Self::open_with_reader_and_config(
+            reader,
+            ReaderConfig {
+                cache,
+                ..ReaderConfig::default()
+            },
+        )
+        .await
+    }
+
+    /// Open from an existing `ObjectReader` with explicit cache and decode
+    /// concurrency settings.
+    pub async fn open_with_reader_and_config(
+        reader: ObjectReader,
+        config: ReaderConfig,
     ) -> AgResult<Self> {
         let md_cache = ReadaheadMetadataCache::new(reader.clone());
         let mut md = TiffMetadataReader::try_open(&md_cache)
@@ -160,7 +169,8 @@ impl CogReader {
             data_ifds,
             mask_ifds,
             alpha_bands,
-            window_cache: build_window_cache(cache),
+            window_cache: build_window_cache(config.cache),
+            decode_semaphore: Arc::new(Semaphore::new(config.decode_task_limit())),
         })
     }
 
@@ -350,50 +360,23 @@ impl CogReader {
 
         let dur_fetch = t_fetch.elapsed();
 
-        // CPU: decode + stitch in one blocking job — never touches reactor.
+        // CPU: decode + stitch in one semaphore-limited blocking job.
         let t_decode = std::time::Instant::now();
-        let coords_for_blocking = coords.clone();
-        let (stitched, mask) = tokio::task::spawn_blocking(
-            move || -> AgResult<(crate::pixel::PixelData, Option<ndarray::Array2<bool>>)> {
-                let registry = async_tiff::decoder::DecoderRegistry::default();
-                let data_arrays: Vec<async_tiff::Array> = data_tiles
-                    .into_iter()
-                    .map(|t| t.decode(&registry))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| AgError::Tiff(format!("decode: {e}")))?;
-                let stitched = stitch_with_info(
-                    &data_arrays,
-                    &coords_for_blocking,
-                    &data_info,
-                    col_off,
-                    row_off,
-                    width,
-                    height,
-                )?;
-                let mask = match (mask_tiles_opt, mask_info_opt) {
-                    (Some(tiles), Some(info)) => {
-                        let mask_arrays: Vec<async_tiff::Array> = tiles
-                            .into_iter()
-                            .map(|t| t.decode(&registry))
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(|e| AgError::Tiff(format!("decode mask: {e}")))?;
-                        Some(stitch_mask_with_info(
-                            &mask_arrays,
-                            &coords_for_blocking,
-                            &info,
-                            col_off,
-                            row_off,
-                            width,
-                            height,
-                        )?)
-                    }
-                    _ => None,
-                };
-                Ok((stitched, mask))
+        let (stitched, mask) = decode_window(
+            DecodeWindowJob {
+                data_tiles,
+                mask_tiles: mask_tiles_opt,
+                coords: coords.clone(),
+                data_info,
+                mask_info: mask_info_opt,
+                col_off,
+                row_off,
+                width,
+                height,
             },
+            Arc::clone(&self.decode_semaphore),
         )
-        .await
-        .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+        .await?;
         let dur_decode = t_decode.elapsed();
         tracing::debug!(
             level,
@@ -667,111 +650,12 @@ mod tests {
     }
 
     #[test]
-    fn weight_counts_pixel_bytes() {
-        use crate::pixel::{ImageData, PixelData};
-        use ndarray::{Array2, Array3};
-
-        let mk = |pixels: PixelData, mask: Option<Array2<bool>>| ImageData {
-            pixels,
-            mask,
-            bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
-            crs: Crs::new("UNKNOWN"),
-            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
-            nodata: None,
+    fn reader_config_clamps_decode_limit_to_one() {
+        let cfg = ReaderConfig {
+            max_decode_tasks: 0,
+            ..ReaderConfig::default()
         };
-
-        // U8, 1 band, 4×4 → 1*1*16 = 16.
-        let d = mk(PixelData::U8(Array3::zeros((1, 4, 4))), None);
-        assert_eq!(image_data_weight(&d), 16);
-
-        // U16, 3 bands, 2×2 → 2*3*4 = 24.
-        let d = mk(PixelData::U16(Array3::zeros((3, 2, 2))), None);
-        assert_eq!(image_data_weight(&d), 24);
-
-        // With mask: + h*w bytes. U8 1band 4×4 (16) + 16 mask = 32.
-        let d = mk(
-            PixelData::U8(Array3::zeros((1, 4, 4))),
-            Some(Array2::default((4, 4))),
-        );
-        assert_eq!(image_data_weight(&d), 32);
-    }
-
-    fn dummy_image() -> ImageData {
-        use crate::pixel::PixelData;
-        use ndarray::Array3;
-        ImageData {
-            pixels: PixelData::U8(Array3::zeros((3, 8, 8))),
-            mask: None,
-            bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
-            crs: Crs::new("UNKNOWN"),
-            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
-            nodata: None,
-        }
-    }
-
-    // No COG fixture is available offline (data/ is gitignored), so the
-    // read_window network path can't be exercised here. These tests pin the
-    // caching mechanism read_window relies on: build_window_cache + moka
-    // try_get_with must memoise (second hit = same Arc) and coalesce
-    // concurrent identical inits into one (single-flight).
-    #[tokio::test]
-    async fn cache_returns_same_arc_on_hit() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let cache = build_window_cache(CacheConfig::default());
-        let key = WindowKey {
-            level: 0,
-            col: 0,
-            row: 0,
-            w: 8,
-            h: 8,
-        };
-        let calls = AtomicUsize::new(0);
-        let init = || async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, AgError>(Arc::new(dummy_image()))
-        };
-        let a = cache.try_get_with(key.clone(), init()).await.unwrap();
-        let b = cache.try_get_with(key, init()).await.unwrap();
-        assert!(Arc::ptr_eq(&a, &b));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn cache_single_flights_concurrent_identical_reads() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let cache = build_window_cache(CacheConfig::default());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let key = WindowKey {
-            level: 2,
-            col: 5,
-            row: 7,
-            w: 256,
-            h: 256,
-        };
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let cache = cache.clone();
-            let key = key.clone();
-            let calls = Arc::clone(&calls);
-            handles.push(tokio::spawn(async move {
-                cache
-                    .try_get_with(key, async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        tokio::task::yield_now().await;
-                        Ok::<_, AgError>(Arc::new(dummy_image()))
-                    })
-                    .await
-                    .unwrap()
-            }));
-        }
-        let mut arcs = Vec::new();
-        for h in handles {
-            arcs.push(h.await.unwrap());
-        }
-        for a in &arcs[1..] {
-            assert!(Arc::ptr_eq(&arcs[0], a));
-        }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cfg.decode_task_limit(), 1);
     }
 
     #[test]

@@ -85,9 +85,9 @@ unified to F64 at the read/warp seam.
 Example HTTP request (axum, `examples/serve.rs`)
   ├─ TMS.tile_bbox(z, x, y)            tile-grid
   ├─ CogReader.read_window              async-tiff + object_store
-  │    └─ Tile::decode in spawn_blocking
+  │    └─ Tile::decode in semaphore-limited spawn_blocking
   ├─ warp::warp (if src_crs ≠ dst_crs)  proj coarse-grid + bilinear
-  │    └─ runs in spawn_blocking (Proj is !Send + !Sync)
+  │    └─ runs in semaphore-limited spawn_blocking (Proj is !Send + !Sync)
   ├─ render pipeline:                   ndarray + palette
   │    ├─ rescale per band
   │    ├─ color_formula (sRGB Lab/Lch)
@@ -104,7 +104,11 @@ src/
   crs.rs              Crs identifier
   pixel.rs            PixelData + ImageData
   tms.rs              WebMercatorQuad + WorldCRS84Quad
-  io/                 CogReader (async-tiff wrapper)
+  io/
+    cog.rs            CogReader open/metadata/window-fetch orchestration
+    cache.rs          decoded-window cache keys, sizing, and single-flight cache
+    decode.rs         semaphore-limited decode/stitch spawn_blocking helper
+    window.rs         source tile-range and stitch helpers
   warp/               Projector + Resampling + coarse-grid warp
   render/             colour, colormap, color_formula, composite, encode, pipeline
   style/              titiler-style URL query parser + compiler
@@ -120,6 +124,14 @@ examples/
 The library crate does not expose an axum server module; HTTP serving lives in
 the example so downstream library users do not inherit web-framework
 dependencies.
+
+CPU-heavy decode/stitch and warp/render work is dispatched with
+`spawn_blocking` behind async `Semaphore` limits. Use
+`CogReader::open_http_with_config` / `CogReader::open_with_reader_and_config`
+with `async_geotiff::io::ReaderConfig` to tune decode concurrency, and
+`Tiler::with_config` with `async_geotiff::tiler::TilerConfig` to tune
+warp/render concurrency. Defaults use the host's available parallelism and
+clamp zero to one permit.
 
 ## License
 

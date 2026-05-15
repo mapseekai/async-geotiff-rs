@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
+use tokio::sync::Semaphore;
 
+use crate::blocking::default_blocking_permits;
 use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::io::CogReader;
@@ -16,11 +18,42 @@ use crate::warp;
 
 pub struct Tiler {
     reader: Arc<CogReader>,
+    tile_cpu_semaphore: Arc<Semaphore>,
+}
+
+/// Runtime limits for a [`Tiler`].
+///
+/// `max_blocking_tasks` caps concurrent warp/render jobs. The permit wait is
+/// async, while the CPU-heavy work still runs on Tokio's blocking pool.
+#[derive(Clone, Copy, Debug)]
+pub struct TilerConfig {
+    pub max_blocking_tasks: usize,
+}
+
+impl Default for TilerConfig {
+    fn default() -> Self {
+        Self {
+            max_blocking_tasks: default_blocking_permits(),
+        }
+    }
+}
+
+impl TilerConfig {
+    fn blocking_task_limit(self) -> usize {
+        self.max_blocking_tasks.max(1)
+    }
 }
 
 impl Tiler {
     pub fn new(reader: Arc<CogReader>) -> Self {
-        Self { reader }
+        Self::with_config(reader, TilerConfig::default())
+    }
+
+    pub fn with_config(reader: Arc<CogReader>, config: TilerConfig) -> Self {
+        Self {
+            reader,
+            tile_cpu_semaphore: Arc::new(Semaphore::new(config.blocking_task_limit())),
+        }
     }
 
     /// WGS84 `[west, south, east, north]` extent of the dataset.
@@ -128,9 +161,9 @@ impl Tiler {
                         let compiled = compile_cached(spec).await?;
                         let dur_compile = t.elapsed();
                         let t = Instant::now();
-                        let png = tokio::task::spawn_blocking(move || render(&src, &compiled))
-                            .await
-                            .map_err(|e| AgError::Warp(format!("join: {e}")))??;
+                        let png = self
+                            .run_tile_cpu("render", move || render(&src, &compiled))
+                            .await?;
                         let dur_render = t.elapsed();
                         tracing::debug!(
                             ?dur_setup,
@@ -174,11 +207,11 @@ impl Tiler {
             spec.reproject
         };
         let t = Instant::now();
-        let warped: ImageData = match tokio::task::spawn_blocking(move || {
-            warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
-        })
-        .await
-        .map_err(|e| AgError::Warp(format!("join: {e}")))?
+        let warped: ImageData = match self
+            .run_tile_cpu("warp", move || {
+                warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
+            })
+            .await
         {
             Ok(w) => w,
             // Grid point outside the projection's valid domain → blank.
@@ -191,9 +224,9 @@ impl Tiler {
         let compiled = compile_cached(spec).await?;
         let dur_compile = t.elapsed();
         let t = Instant::now();
-        let png = tokio::task::spawn_blocking(move || render(&warped, &compiled))
-            .await
-            .map_err(|e| AgError::Warp(format!("join: {e}")))??;
+        let png = self
+            .run_tile_cpu("render", move || render(&warped, &compiled))
+            .await?;
         let dur_render = t.elapsed();
         tracing::debug!(
             ?dur_setup,
@@ -205,6 +238,23 @@ impl Tiler {
             "tile timing (warp path)"
         );
         Ok(png)
+    }
+
+    async fn run_tile_cpu<T, F>(&self, label: &'static str, f: F) -> AgResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> AgResult<T> + Send + 'static,
+    {
+        let permit = Arc::clone(&self.tile_cpu_semaphore)
+            .acquire_owned()
+            .await
+            .map_err(|_| AgError::Warp(format!("{label} semaphore closed")))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .map_err(|e| AgError::Warp(format!("{label} join: {e}")))?
     }
 
     /// Returns the integer `(col, row)` of an exact `ts×ts` passthrough
@@ -301,12 +351,20 @@ fn empty_tile(size: usize) -> AgResult<Bytes> {
 
 #[cfg(test)]
 mod tests {
-    use super::Tiler;
+    use super::{Tiler, TilerConfig};
     use crate::bounds::{Bbox, GeoTransform};
 
     #[test]
     fn tiler_type_compiles() {
         let _ = std::mem::size_of::<Tiler>();
+    }
+
+    #[test]
+    fn tiler_config_clamps_blocking_limit_to_one() {
+        let cfg = TilerConfig {
+            max_blocking_tasks: 0,
+        };
+        assert_eq!(cfg.blocking_task_limit(), 1);
     }
 
     #[test]
