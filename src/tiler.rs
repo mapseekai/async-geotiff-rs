@@ -73,9 +73,8 @@ impl Tiler {
         //    internal_tile` optimisation (reader.py:453-459); we use the
         //    resolution-match condition because it is the actual cause of
         //    edge-resampling artifacts, not internal-tile-grid alignment.
-        let (rc, rr, rw, rh) = self
-            .reader
-            .level_transform(level)?
+        let level_tr = self.reader.level_transform(level)?;
+        let (rc, rr, rw, rh) = level_tr
             .window_for_bbox(&bbox_in_src)
             .ok_or_else(|| AgError::Warp("source GeoTransform not invertible".into()))?;
         let same_crs = self.reader.src_crs() == &dst_crs;
@@ -83,6 +82,44 @@ impl Tiler {
         let res_matches = level_gsd > 0.0
             && ((target_gsd - level_gsd).abs() / level_gsd) < 0.01;
         let aligned = same_crs && res_matches;
+
+        // -- L2 passthrough --
+        // When the requested tile maps EXACTLY onto an integer-aligned
+        // ts×ts source-pixel window (same CRS, native resolution, no
+        // sub-pixel offset, fully inside the IFD), the warp would be a
+        // no-op identity crop. Skip it entirely and feed the windowed read
+        // straight to render — this is the big payoff of rio-tiler's
+        // aligned-read insight: zero resample, zero PROJ, one read.
+        let ts = spec.tilesize as usize;
+        if same_crs && res_matches {
+            if let Some((pc, pr)) =
+                Self::passthrough_window(&level_tr, &dst_bbox, ts)
+            {
+                if let Ok((iw, ih)) = self.reader.level_dimensions(level) {
+                    let in_bounds = pc >= 0
+                        && pr >= 0
+                        && (pc as u64 + ts as u64) <= iw as u64
+                        && (pr as u64 + ts as u64) <= ih as u64;
+                    if in_bounds {
+                        tracing::debug!(
+                            pc, pr, ts, level,
+                            "L2 passthrough — skipping warp entirely"
+                        );
+                        let src: ImageData = self
+                            .reader
+                            .read_window(level, pc, pr, ts as u64, ts as u64)
+                            .await?;
+                        let compiled: CompiledRenderSpec = compile(spec)?;
+                        let png = tokio::task::spawn_blocking(move || {
+                            render(&src, &compiled)
+                        })
+                        .await
+                        .map_err(|e| AgError::Warp(format!("join: {e}")))??;
+                        return Ok(png);
+                    }
+                }
+            }
+        }
         let raw = if aligned {
             tracing::debug!(target_gsd, level_gsd, "aligned read — skipping halo");
             (rc, rr, rw, rh)
@@ -109,7 +146,6 @@ impl Tiler {
         } else {
             spec.reproject
         };
-        let ts = spec.tilesize as usize;
         let warped: ImageData = tokio::task::spawn_blocking(move || {
             warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
         })
@@ -121,6 +157,36 @@ impl Tiler {
             .await
             .map_err(|e| AgError::Warp(format!("join: {e}")))??;
         Ok(png)
+    }
+
+    /// Returns the integer `(col, row)` of an exact `ts×ts` passthrough
+    /// window when the destination tile maps onto source pixels with
+    /// negligible sub-pixel offset and unit scale. `None` means the read
+    /// is not a clean identity crop and must go through the warp path.
+    ///
+    /// Tolerance: corners must be within 1e-3 px of integers and the span
+    /// must round to exactly `ts` — anything looser would misregister the
+    /// tile against the basemap.
+    fn passthrough_window(
+        level_tr: &crate::bounds::GeoTransform,
+        dst_bbox: &Bbox,
+        ts: usize,
+    ) -> Option<(i64, i64)> {
+        const TOL: f64 = 1e-3;
+        let inv = level_tr.inverse()?;
+        // Top-left and bottom-right corners → source pixel coords.
+        let (c0, r0) = inv.forward(dst_bbox.xmin, dst_bbox.ymax);
+        let (c1, r1) = inv.forward(dst_bbox.xmax, dst_bbox.ymin);
+        let frac = |v: f64| (v - v.round()).abs();
+        if frac(c0) > TOL || frac(r0) > TOL {
+            return None;
+        }
+        let span_c = (c1 - c0).abs();
+        let span_r = (r1 - r0).abs();
+        if (span_c - ts as f64).abs() > TOL || (span_r - ts as f64).abs() > TOL {
+            return None;
+        }
+        Some((c0.round() as i64, r0.round() as i64))
     }
 
     /// Reproject a bbox synchronously — 4 corner points through PROJ (or the
@@ -173,8 +239,41 @@ fn empty_tile(size: usize) -> AgResult<Bytes> {
 
 #[cfg(test)]
 mod tests {
+    use super::Tiler;
+    use crate::bounds::{Bbox, GeoTransform};
+
     #[test]
     fn tiler_type_compiles() {
-        let _ = std::mem::size_of::<super::Tiler>();
+        let _ = std::mem::size_of::<Tiler>();
+    }
+
+    #[test]
+    fn passthrough_hits_on_exact_aligned_tile() {
+        // GT: origin (0, 256), 1 m/px, north-up. A 256×256 tile covering
+        // world [0,0]..[256,256] maps exactly to pixel window (0,0)+256.
+        let gt = GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 256.0, 0.0, -1.0]);
+        let bbox = Bbox::new(0.0, 0.0, 256.0, 256.0);
+        assert_eq!(Tiler::passthrough_window(&gt, &bbox, 256), Some((0, 0)));
+
+        // Offset tile at world (512, 0)..(768, 256) → pixel col 512.
+        let bbox2 = Bbox::new(512.0, 0.0, 768.0, 256.0);
+        assert_eq!(Tiler::passthrough_window(&gt, &bbox2, 256), Some((512, 0)));
+    }
+
+    #[test]
+    fn passthrough_rejects_subpixel_offset() {
+        let gt = GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 256.0, 0.0, -1.0]);
+        // Origin shifted half a pixel — must NOT passthrough (would
+        // misregister against the basemap).
+        let bbox = Bbox::new(0.5, 0.0, 256.5, 256.0);
+        assert_eq!(Tiler::passthrough_window(&gt, &bbox, 256), None);
+    }
+
+    #[test]
+    fn passthrough_rejects_scale_mismatch() {
+        let gt = GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 256.0, 0.0, -1.0]);
+        // World span 512 but ts=256 → 2 m/px request, not unit scale.
+        let bbox = Bbox::new(0.0, -256.0, 512.0, 256.0);
+        assert_eq!(Tiler::passthrough_window(&gt, &bbox, 256), None);
     }
 }
