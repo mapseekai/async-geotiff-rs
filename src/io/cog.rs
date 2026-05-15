@@ -1,18 +1,15 @@
 //! `CogReader` — async-tiff wrapper with GeoTransform/CRS derivation.
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_tiff::metadata::{cache::ReadaheadMetadataCache, TiffMetadataReader};
 use async_tiff::reader::ObjectReader;
 use async_tiff::tags::PhotometricInterpretation;
 use async_tiff::{ImageFileDirectory, TIFF};
-use lru::LruCache;
 use object_store::http::HttpBuilder;
 use object_store::path::Path;
 use object_store::ObjectStore;
-use tokio::sync::Mutex;
 
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
@@ -27,7 +24,6 @@ pub struct CogReader {
     pub(crate) transform: GeoTransform,
     data_ifds: Vec<usize>,
     mask_ifds: Vec<Option<usize>>,
-    tile_cache: Mutex<LruCache<TileCacheKey, Arc<async_tiff::Array>>>,
 }
 
 impl CogReader {
@@ -65,9 +61,6 @@ impl CogReader {
             transform,
             data_ifds,
             mask_ifds,
-            tile_cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(TILE_CACHE_CAPACITY).expect("non-zero cache cap"),
-            )),
         })
     }
 
@@ -132,7 +125,6 @@ impl CogReader {
         width: u64,
         height: u64,
     ) -> AgResult<ImageData> {
-        let ifd_idx = self.data_ifd_index(level)?;
         let ifd = self.data_ifd(level)?;
         let ((tx0, tx1), (ty0, ty1)) = tile_range_for_window(ifd, col_off, row_off, width, height)
             .ok_or_else(|| AgError::Tiff("ifd lacks tile dims".into()))?;
@@ -140,9 +132,11 @@ impl CogReader {
         let coords: Vec<(usize, usize)> = (tx0..=tx1)
             .flat_map(|x| (ty0..=ty1).map(move |y| (x as usize, y as usize)))
             .collect();
-        let arrays = self
-            .fetch_decode_tiles_cached(ifd_idx, ifd, &coords)
-            .await?;
+        let tiles = ifd
+            .fetch_tiles(&coords, &self.reader)
+            .await
+            .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
+        let arrays = decode_tiles(tiles).await?;
 
         let mask = if let Some(mask_ifd) = self.mask_ifd(level)? {
             let mask_tiles = mask_ifd
@@ -205,58 +199,6 @@ impl CogReader {
         Ok(self.tiff.ifds().get(*mask_idx))
     }
 
-    async fn fetch_decode_tiles_cached(
-        &self,
-        ifd_idx: usize,
-        ifd: &ImageFileDirectory,
-        coords: &[(usize, usize)],
-    ) -> AgResult<Vec<Arc<async_tiff::Array>>> {
-        let mut arrays: Vec<Option<Arc<async_tiff::Array>>> = vec![None; coords.len()];
-        let mut missing: Vec<(usize, usize, usize)> = Vec::new();
-        {
-            let mut cache = self.tile_cache.lock().await;
-            for (pos, &(x, y)) in coords.iter().enumerate() {
-                let key = TileCacheKey { ifd_idx, x, y };
-                // `get` touches LRU order; `put` on miss happens below.
-                if let Some(array) = cache.get(&key) {
-                    arrays[pos] = Some(array.clone());
-                } else {
-                    missing.push((pos, x, y));
-                }
-            }
-        }
-
-        if !missing.is_empty() {
-            let missing_coords: Vec<(usize, usize)> =
-                missing.iter().map(|(_, x, y)| (*x, *y)).collect();
-            let tiles = ifd
-                .fetch_tiles(&missing_coords, &self.reader)
-                .await
-                .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
-            let decoded = decode_tiles(tiles).await?;
-
-            let mut cache = self.tile_cache.lock().await;
-            for ((pos, x, y), array) in missing.into_iter().zip(decoded.into_iter()) {
-                let array = Arc::new(array);
-                cache.put(TileCacheKey { ifd_idx, x, y }, array.clone());
-                arrays[pos] = Some(array);
-            }
-        }
-
-        arrays
-            .into_iter()
-            .map(|array| array.ok_or_else(|| AgError::Tiff("tile cache miss".into())))
-            .collect()
-    }
-}
-
-const TILE_CACHE_CAPACITY: usize = 512;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct TileCacheKey {
-    ifd_idx: usize,
-    x: usize,
-    y: usize,
 }
 
 async fn decode_tiles(tiles: Vec<async_tiff::Tile>) -> AgResult<Vec<async_tiff::Array>> {
