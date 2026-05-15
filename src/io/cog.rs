@@ -270,14 +270,28 @@ impl CogReader {
             w: width,
             h: height,
         };
-        self.window_cache
+        let t = std::time::Instant::now();
+        let hit = self.window_cache.contains_key(&key);
+        let out = self
+            .window_cache
             .try_get_with(key, async {
                 self.read_window_uncached(level, col_off, row_off, width, height)
                     .await
                     .map(Arc::new)
             })
             .await
-            .map_err(|e: Arc<AgError>| AgError::Tiff(format!("read_window: {e}")))
+            .map_err(|e: Arc<AgError>| AgError::Tiff(format!("read_window: {e}")));
+        tracing::debug!(
+            level,
+            col_off,
+            row_off,
+            width,
+            height,
+            cache_hit = hit,
+            dur = ?t.elapsed(),
+            "read_window"
+        );
+        out
     }
 
     async fn read_window_uncached(
@@ -298,6 +312,7 @@ impl CogReader {
             .collect();
 
         // I/O: ranged HTTP fetch (object_store handles coalescing). Stays async.
+        let t_fetch = std::time::Instant::now();
         let data_tiles = ifd
             .fetch_tiles(&coords, &self.reader)
             .await
@@ -312,7 +327,10 @@ impl CogReader {
             (None, None)
         };
 
+        let dur_fetch = t_fetch.elapsed();
+
         // CPU: decode + stitch in one blocking job — never touches reactor.
+        let t_decode = std::time::Instant::now();
         let coords_for_blocking = coords.clone();
         let (stitched, mask) = tokio::task::spawn_blocking(
             move || -> AgResult<(crate::pixel::PixelData, Option<ndarray::Array2<bool>>)> {
@@ -355,6 +373,14 @@ impl CogReader {
         )
         .await
         .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+        let dur_decode = t_decode.elapsed();
+        tracing::debug!(
+            level,
+            tiles = coords.len(),
+            ?dur_fetch,
+            ?dur_decode,
+            "read_window miss (fetch + decode)"
+        );
 
         // Alpha-band → mask promotion (rio-tiler priority: alpha > nodata).
         // Only applies when no separate mask IFD was present and the data

@@ -1,6 +1,7 @@
 //! Top-level orchestrator: HTTP request → tile bytes.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 
@@ -30,6 +31,7 @@ impl Tiler {
         y: u32,
         spec: &RenderSpec,
     ) -> AgResult<Bytes> {
+        let t_req = Instant::now();
         let tms = Tms::new(tms_kind)?;
         let dst_bbox = tms.tile_bbox(z, x, y)?;
         let dst_crs = tms.crs();
@@ -82,6 +84,7 @@ impl Tiler {
         let res_matches = level_gsd > 0.0
             && ((target_gsd - level_gsd).abs() / level_gsd) < 0.01;
         let aligned = same_crs && res_matches;
+        let dur_setup = t_req.elapsed();
 
         // -- L2 passthrough --
         // When the requested tile maps EXACTLY onto an integer-aligned
@@ -105,16 +108,30 @@ impl Tiler {
                             pc, pr, ts, level,
                             "L2 passthrough — skipping warp entirely"
                         );
+                        let t = Instant::now();
                         let src: Arc<ImageData> = self
                             .reader
                             .read_window(level, pc, pr, ts as u64, ts as u64)
                             .await?;
+                        let dur_read = t.elapsed();
+                        let t = Instant::now();
                         let compiled: CompiledRenderSpec = compile(spec)?;
+                        let dur_compile = t.elapsed();
+                        let t = Instant::now();
                         let png = tokio::task::spawn_blocking(move || {
                             render(&src, &compiled)
                         })
                         .await
                         .map_err(|e| AgError::Warp(format!("join: {e}")))??;
+                        let dur_render = t.elapsed();
+                        tracing::debug!(
+                            ?dur_setup,
+                            ?dur_read,
+                            ?dur_compile,
+                            ?dur_render,
+                            total = ?t_req.elapsed(),
+                            "tile timing (L2 passthrough)"
+                        );
                         return Ok(png);
                     }
                 }
@@ -136,7 +153,9 @@ impl Tiler {
             return empty_tile(spec.tilesize as usize);
         }
         tracing::debug!(col, row, w, h, "read window (clamped)");
+        let t = Instant::now();
         let src: Arc<ImageData> = self.reader.read_window(level, col, row, w, h).await?;
+        let dur_read = t.elapsed();
 
         // 4. Project the read window into the exact destination tile grid. This is
         // still needed for same-CRS reads because the requested COG window may not
@@ -146,16 +165,31 @@ impl Tiler {
         } else {
             spec.reproject
         };
+        let t = Instant::now();
         let warped: ImageData = tokio::task::spawn_blocking(move || {
             warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
         })
         .await
         .map_err(|e| AgError::Warp(format!("join: {e}")))??;
+        let dur_warp = t.elapsed();
 
+        let t = Instant::now();
         let compiled: CompiledRenderSpec = compile(spec)?;
+        let dur_compile = t.elapsed();
+        let t = Instant::now();
         let png = tokio::task::spawn_blocking(move || render(&warped, &compiled))
             .await
             .map_err(|e| AgError::Warp(format!("join: {e}")))??;
+        let dur_render = t.elapsed();
+        tracing::debug!(
+            ?dur_setup,
+            ?dur_read,
+            ?dur_warp,
+            ?dur_compile,
+            ?dur_render,
+            total = ?t_req.elapsed(),
+            "tile timing (warp path)"
+        );
         Ok(png)
     }
 
