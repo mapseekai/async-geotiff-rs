@@ -105,7 +105,7 @@ impl Tiler {
                             pc, pr, ts, level,
                             "L2 passthrough — skipping warp entirely"
                         );
-                        let src: ImageData = self
+                        let src: Arc<ImageData> = self
                             .reader
                             .read_window(level, pc, pr, ts as u64, ts as u64)
                             .await?;
@@ -136,7 +136,7 @@ impl Tiler {
             return empty_tile(spec.tilesize as usize);
         }
         tracing::debug!(col, row, w, h, "read window (clamped)");
-        let src: ImageData = self.reader.read_window(level, col, row, w, h).await?;
+        let src: Arc<ImageData> = self.reader.read_window(level, col, row, w, h).await?;
 
         // 4. Project the read window into the exact destination tile grid. This is
         // still needed for same-CRS reads because the requested COG window may not

@@ -252,7 +252,35 @@ impl CogReader {
     /// blocking but `stitch` (which after the dtype refactor does the bulk
     /// memcpy + planar-axis view assembly) ran back on the tokio worker —
     /// blocking the reactor for any window large enough to matter.
+    /// Read a pixel window, served from the decoded-window cache when
+    /// possible. Concurrent identical reads are coalesced by moka into a
+    /// single decode (single-flight); errors are not cached.
     pub async fn read_window(
+        &self,
+        level: usize,
+        col_off: i64,
+        row_off: i64,
+        width: u64,
+        height: u64,
+    ) -> AgResult<Arc<ImageData>> {
+        let key = WindowKey {
+            level,
+            col: col_off,
+            row: row_off,
+            w: width,
+            h: height,
+        };
+        self.window_cache
+            .try_get_with(key, async {
+                self.read_window_uncached(level, col_off, row_off, width, height)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .map_err(|e: Arc<AgError>| AgError::Tiff(format!("read_window: {e}")))
+    }
+
+    async fn read_window_uncached(
         &self,
         level: usize,
         col_off: i64,
@@ -602,6 +630,72 @@ mod tests {
             Some(Array2::default((4, 4))),
         );
         assert_eq!(image_data_weight(&d), 32);
+    }
+
+    fn dummy_image() -> ImageData {
+        use crate::pixel::PixelData;
+        use ndarray::Array3;
+        ImageData {
+            pixels: PixelData::U8(Array3::zeros((3, 8, 8))),
+            mask: None,
+            bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
+            crs: Crs::new("UNKNOWN"),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
+            nodata: None,
+        }
+    }
+
+    // No COG fixture is available offline (data/ is gitignored), so the
+    // read_window network path can't be exercised here. These tests pin the
+    // caching mechanism read_window relies on: build_window_cache + moka
+    // try_get_with must memoise (second hit = same Arc) and coalesce
+    // concurrent identical inits into one (single-flight).
+    #[tokio::test]
+    async fn cache_returns_same_arc_on_hit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = build_window_cache(CacheConfig::default());
+        let key = WindowKey { level: 0, col: 0, row: 0, w: 8, h: 8 };
+        let calls = AtomicUsize::new(0);
+        let init = || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, AgError>(Arc::new(dummy_image()))
+        };
+        let a = cache.try_get_with(key.clone(), init()).await.unwrap();
+        let b = cache.try_get_with(key, init()).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cache_single_flights_concurrent_identical_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = build_window_cache(CacheConfig::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = WindowKey { level: 2, col: 5, row: 7, w: 256, h: 256 };
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let key = key.clone();
+            let calls = Arc::clone(&calls);
+            handles.push(tokio::spawn(async move {
+                cache
+                    .try_get_with(key, async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        Ok::<_, AgError>(Arc::new(dummy_image()))
+                    })
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut arcs = Vec::new();
+        for h in handles {
+            arcs.push(h.await.unwrap());
+        }
+        for a in &arcs[1..] {
+            assert!(Arc::ptr_eq(&arcs[0], a));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
