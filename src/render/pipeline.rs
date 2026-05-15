@@ -7,7 +7,7 @@
 //! Validity mask is applied as a single `Zip` over the alpha channel.
 
 use bytes::Bytes;
-use ndarray::{s, Array2, Array3, ArrayView2, Axis, Zip};
+use ndarray::{s, Array2, Array3, Axis, Zip};
 
 use crate::error::{AgError, AgResult};
 use crate::pixel::ImageData;
@@ -336,16 +336,41 @@ fn render_three_band(
     }
 
     if auto_rgb || matches!(spec.composite.kind, crate::render::composite::CompositeKind::Rgb) {
-        // Per-band matrix-style rescale to u8 then channel-wise assign.
-        let r_u8 = scale_to_u8(r_band.view(), ranges[0]);
-        let g_u8 = scale_to_u8(g_band.view(), ranges[1]);
-        let b_u8 = scale_to_u8(b_band.view(), ranges[2]);
+        // Fused single-pass rescale + interleave + alpha (mask/nodata).
+        // Previous version did 3 mapv allocations (one Array2<u8> per band)
+        // and 3 strided slice_mut().assign() into RGBA, then a separate
+        // fill(255) and a Zip mask pass — five sweeps over h*w cells.
+        // Now: one linear sweep over the contiguous RGBA byte buffer.
         let mut rgba = Array3::<u8>::zeros((h, w, 4));
-        rgba.slice_mut(s![.., .., 0]).assign(&r_u8);
-        rgba.slice_mut(s![.., .., 1]).assign(&g_u8);
-        rgba.slice_mut(s![.., .., 2]).assign(&b_u8);
-        rgba.slice_mut(s![.., .., 3]).fill(255);
-        apply_valid_to_alpha(&mut rgba, valid);
+        let n = h * w;
+        let r_slice = r_band.as_slice().expect("r_band contiguous");
+        let g_slice = g_band.as_slice().expect("g_band contiguous");
+        let b_slice = b_band.as_slice().expect("b_band contiguous");
+        let rgba_slice = rgba
+            .as_slice_mut()
+            .expect("freshly-allocated RGBA standard layout");
+        let mask_slice: Option<&[bool]> = valid.and_then(|v| v.as_slice());
+        let (lo_r, hi_r) = ranges[0];
+        let (lo_g, hi_g) = ranges[1];
+        let (lo_b, hi_b) = ranges[2];
+        let inv_r = 255.0 / (hi_r - lo_r).max(1e-12);
+        let inv_g = 255.0 / (hi_g - lo_g).max(1e-12);
+        let inv_b = 255.0 / (hi_b - lo_b).max(1e-12);
+        for i in 0..n {
+            // Pre-scale: (v - lo) * (255 / span), then clamp+cast.
+            let r_u8 = ((r_slice[i] - lo_r) * inv_r).clamp(0.0, 255.0) as u8;
+            let g_u8 = ((g_slice[i] - lo_g) * inv_g).clamp(0.0, 255.0) as u8;
+            let b_u8 = ((b_slice[i] - lo_b) * inv_b).clamp(0.0, 255.0) as u8;
+            let alpha = match mask_slice {
+                Some(m) if !m[i] => 0,
+                _ => 255,
+            };
+            let base = i * 4;
+            rgba_slice[base] = r_u8;
+            rgba_slice[base + 1] = g_u8;
+            rgba_slice[base + 2] = b_u8;
+            rgba_slice[base + 3] = alpha;
+        }
         return Ok(rgba);
     }
 
@@ -362,12 +387,6 @@ fn render_three_band(
     });
     apply_valid_to_alpha(&mut rgba, valid);
     Ok(rgba)
-}
-
-/// `(band - lo) / span` clamped to [0, 1] times 255, as u8 — single `mapv`.
-fn scale_to_u8(band: ArrayView2<f64>, (lo, hi): (f64, f64)) -> Array2<u8> {
-    let span = (hi - lo).max(1e-12);
-    band.mapv(|v| (((v - lo) / span).clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
 /// Fill `rgba` using an `(h, w)` LUT-index array and a 256×4 LUT.
