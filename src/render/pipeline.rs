@@ -1,7 +1,13 @@
 //! Fused render pipeline: rescale → color_formula → composite → encode PNG.
+//!
+//! Hot path uses ndarray matrix operations end-to-end:
+//! - normalise per band as one `mapv` (broadcast scalar arithmetic over `Array2`),
+//! - colormap = elementwise LUT index (still scalar per cell, single linear pass),
+//! - RGB = per-band `assign()` into the (H, W, 4) RGBA `Array3`.
+//! Validity mask is applied as a single `Zip` over the alpha channel.
 
 use bytes::Bytes;
-use ndarray::Array3;
+use ndarray::{s, Array2, Array3, ArrayView2, Axis, Zip};
 
 use crate::error::{AgError, AgResult};
 use crate::pixel::ImageData;
@@ -54,46 +60,33 @@ pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
         }
     }
 
-    // Hot-path optimisation: extract contiguous f64 slices once. Each band view
-    // is a (h, w) C-order `Array2<f64>`; `to_owned()` + `into_raw_vec()` gives a
-    // flat `Vec<f64>` of length n that we can index linearly.
-    let band_buffers: Vec<Vec<f64>> = bidx
+    let _ = n;
+    // Materialise per-band Array2<f64> views from the planar (C, H, W) source.
+    // `to_owned()` makes each a contiguous Array2<f64> we can broadcast over.
+    let band_views: Vec<Array2<f64>> = bidx
         .iter()
-        .map(|&b| {
-            src.index_axis(ndarray::Axis(0), b)
-                .to_owned()
-                .into_raw_vec_and_offset()
-                .0
-        })
+        .map(|&b| src.index_axis(Axis(0), b).to_owned())
         .collect();
 
     let nodata = spec.nodata.or(image.nodata);
-    let valid = compute_valid(image, &band_buffers, nodata);
+    let valid: Option<Array2<bool>> = compute_valid_mask(image, &band_views, nodata, h, w);
 
-    let mut rgba = Array3::<u8>::zeros((h, w, 4));
-    {
-        let rgba_flat = rgba
-            .as_slice_mut()
-            .expect("rgba Array3<u8>::zeros is standard layout");
-        match band_buffers.len() {
-            1 => write_single_band(rgba_flat, &band_buffers[0], valid.as_deref(), spec),
-            3 => write_three_band(
-                rgba_flat,
-                &band_buffers[0],
-                &band_buffers[1],
-                &band_buffers[2],
-                valid.as_deref(),
-                spec,
-                auto_rgb,
-            ),
-            other => {
-                return Err(AgError::UnsupportedPixel(format!(
-                    "expected 1 or 3 bands after bidx, got {other}"
-                )))
-            }
+    let mut rgba: Array3<u8> = match band_views.len() {
+        1 => render_single_band(&band_views[0], valid.as_ref(), spec),
+        3 => render_three_band(
+            &band_views[0],
+            &band_views[1],
+            &band_views[2],
+            valid.as_ref(),
+            spec,
+            auto_rgb,
+        )?,
+        other => {
+            return Err(AgError::UnsupportedPixel(format!(
+                "expected 1 or 3 bands after bidx, got {other}"
+            )))
         }
-        let _ = n; // silence unused if logging removed
-    }
+    };
 
     let target = spec.tile_size as usize;
     if target > 0 && (h != target || w != target) {
@@ -102,57 +95,70 @@ pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
     encode_png(&rgba)
 }
 
-/// Build a flat validity mask (`true` = render this pixel). Returns `None`
-/// when every pixel is valid — caller skips the check entirely.
-fn compute_valid(
+/// Build a `(h, w)` validity mask. Returns `None` if every pixel is valid so
+/// the caller can skip the mask check entirely.
+///
+/// Implemented as a sequence of `Zip` reductions over the input `Array2`s —
+/// pure ndarray broadcasting, no manual indexing.
+fn compute_valid_mask(
     image: &ImageData,
-    bands: &[Vec<f64>],
+    bands: &[Array2<f64>],
     nodata: Option<f64>,
-) -> Option<Vec<bool>> {
-    let n = bands.first().map(|b| b.len()).unwrap_or(0);
-    let mask_slice: Option<&[bool]> = image.mask.as_ref().and_then(|m| m.as_slice());
-
-    if mask_slice.is_none() && nodata.is_none() {
+    h: usize,
+    w: usize,
+) -> Option<Array2<bool>> {
+    let mask_present = image.mask.is_some();
+    if !mask_present && nodata.is_none() {
         return None;
     }
-
-    let mut out = vec![true; n];
-    if let Some(m) = mask_slice {
-        for i in 0..n {
-            out[i] = m[i];
-        }
+    let mut valid = Array2::<bool>::from_elem((h, w), true);
+    if let Some(m) = &image.mask {
+        valid.assign(m);
     }
     if let Some(nd) = nodata {
+        let is_nan = nd.is_nan();
         for band in bands {
-            if nd.is_nan() {
-                for (i, &v) in band.iter().enumerate() {
-                    if v.is_nan() {
-                        out[i] = false;
+            if is_nan {
+                Zip::from(&mut valid).and(band).for_each(|v, &x| {
+                    if x.is_nan() {
+                        *v = false;
                     }
-                }
+                });
             } else {
-                for (i, &v) in band.iter().enumerate() {
-                    if (v - nd).abs() < 1e-9 {
-                        out[i] = false;
+                Zip::from(&mut valid).and(band).for_each(|v, &x| {
+                    if (x - nd).abs() < 1e-9 {
+                        *v = false;
                     }
-                }
+                });
             }
         }
     }
-    Some(out)
+    Some(valid)
 }
 
-/// Single-band gradient/discrete path — slice-only, no ndarray indexing,
-/// and direct LUT lookup when the composite is a gradient.
-fn write_single_band(
-    rgba_flat: &mut [u8],
-    band: &[f64],
-    valid: Option<&[bool]>,
+/// Apply the validity mask to the alpha channel of an RGBA `Array3<u8>`.
+fn apply_valid_to_alpha(rgba: &mut Array3<u8>, valid: Option<&Array2<bool>>) {
+    if let Some(v) = valid {
+        Zip::from(rgba.slice_mut(s![.., .., 3]))
+            .and(v)
+            .for_each(|a, &ok| {
+                if !ok {
+                    *a = 0;
+                }
+            });
+    }
+}
+
+/// Single-band path: matrix-style rescale → LUT index Array2<u8> → fill RGBA.
+fn render_single_band(
+    band: &Array2<f64>,
+    valid: Option<&Array2<bool>>,
     spec: &CompiledRenderSpec,
-) {
+) -> Array3<u8> {
     use crate::render::composite::CompositeKind;
     let comp = &spec.composite;
-    let n = band.len();
+    let (h, w) = band.dim();
+
     match comp.kind {
         CompositeKind::Gradient => {
             let lut = comp.lut.unwrap_or([[0u8; 4]; 256]);
@@ -161,64 +167,114 @@ fn write_single_band(
                 _ => (0.0, 1.0),
             };
             let scale = 255.0 / (hi - lo).max(1e-12);
-            for i in 0..n {
-                if valid.is_some_and(|v| !v[i]) {
-                    continue;
-                }
-                let t = ((band[i] - lo) * scale).clamp(0.0, 255.0) as usize;
-                let px = lut[t];
-                let base = i * 4;
-                rgba_flat[base..base + 4].copy_from_slice(&px);
-            }
+
+            // Matrix-style normalise: out = clamp((band - lo) * scale, 0, 255) as u8
+            let idx = band.mapv(|v| (((v - lo) * scale).clamp(0.0, 255.0)) as u8);
+
+            let mut rgba = Array3::<u8>::zeros((h, w, 4));
+            interleave_lut(&idx, &lut, &mut rgba);
+            apply_valid_to_alpha(&mut rgba, valid);
+            rgba
         }
         _ => {
-            // Discrete/Rgb single-band fallback (rare) — keep general dispatch.
-            for i in 0..n {
-                if valid.is_some_and(|v| !v[i]) {
-                    continue;
-                }
-                let px = comp.get(&[band[i]], None);
-                let base = i * 4;
-                rgba_flat[base..base + 4].copy_from_slice(&px);
-            }
+            // Discrete / single-band-rgb fallback: per-pixel composite.get.
+            let mut rgba = Array3::<u8>::zeros((h, w, 4));
+            Zip::indexed(band).for_each(|(r, c), &v| {
+                let px = comp.get(&[v], None);
+                rgba.slice_mut(s![r, c, ..])
+                    .iter_mut()
+                    .zip(px.iter())
+                    .for_each(|(dst, src)| *dst = *src);
+            });
+            apply_valid_to_alpha(&mut rgba, valid);
+            rgba
         }
     }
 }
 
-/// Three-band RGB path — same slice-only structure.
-fn write_three_band(
-    rgba_flat: &mut [u8],
-    r_band: &[f64],
-    g_band: &[f64],
-    b_band: &[f64],
-    valid: Option<&[bool]>,
+/// Three-band RGB path: per-band matrix rescale → channel `assign()` into RGBA.
+fn render_three_band(
+    r_band: &Array2<f64>,
+    g_band: &Array2<f64>,
+    b_band: &Array2<f64>,
+    valid: Option<&Array2<bool>>,
     spec: &CompiledRenderSpec,
     auto_rgb: bool,
-) {
-    let n = r_band.len();
+) -> AgResult<Array3<u8>> {
+    let (h, w) = r_band.dim();
     let has_formula = !spec.formula.is_empty();
     let ranges = rgb_ranges(spec);
-    for i in 0..n {
-        if valid.is_some_and(|v| !v[i]) {
-            continue;
-        }
-        let (rb, gb, bb) = (r_band[i], g_band[i], b_band[i]);
-        let px = if has_formula {
-            let r = normalize(rb, ranges[0]);
-            let g = normalize(gb, ranges[1]);
-            let b = normalize(bb, ranges[2]);
+
+    if has_formula {
+        // Color formula goes via Lab/Lch and is unavoidably per-pixel.
+        let mut rgba = Array3::<u8>::zeros((h, w, 4));
+        Zip::indexed(r_band).for_each(|(r_idx, c_idx), &rv| {
+            let gv = g_band[[r_idx, c_idx]];
+            let bv = b_band[[r_idx, c_idx]];
+            let r = normalize(rv, ranges[0]);
+            let g = normalize(gv, ranges[1]);
+            let b = normalize(bv, ranges[2]);
             let (r, g, b) = crate::render::color_formula::apply(&spec.formula, r, g, b);
-            [unit_to_u8(r), unit_to_u8(g), unit_to_u8(b), 255]
-        } else if auto_rgb {
-            let r = normalize(rb, ranges[0]);
-            let g = normalize(gb, ranges[1]);
-            let b = normalize(bb, ranges[2]);
-            [unit_to_u8(r), unit_to_u8(g), unit_to_u8(b), 255]
-        } else {
-            spec.composite.get(&[rb, gb, bb], None)
-        };
+            rgba[[r_idx, c_idx, 0]] = unit_to_u8(r);
+            rgba[[r_idx, c_idx, 1]] = unit_to_u8(g);
+            rgba[[r_idx, c_idx, 2]] = unit_to_u8(b);
+            rgba[[r_idx, c_idx, 3]] = 255;
+        });
+        apply_valid_to_alpha(&mut rgba, valid);
+        return Ok(rgba);
+    }
+
+    if auto_rgb || matches!(spec.composite.kind, crate::render::composite::CompositeKind::Rgb) {
+        // Per-band matrix-style rescale to u8 then channel-wise assign.
+        let r_u8 = scale_to_u8(r_band.view(), ranges[0]);
+        let g_u8 = scale_to_u8(g_band.view(), ranges[1]);
+        let b_u8 = scale_to_u8(b_band.view(), ranges[2]);
+        let mut rgba = Array3::<u8>::zeros((h, w, 4));
+        rgba.slice_mut(s![.., .., 0]).assign(&r_u8);
+        rgba.slice_mut(s![.., .., 1]).assign(&g_u8);
+        rgba.slice_mut(s![.., .., 2]).assign(&b_u8);
+        rgba.slice_mut(s![.., .., 3]).fill(255);
+        apply_valid_to_alpha(&mut rgba, valid);
+        return Ok(rgba);
+    }
+
+    // 3-band into a gradient/discrete composite — uncommon. Fallback.
+    let mut rgba = Array3::<u8>::zeros((h, w, 4));
+    Zip::indexed(r_band).for_each(|(r_idx, c_idx), &rv| {
+        let gv = g_band[[r_idx, c_idx]];
+        let bv = b_band[[r_idx, c_idx]];
+        let px = spec.composite.get(&[rv, gv, bv], None);
+        rgba.slice_mut(s![r_idx, c_idx, ..])
+            .iter_mut()
+            .zip(px.iter())
+            .for_each(|(dst, src)| *dst = *src);
+    });
+    apply_valid_to_alpha(&mut rgba, valid);
+    Ok(rgba)
+}
+
+/// `(band - lo) / span` clamped to [0, 1] times 255, as u8 — single `mapv`.
+fn scale_to_u8(band: ArrayView2<f64>, (lo, hi): (f64, f64)) -> Array2<u8> {
+    let span = (hi - lo).max(1e-12);
+    band.mapv(|v| (((v - lo) / span).clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// Fill `rgba` using an `(h, w)` LUT-index array and a 256×4 LUT.
+fn interleave_lut(idx: &Array2<u8>, lut: &[[u8; 4]; 256], rgba: &mut Array3<u8>) {
+    // We could express this as a single Zip over the leading axis of rgba but
+    // a slice copy of 4 bytes per pixel is just as cache-friendly and skips
+    // ndarray bounds checks in debug.
+    let (h, w) = idx.dim();
+    let idx_slice = idx
+        .as_slice()
+        .expect("idx Array2<u8>::mapv is standard layout");
+    let rgba_slice = rgba
+        .as_slice_mut()
+        .expect("rgba Array3<u8>::zeros is standard layout");
+    debug_assert_eq!(rgba_slice.len(), h * w * 4);
+    for (i, &t) in idx_slice.iter().enumerate() {
         let base = i * 4;
-        rgba_flat[base..base + 4].copy_from_slice(&px);
+        rgba_slice[base..base + 4].copy_from_slice(&lut[t as usize]);
     }
 }
 
