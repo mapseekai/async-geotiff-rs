@@ -78,7 +78,7 @@ impl CogReader {
             .map(|&idx| {
                 tiff.ifds()
                     .get(idx)
-                    .and_then(|ifd| alpha_band_index(ifd))
+                    .and_then(alpha_band_index)
             })
             .collect();
         Ok(Self {
