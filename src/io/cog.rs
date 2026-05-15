@@ -139,34 +139,28 @@ impl CogReader {
         Ok(x_res.max(y_res))
     }
 
-    /// Pick the finest overview whose ground-sample distance is still ≥ the
-    /// target (or the coarsest available if every overview is finer than
-    /// target). Matches rio-tiler / gdalwarp behaviour — previously we
-    /// returned the coarsest level ≤ target, which under-resolved every
-    /// tile by one overview level.
+    /// Faithful port of rio-tiler `get_overview_level`
+    /// (`rio_tiler/utils.py`, itself adapted from GDAL `gdalwarp_lib.cpp`).
+    ///
+    /// Level 0 is full resolution; 1.. are progressively coarser overviews
+    /// (gsd strictly increasing). The chosen level is the **finest one that
+    /// is still no coarser than the target** — i.e. it brackets the target
+    /// from below and the subsequent warp *downsamples* to the exact tile
+    /// resolution. Reading a finer level and downsampling preserves detail;
+    /// reading a coarser level and upsampling would blur the tile. This is
+    /// the single most important quality/bandwidth decision in the pipeline.
+    ///
+    /// Rules (matching upstream exactly):
+    /// - `target ≤ src_res` (zoomed in past native): use full resolution.
+    /// - otherwise walk levels; pick `L` where `gsd(L) < target < gsd(L+1)`,
+    ///   or snap to `L` if `|gsd(L) − target| < 0.1`.
+    /// - target coarser than every overview: use the coarsest level.
     pub fn pick_overview(&self, target_gsd: f64) -> usize {
-        let levels: Vec<(usize, f64)> = (0..self.level_count())
-            .filter_map(|l| self.level_gsd(l).ok().map(|g| (l, g)))
+        let n = self.level_count();
+        let gsds: Vec<f64> = (0..n)
+            .map(|l| self.level_gsd(l).unwrap_or(f64::INFINITY))
             .collect();
-        if levels.is_empty() {
-            return 0;
-        }
-        // Find finest (smallest gsd) level whose gsd >= target.
-        let mut best: Option<(usize, f64)> = None;
-        for &(l, gsd) in &levels {
-            if gsd >= target_gsd && best.map_or(true, |(_, b)| gsd < b) {
-                best = Some((l, gsd));
-            }
-        }
-        if let Some((l, _)) = best {
-            return l;
-        }
-        // All overviews are finer than target → coarsest available.
-        levels
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|&(l, _)| l)
-            .unwrap_or(0)
+        pick_overview_from_gsds(&gsds, target_gsd)
     }
 
     /// Read a pixel window from the chosen overview level.
@@ -417,6 +411,30 @@ fn classify_ifds(tiff: &TIFF) -> AgResult<(Vec<usize>, Vec<Option<usize>>)> {
     Ok((data_ifds, mask_ifds))
 }
 
+/// Pure overview-selection logic, faithful to rio-tiler `get_overview_level`.
+/// `gsds[0]` is full-resolution; entries are non-decreasing (coarser).
+fn pick_overview_from_gsds(gsds: &[f64], target_gsd: f64) -> usize {
+    let n = gsds.len();
+    if n <= 1 {
+        return 0;
+    }
+    let src_res = gsds[0];
+    if target_gsd <= src_res {
+        return 0;
+    }
+    for level in 0..n - 1 {
+        let cur = gsds[level];
+        let next = gsds[level + 1];
+        if cur < target_gsd && next > target_gsd {
+            return level;
+        }
+        if (cur - target_gsd).abs() < 0.1 {
+            return level;
+        }
+    }
+    n - 1
+}
+
 fn is_mask_ifd(ifd: &ImageFileDirectory) -> bool {
     ifd.new_subfile_type().is_some_and(|t| t & 4 != 0)
         && ifd.photometric_interpretation() == PhotometricInterpretation::TransparencyMask
@@ -441,6 +459,39 @@ fn alpha_band_index(ifd: &ImageFileDirectory) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Full-res gsd=10, overviews 20/40/80 (levels 0..3).
+    const PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
+
+    #[test]
+    fn overview_brackets_target_from_below_downsample() {
+        // target 30 sits between L1(20) and L2(40): rio-tiler picks the
+        // FINER bracket (L1) and downsamples 20→30. Not L2 (upsample).
+        assert_eq!(pick_overview_from_gsds(&PYRAMID, 30.0), 1);
+    }
+
+    #[test]
+    fn overview_zoomed_in_uses_full_res() {
+        // target finer than native → full res.
+        assert_eq!(pick_overview_from_gsds(&PYRAMID, 5.0), 0);
+        assert_eq!(pick_overview_from_gsds(&PYRAMID, 10.0), 0);
+    }
+
+    #[test]
+    fn overview_snaps_within_tolerance() {
+        // target ≈ L2(40) within 0.1 → snap to L2.
+        assert_eq!(pick_overview_from_gsds(&PYRAMID, 40.05), 2);
+    }
+
+    #[test]
+    fn overview_coarser_than_all_uses_coarsest() {
+        assert_eq!(pick_overview_from_gsds(&PYRAMID, 200.0), 3);
+    }
+
+    #[test]
+    fn overview_single_level_is_zero() {
+        assert_eq!(pick_overview_from_gsds(&[10.0], 100.0), 0);
+    }
 
     #[test]
     fn split_http_url_extracts_parts() {
