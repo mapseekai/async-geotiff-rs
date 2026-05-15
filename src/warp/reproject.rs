@@ -100,9 +100,11 @@ pub fn warp(
                 + p10.1 * di * (1.0 - dj)
                 + p11.1 * di * dj;
             mask[[r, c]] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
+            let valid_view = src.mask.as_ref().map(|m| m.view());
             for b in 0..bands {
                 let band_view = src_f64.index_axis(ndarray::Axis(0), b);
-                out[[b, r, c]] = resampling.sample(band_view, sc, sr, fill);
+                out[[b, r, c]] =
+                    resampling.sample_masked(band_view, valid_view, sc, sr, fill);
             }
         }
     }

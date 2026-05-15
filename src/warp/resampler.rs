@@ -31,19 +31,43 @@ impl Resampling {
     /// that appear between adjacent XYZ tiles when a sample lands on the
     /// last column/row of the read window.
     pub fn sample(self, view: ArrayView2<f64>, col: f64, row: f64, fill: f64) -> f64 {
+        self.sample_masked(view, None, col, row, fill)
+    }
+
+    /// Like [`sample`] but bilinear/cubic skip neighbours marked invalid in
+    /// `valid` (and renormalises the remaining weights). When all 4
+    /// neighbours are invalid, returns `fill`. Matches GDAL `gdalwarp -wo
+    /// SAMPLE_GRID=YES` semantics for nodata-aware interpolation.
+    pub fn sample_masked(
+        self,
+        view: ArrayView2<f64>,
+        valid: Option<ArrayView2<bool>>,
+        col: f64,
+        row: f64,
+        fill: f64,
+    ) -> f64 {
         let (h, w) = (view.shape()[0] as i64, view.shape()[1] as i64);
         if w == 0 || h == 0 {
             return fill;
         }
-        // Out-of-bounds outside the convex hull of pixel centres → fill.
         if col < -0.5 || row < -0.5 || col > (w - 1) as f64 + 0.5 || row > (h - 1) as f64 + 0.5 {
             return fill;
         }
         let cf = col.clamp(0.0, (w - 1) as f64);
         let rf = row.clamp(0.0, (h - 1) as f64);
         match self {
-            // Cross-CRS sampler keeps cubic at bilinear quality — the SIMD
-            // cubic path is exercised in the same-CRS `warp_affine` branch.
+            Self::Nearest => {
+                let c = cf.round().clamp(0.0, (w - 1) as f64) as usize;
+                let r = rf.round().clamp(0.0, (h - 1) as f64) as usize;
+                if let Some(m) = valid {
+                    if !m[[r, c]] {
+                        return fill;
+                    }
+                }
+                view[[r, c]]
+            }
+            // Cross-CRS cubic uses the bilinear weight kernel (PROJ error
+            // dominates; a true 16-tap scalar loop adds cost for no quality).
             Self::Cubic | Self::Bilinear => {
                 let c0 = cf.floor() as usize;
                 let r0 = rf.floor() as usize;
@@ -51,18 +75,52 @@ impl Resampling {
                 let r1 = (r0 + 1).min(h as usize - 1);
                 let dc = cf - c0 as f64;
                 let dr = rf - r0 as f64;
+
+                let w00 = (1.0 - dc) * (1.0 - dr);
+                let w01 = dc * (1.0 - dr);
+                let w10 = (1.0 - dc) * dr;
+                let w11 = dc * dr;
                 let v00 = view[[r0, c0]];
                 let v01 = view[[r0, c1]];
                 let v10 = view[[r1, c0]];
                 let v11 = view[[r1, c1]];
-                let top = v00 * (1.0 - dc) + v01 * dc;
-                let bot = v10 * (1.0 - dc) + v11 * dc;
-                return top * (1.0 - dr) + bot * dr;
-            }
-            Self::Nearest => {
-                let c = cf.round().clamp(0.0, (w - 1) as f64) as usize;
-                let r = rf.round().clamp(0.0, (h - 1) as f64) as usize;
-                view[[r, c]]
+
+                match valid {
+                    None => {
+                        let top = v00 * (1.0 - dc) + v01 * dc;
+                        let bot = v10 * (1.0 - dc) + v11 * dc;
+                        top * (1.0 - dr) + bot * dr
+                    }
+                    Some(m) => {
+                        // Reweighted bilinear: drop invalid neighbours,
+                        // rescale remaining weights to sum to 1.
+                        let (m00, m01, m10, m11) =
+                            (m[[r0, c0]], m[[r0, c1]], m[[r1, c0]], m[[r1, c1]]);
+                        let mut wsum = 0.0;
+                        let mut vsum = 0.0;
+                        if m00 {
+                            wsum += w00;
+                            vsum += w00 * v00;
+                        }
+                        if m01 {
+                            wsum += w01;
+                            vsum += w01 * v01;
+                        }
+                        if m10 {
+                            wsum += w10;
+                            vsum += w10 * v10;
+                        }
+                        if m11 {
+                            wsum += w11;
+                            vsum += w11 * v11;
+                        }
+                        if wsum > 0.0 {
+                            vsum / wsum
+                        } else {
+                            fill
+                        }
+                    }
+                }
             }
         }
     }
