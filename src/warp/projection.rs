@@ -2,6 +2,20 @@
 //!
 //! `Proj` is `!Send + !Sync` (FFI handle). Must live on a single thread —
 //! typically inside `tokio::task::spawn_blocking`.
+//!
+//! Each `Proj::new_known_crs` call materialises a fresh PROJ context (parses
+//! the proj-string, opens the grid database, etc.) — 5-30 ms on the first
+//! hit, non-trivial on subsequent ones. For a tile server every cross-CRS
+//! tile would pay that cost twice (bbox reprojection + warp grid).
+//!
+//! `with_cached` keeps a `thread_local!` map of `(src, dst) → Projector`
+//! and reuses entries within the same blocking-pool worker thread. Tokio's
+//! blocking pool reuses threads up to `max_blocking_threads`, so cache hit
+//! rate is high after warm-up. This is the Rust-side analogue of the
+//! async-geotiff guidance to "do PROJ init once, reuse the handle".
+
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
@@ -39,6 +53,50 @@ impl Projector {
     pub fn dst(&self) -> &Crs {
         &self.dst
     }
+}
+
+#[cfg(feature = "proj")]
+thread_local! {
+    /// Per-blocking-thread cache of `(src, dst) → Projector`. `Proj` is
+    /// `!Send`, so we cannot share across threads — this is the only
+    /// place a Projector lives.
+    static PROJ_CACHE: RefCell<HashMap<(Crs, Crs), Projector>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(feature = "proj")]
+/// Run `f` with a (possibly-cached) `Projector` for `(src, dst)`.
+///
+/// MUST be called inside `tokio::task::spawn_blocking` (or any synchronous
+/// thread context) — `Proj` is `!Send`, so callers cannot hold the
+/// projector across `.await` points.
+pub fn with_cached<R>(
+    src: &Crs,
+    dst: &Crs,
+    f: impl FnOnce(&Projector) -> AgResult<R>,
+) -> AgResult<R> {
+    PROJ_CACHE.with(|cell| {
+        let key = (src.clone(), dst.clone());
+        // Build on miss outside the borrow scope to keep RefCell usage tight.
+        let need_build = !cell.borrow().contains_key(&key);
+        if need_build {
+            let p = Projector::new(src, dst)?;
+            cell.borrow_mut().insert(key.clone(), p);
+        }
+        let map = cell.borrow();
+        let proj = map
+            .get(&key)
+            .expect("just inserted if missing");
+        f(proj)
+    })
+}
+
+#[cfg(not(feature = "proj"))]
+pub fn with_cached<R>(
+    _src: &Crs,
+    _dst: &Crs,
+    _f: impl FnOnce(&Projector) -> AgResult<R>,
+) -> AgResult<R> {
+    Err(AgError::Warp("crate built without `proj` feature".into()))
 }
 
 #[cfg(not(feature = "proj"))]

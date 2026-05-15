@@ -10,7 +10,6 @@ use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
 use crate::pixel::{ImageData, PixelData};
-use crate::warp::projection::Projector;
 use crate::warp::resampler::Resampling;
 
 pub fn warp(
@@ -50,9 +49,9 @@ pub fn warp(
     }
 
     // Cross-CRS path: coarse 32×32 grid through PROJ + bilinear interpolation
-    // of intermediate dst→src pixel coords.
-    let projector = Projector::new(dst_crs, &src.crs)?;
-
+    // of intermediate dst→src pixel coords. The Projector is fetched from a
+    // thread-local cache (see `projection::with_cached`) so back-to-back
+    // tile requests on the same worker thread skip PROJ context init.
     const N: usize = 32;
     let mut grid_dst: Vec<(f64, f64)> = Vec::with_capacity((N + 1) * (N + 1));
     for i in 0..=N {
@@ -62,7 +61,7 @@ pub fn warp(
             grid_dst.push((dx, dy));
         }
     }
-    projector.convert(&mut grid_dst)?;
+    crate::warp::projection::with_cached(dst_crs, &src.crs, |p| p.convert(&mut grid_dst))?;
 
     let grid_src_pix: Vec<(f64, f64)> = grid_dst
         .into_iter()

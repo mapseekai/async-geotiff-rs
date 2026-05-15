@@ -100,25 +100,24 @@ impl Tiler {
     }
 
     /// Reproject a bbox from `from_crs` into the source CRS, taking the AABB
-    /// of the four transformed corners.
+    /// of the four transformed corners. Uses the thread-local Projector
+    /// cache so this and the subsequent warp share one PROJ context.
     async fn reproject_bbox(
         &self,
         bbox: &crate::bounds::Bbox,
         from_crs: &crate::crs::Crs,
     ) -> AgResult<Bbox> {
-        use crate::warp::projection::Projector;
         let src_crs = self.reader.src_crs().clone();
         let from_crs = from_crs.clone();
         let bb = *bbox;
         let res = tokio::task::spawn_blocking(move || -> AgResult<Bbox> {
-            let proj = Projector::new(&from_crs, &src_crs)?;
             let mut pts = [
                 (bb.xmin, bb.ymin),
                 (bb.xmax, bb.ymin),
                 (bb.xmax, bb.ymax),
                 (bb.xmin, bb.ymax),
             ];
-            proj.convert(&mut pts)?;
+            crate::warp::projection::with_cached(&from_crs, &src_crs, |p| p.convert(&mut pts))?;
             Ok(Bbox::from_corners(&pts))
         })
         .await
