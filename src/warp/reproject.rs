@@ -158,6 +158,9 @@ fn warp_affine(
     let alg = match resampling {
         Resampling::Nearest => fr::ResizeAlg::Nearest,
         Resampling::Bilinear => fr::ResizeAlg::Convolution(fr::FilterType::Bilinear),
+        // Catmull-Rom bicubic — same SIMD codepath in fast_image_resize as
+        // bilinear, just a wider 4-tap kernel.
+        Resampling::Cubic => fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom),
     };
     let options = fr::ResizeOptions::new()
         .resize_alg(alg)

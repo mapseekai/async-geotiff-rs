@@ -7,6 +7,11 @@ pub enum Resampling {
     #[default]
     Nearest,
     Bilinear,
+    /// Catmull-Rom bicubic (16-tap). Sharper than bilinear with negligible
+    /// extra cost in `fast_image_resize`'s SIMD path; for the cross-CRS
+    /// fallback sampler, falls back to bilinear (cubic is overkill there
+    /// because PROJ error already dominates).
+    Cubic,
 }
 
 impl Resampling {
@@ -14,6 +19,7 @@ impl Resampling {
         match s {
             "nearest" => Some(Self::Nearest),
             "bilinear" => Some(Self::Bilinear),
+            "cubic" | "bicubic" => Some(Self::Cubic),
             _ => None,
         }
     }
@@ -36,12 +42,9 @@ impl Resampling {
         let cf = col.clamp(0.0, (w - 1) as f64);
         let rf = row.clamp(0.0, (h - 1) as f64);
         match self {
-            Self::Nearest => {
-                let c = cf.round().clamp(0.0, (w - 1) as f64) as usize;
-                let r = rf.round().clamp(0.0, (h - 1) as f64) as usize;
-                view[[r, c]]
-            }
-            Self::Bilinear => {
+            // Cross-CRS sampler keeps cubic at bilinear quality — the SIMD
+            // cubic path is exercised in the same-CRS `warp_affine` branch.
+            Self::Cubic | Self::Bilinear => {
                 let c0 = cf.floor() as usize;
                 let r0 = rf.floor() as usize;
                 let c1 = (c0 + 1).min(w as usize - 1);
@@ -54,7 +57,12 @@ impl Resampling {
                 let v11 = view[[r1, c1]];
                 let top = v00 * (1.0 - dc) + v01 * dc;
                 let bot = v10 * (1.0 - dc) + v11 * dc;
-                top * (1.0 - dr) + bot * dr
+                return top * (1.0 - dr) + bot * dr;
+            }
+            Self::Nearest => {
+                let c = cf.round().clamp(0.0, (w - 1) as f64) as usize;
+                let r = rf.round().clamp(0.0, (h - 1) as f64) as usize;
+                view[[r, c]]
             }
         }
     }
@@ -88,6 +96,8 @@ mod tests {
     #[test]
     fn parse_string() {
         assert_eq!(Resampling::parse("bilinear"), Some(Resampling::Bilinear));
+        assert_eq!(Resampling::parse("cubic"), Some(Resampling::Cubic));
+        assert_eq!(Resampling::parse("bicubic"), Some(Resampling::Cubic));
         assert_eq!(Resampling::parse("foo"), None);
     }
 }
