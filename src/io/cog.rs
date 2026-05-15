@@ -16,7 +16,9 @@ use object_store::{ClientOptions, ObjectStore};
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
-use crate::io::window::{stitch, stitch_mask, tile_range_for_window};
+use crate::io::window::{
+    stitch_mask_with_info, stitch_with_info, tile_range_for_window, IfdInfo,
+};
 use crate::pixel::ImageData;
 
 pub struct CogReader {
@@ -130,6 +132,12 @@ impl CogReader {
 
     /// Read a pixel window from the chosen overview level.
     /// Returns ImageData (planar (C,H,W) layout from async-tiff).
+    ///
+    /// The whole CPU chain `decode → stitch (+ optional mask decode/stitch)`
+    /// runs inside one `spawn_blocking` job. Previously `decode_tiles` was
+    /// blocking but `stitch` (which after the dtype refactor does the bulk
+    /// memcpy + planar-axis view assembly) ran back on the tokio worker —
+    /// blocking the reactor for any window large enough to matter.
     pub async fn read_window(
         &self,
         level: usize,
@@ -141,40 +149,78 @@ impl CogReader {
         let ifd = self.data_ifd(level)?;
         let ((tx0, tx1), (ty0, ty1)) = tile_range_for_window(ifd, col_off, row_off, width, height)
             .ok_or_else(|| AgError::Tiff("ifd lacks tile dims".into()))?;
+        let data_info = IfdInfo::from(ifd);
 
         let coords: Vec<(usize, usize)> = (tx0..=tx1)
             .flat_map(|x| (ty0..=ty1).map(move |y| (x as usize, y as usize)))
             .collect();
-        let tiles = ifd
+
+        // I/O: ranged HTTP fetch (object_store handles coalescing). Stays async.
+        let data_tiles = ifd
             .fetch_tiles(&coords, &self.reader)
             .await
             .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
-        let arrays = decode_tiles(tiles).await?;
-
-        let mask = if let Some(mask_ifd) = self.mask_ifd(level)? {
-            let mask_tiles = mask_ifd
+        let (mask_tiles_opt, mask_info_opt) = if let Some(mask_ifd) = self.mask_ifd(level)? {
+            let tiles = mask_ifd
                 .fetch_tiles(&coords, &self.reader)
                 .await
                 .map_err(|e| AgError::Tiff(format!("fetch mask tiles: {e}")))?;
-            let mask_arrays = decode_tiles(mask_tiles).await?;
-            Some(stitch_mask(
-                &mask_arrays,
-                &coords,
-                mask_ifd,
-                col_off,
-                row_off,
-                width,
-                height,
-            )?)
+            (Some(tiles), Some(IfdInfo::from(mask_ifd)))
         } else {
-            None
+            (None, None)
         };
 
-        let stitched = stitch(&arrays, &coords, ifd, col_off, row_off, width, height)?;
+        // CPU: decode + stitch in one blocking job — never touches reactor.
+        let coords_for_blocking = coords.clone();
+        let (stitched, mask) = tokio::task::spawn_blocking(
+            move || -> AgResult<(crate::pixel::PixelData, Option<ndarray::Array2<bool>>)> {
+                let registry = async_tiff::decoder::DecoderRegistry::default();
+                let data_arrays: Vec<async_tiff::Array> = data_tiles
+                    .into_iter()
+                    .map(|t| t.decode(&registry))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| AgError::Tiff(format!("decode: {e}")))?;
+                let stitched = stitch_with_info(
+                    &data_arrays,
+                    &coords_for_blocking,
+                    &data_info,
+                    col_off,
+                    row_off,
+                    width,
+                    height,
+                )?;
+                let mask = match (mask_tiles_opt, mask_info_opt) {
+                    (Some(tiles), Some(info)) => {
+                        let mask_arrays: Vec<async_tiff::Array> = tiles
+                            .into_iter()
+                            .map(|t| t.decode(&registry))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| AgError::Tiff(format!("decode mask: {e}")))?;
+                        Some(stitch_mask_with_info(
+                            &mask_arrays,
+                            &coords_for_blocking,
+                            &info,
+                            col_off,
+                            row_off,
+                            width,
+                            height,
+                        )?)
+                    }
+                    _ => None,
+                };
+                Ok((stitched, mask))
+            },
+        )
+        .await
+        .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+
         let level_transform = self.level_transform(level)?;
         let window_transform = level_transform.translated(col_off as f64, row_off as f64);
         let bbox_world = transform_bbox(level_transform, col_off, row_off, width, height);
-        let nodata = ifd.gdal_nodata().and_then(|s| s.parse::<f64>().ok());
+        let nodata = self
+            .data_ifd(level)?
+            .gdal_nodata()
+            .and_then(|s| s.parse::<f64>().ok());
 
         Ok(ImageData {
             pixels: stitched,
@@ -212,19 +258,6 @@ impl CogReader {
         Ok(self.tiff.ifds().get(*mask_idx))
     }
 
-}
-
-async fn decode_tiles(tiles: Vec<async_tiff::Tile>) -> AgResult<Vec<async_tiff::Array>> {
-    tokio::task::spawn_blocking(move || {
-        let registry = async_tiff::decoder::DecoderRegistry::default();
-        tiles
-            .into_iter()
-            .map(|t| t.decode(&registry))
-            .collect::<Result<Vec<_>, _>>()
-    })
-    .await
-    .map_err(|e| AgError::Tiff(format!("join: {e}")))?
-    .map_err(|e| AgError::Tiff(format!("decode: {e}")))
 }
 
 fn transform_bbox(transform: GeoTransform, col: i64, row: i64, w: u64, h: u64) -> Bbox {

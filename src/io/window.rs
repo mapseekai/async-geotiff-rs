@@ -8,6 +8,32 @@ use async_tiff::tags::PlanarConfiguration;
 use async_tiff::{Array, ImageFileDirectory, TypedArray};
 use ndarray::{s, Array2, Array3};
 
+/// Plain-data view of the IFD attributes stitch needs. Extracted up front so
+/// `stitch_with_info` can run inside `spawn_blocking` without holding any
+/// `&ImageFileDirectory` borrow into `self`.
+#[derive(Debug, Clone, Copy)]
+pub struct IfdInfo {
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub bands: usize,
+    pub planar: PlanarConfiguration,
+    pub image_width: u32,
+    pub image_height: u32,
+}
+
+impl From<&ImageFileDirectory> for IfdInfo {
+    fn from(ifd: &ImageFileDirectory) -> Self {
+        Self {
+            tile_width: ifd.tile_width().unwrap_or_else(|| ifd.image_width()),
+            tile_height: ifd.tile_height().unwrap_or_else(|| ifd.image_height()),
+            bands: ifd.samples_per_pixel() as usize,
+            planar: ifd.planar_configuration(),
+            image_width: ifd.image_width(),
+            image_height: ifd.image_height(),
+        }
+    }
+}
+
 /// Convert pixel window to inclusive tile coordinate range
 /// (tx_min..=tx_max, ty_min..=ty_max). Returns None if the IFD lacks tile dims.
 pub fn tile_range_for_window(
@@ -44,12 +70,35 @@ pub fn stitch<A: Borrow<Array>>(
     width: u64,
     height: u64,
 ) -> AgResult<PixelData> {
-    let planar = ifd.planar_configuration();
-    let bands = ifd.samples_per_pixel() as usize;
+    stitch_with_info(
+        arrays,
+        coords,
+        &IfdInfo::from(ifd),
+        col_off,
+        row_off,
+        width,
+        height,
+    )
+}
+
+/// Like [`stitch`] but takes a plain-data [`IfdInfo`]; used inside
+/// `spawn_blocking` where holding a `&ImageFileDirectory` would tie the
+/// closure to `self`. The two functions share all the per-tile work.
+pub fn stitch_with_info<A: Borrow<Array>>(
+    arrays: &[A],
+    coords: &[(usize, usize)],
+    info: &IfdInfo,
+    col_off: i64,
+    row_off: i64,
+    width: u64,
+    height: u64,
+) -> AgResult<PixelData> {
+    let planar = info.planar;
+    let bands = info.bands;
     let dst_h = height as usize;
     let dst_w = width as usize;
-    let tw = tile_width(ifd) as i64;
-    let th = tile_height(ifd) as i64;
+    let tw = info.tile_width as i64;
+    let th = info.tile_height as i64;
 
     // Determine output dtype from the first decoded array. All tiles in an
     // IFD share dtype, so this is safe.
@@ -119,7 +168,7 @@ pub fn stitch<A: Borrow<Array>>(
         | TypedArray::UInt64(_)
         | TypedArray::Int64(_)
         | TypedArray::Bool(_) => stitch_upcast_to_f32(
-            arrays, coords, ifd, col_off, row_off, width, height,
+            arrays, coords, info, col_off, row_off, width, height,
         ),
     }
 }
@@ -168,17 +217,17 @@ fn arrange_planar_view<'a, T: 'static>(
 fn stitch_upcast_to_f32<A: Borrow<Array>>(
     arrays: &[A],
     coords: &[(usize, usize)],
-    ifd: &ImageFileDirectory,
+    info: &IfdInfo,
     col_off: i64,
     row_off: i64,
     width: u64,
     height: u64,
 ) -> AgResult<PixelData> {
-    let tw = tile_width(ifd) as i64;
-    let th = tile_height(ifd) as i64;
-    let bands = ifd.samples_per_pixel() as usize;
+    let tw = info.tile_width as i64;
+    let th = info.tile_height as i64;
+    let bands = info.bands;
     let mut out = Array3::<f32>::zeros((bands, height as usize, width as usize));
-    let planar = ifd.planar_configuration();
+    let planar = info.planar;
     for ((tx, ty), arr) in coords.iter().zip(arrays.iter()) {
         let arr = arr.borrow();
         let tile_col = (*tx as i64) * tw;
@@ -226,14 +275,35 @@ pub fn stitch_mask<A: Borrow<Array>>(
     width: u64,
     height: u64,
 ) -> AgResult<Array2<bool>> {
-    let tw = tile_width(ifd) as i64;
-    let th = tile_height(ifd) as i64;
+    stitch_mask_with_info(
+        arrays,
+        coords,
+        &IfdInfo::from(ifd),
+        col_off,
+        row_off,
+        width,
+        height,
+    )
+}
+
+/// Plain-data version used inside `spawn_blocking`.
+pub fn stitch_mask_with_info<A: Borrow<Array>>(
+    arrays: &[A],
+    coords: &[(usize, usize)],
+    info: &IfdInfo,
+    col_off: i64,
+    row_off: i64,
+    width: u64,
+    height: u64,
+) -> AgResult<Array2<bool>> {
+    let tw = info.tile_width as i64;
+    let th = info.tile_height as i64;
     let mut out = Array2::<bool>::from_elem((height as usize, width as usize), true);
     for ((tx, ty), arr) in coords.iter().zip(arrays.iter()) {
         let arr = arr.borrow();
         let tile_col = (*tx as i64) * tw;
         let tile_row = (*ty as i64) * th;
-        let mask = array_to_mask(arr, ifd.planar_configuration())?;
+        let mask = array_to_mask(arr, info.planar)?;
         let shape = mask.shape();
         let (a_h, a_w) = (shape[0] as i64, shape[1] as i64);
 
