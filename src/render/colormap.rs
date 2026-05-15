@@ -36,7 +36,9 @@ pub fn lut_from_stops(stops: &[(f64, Colour)]) -> AgResult<Lut> {
         return Err(AgError::UnknownColormap("need >=2 stops".into()));
     }
     let mut s = stops.to_vec();
-    s.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    // `total_cmp` is NaN-safe — a stray NaN stop position must not panic
+    // the render pipeline (it would take down the tile handler).
+    s.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut lut = [[0u8; 4]; 256];
     for (i, slot) in lut.iter_mut().enumerate() {
         let t = i as f64 / 255.0;

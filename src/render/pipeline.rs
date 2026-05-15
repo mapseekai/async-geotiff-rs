@@ -4,6 +4,7 @@
 //! - normalise per band as one `mapv` (broadcast scalar arithmetic over `Array2`),
 //! - colormap = elementwise LUT index (still scalar per cell, single linear pass),
 //! - RGB = per-band `assign()` into the (H, W, 4) RGBA `Array3`.
+//!
 //! Validity mask is applied as a single `Zip` over the alpha channel.
 
 use bytes::Bytes;
@@ -149,7 +150,10 @@ fn try_u8_rgb_fastpath(
     // Identity rescale check: empty, or each (lo, hi) is (0, 255).
     let identity = spec.rescale.is_empty()
         || (spec.rescale.len() == 3
-            && spec.rescale.iter().all(|(lo, hi)| *lo == 0.0 && *hi == 255.0));
+            && spec
+                .rescale
+                .iter()
+                .all(|(lo, hi)| *lo == 0.0 && *hi == 255.0));
     if !identity {
         return None;
     }
@@ -324,7 +328,12 @@ fn render_three_band(
         return Ok(rgba);
     }
 
-    if auto_rgb || matches!(spec.composite.kind, crate::render::composite::CompositeKind::Rgb) {
+    if auto_rgb
+        || matches!(
+            spec.composite.kind,
+            crate::render::composite::CompositeKind::Rgb
+        )
+    {
         // Fused single-pass rescale + interleave + alpha (mask/nodata).
         // Previous version did 3 mapv allocations (one Array2<u8> per band)
         // and 3 strided slice_mut().assign() into RGBA, then a separate
@@ -413,7 +422,6 @@ fn normalize(value: f64, (lo, hi): (f64, f64)) -> f64 {
 fn unit_to_u8(value: f64) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
-
 
 #[cfg(test)]
 mod tests {

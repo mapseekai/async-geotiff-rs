@@ -34,18 +34,37 @@ pub fn warp(
         .inverse()
         .ok_or_else(|| AgError::Warp("src GeoTransform not invertible".into()))?;
 
-    // Fast path: same CRS — SIMD-accelerated crop+resize via fast_image_resize.
+    // Fast path: same CRS — SIMD-accelerated crop+resize via
+    // fast_image_resize. Only when the tile maps *fully inside* the source
+    // image: warp_affine clamps its CropBox to the image and resizes that
+    // into the full dst tile, so a boundary tile (mapping partly outside
+    // the COG) would stretch the valid strip across the whole tile. Such
+    // tiles fall through to the scalar grid path below, which returns
+    // transparent fill for out-of-bounds source coords. EDGE_EPS matches
+    // the resampler's sub-pixel seam-halo tolerance so fully-interior
+    // tiles still take the SIMD path.
     if &src.crs == dst_crs {
-        return warp_affine(
-            src,
-            dst_crs,
-            dst_bbox,
-            dst_w,
-            dst_h,
-            resampling,
-            src_inv,
-            dst_transform,
-        );
+        let (lx, ty) = src_inv.forward(dst_bbox.xmin, dst_bbox.ymax);
+        let (rx, by) = src_inv.forward(dst_bbox.xmax, dst_bbox.ymin);
+        let (x0, x1) = (lx.min(rx), lx.max(rx));
+        let (y0, y1) = (ty.min(by), ty.max(by));
+        let sw = src.pixels.width() as f64;
+        let sh = src.pixels.height() as f64;
+        const EDGE_EPS: f64 = 0.5;
+        let fully_in_bounds =
+            x0 >= -EDGE_EPS && y0 >= -EDGE_EPS && x1 <= sw + EDGE_EPS && y1 <= sh + EDGE_EPS;
+        if fully_in_bounds {
+            return warp_affine(
+                src,
+                dst_crs,
+                dst_bbox,
+                dst_w,
+                dst_h,
+                resampling,
+                src_inv,
+                dst_transform,
+            );
+        }
     }
 
     // Cross-CRS path: coarse 32×32 grid through PROJ + bilinear interpolation
@@ -100,7 +119,7 @@ pub fn warp(
     //   4. The mask is computed once per pixel (not per band) and read from
     //      `src.mask` only at the row level.
     let bands = src.pixels.bands();
-    let src_f64 = src.pixels.to_f64();
+    let src_f64 = src.pixels.as_f64();
     let fill = src.nodata.unwrap_or(0.0);
     let src_h = src_f64.shape()[1];
     let src_w = src_f64.shape()[2];
@@ -204,6 +223,7 @@ pub fn warp(
 /// Mirrors GDAL `gdalwarp`'s default "approx_transformer" heuristic: do
 /// one PROJ sweep at the corners, validate against an interior grid, and
 /// promote to the rectilinear fast path when error is sub-pixel.
+#[allow(clippy::too_many_arguments)]
 fn try_subtile_affine(
     src: &ImageData,
     dst_crs: &Crs,
@@ -274,6 +294,24 @@ fn try_subtile_affine(
 
     let src_h = src.pixels.height() as f64;
     let src_w = src.pixels.width() as f64;
+
+    // Boundary correctness: if the tile maps partly outside the source
+    // image, clamping the CropBox to the image and resizing it into the
+    // full dst tile stretches the valid strip across the whole tile
+    // (smeared edges on COG-perimeter tiles at deep zoom). Fall back to the
+    // scalar sampler, which returns transparent fill for out-of-bounds src
+    // coords. EDGE_EPS = 0.5 keeps the same sub-pixel seam-halo tolerance
+    // as the resampler edge handling, so fully-interior tiles still take
+    // this SIMD fast path.
+    const EDGE_EPS: f64 = 0.5;
+    if min_x < -EDGE_EPS
+        || min_y < -EDGE_EPS
+        || max_x > src_w + EDGE_EPS
+        || max_y > src_h + EDGE_EPS
+    {
+        return Ok(None);
+    }
+
     let crop_left = min_x.max(0.0);
     let crop_top = min_y.max(0.0);
     let crop_right = max_x.min(src_w);
@@ -386,6 +424,7 @@ fn try_subtile_affine(
 /// kernels directly, F32 uses the float kernel. F64/I16/I32/U32 are
 /// cast once to F32 (matching GDAL's default working type) so the SIMD
 /// path stays in scope.
+#[allow(clippy::too_many_arguments)]
 fn warp_affine(
     src: &ImageData,
     dst_crs: &Crs,
@@ -424,9 +463,12 @@ fn warp_affine(
         Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
         Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
     };
-    let options = fr::ResizeOptions::new()
-        .resize_alg(alg)
-        .crop(crop_left, crop_top, crop_w_clamped, crop_h_clamped);
+    let options = fr::ResizeOptions::new().resize_alg(alg).crop(
+        crop_left,
+        crop_top,
+        crop_w_clamped,
+        crop_h_clamped,
+    );
     let mut resizer = fr::Resizer::new();
 
     let pixels = match &src.pixels {
@@ -450,9 +492,8 @@ fn warp_affine(
             |b| {
                 // Native u16 → bytes
                 let mut buf = vec![0u8; b.len() * 2];
-                bytemuck::cast_slice_mut::<u8, u16>(&mut buf).copy_from_slice(
-                    b.as_slice().expect("u16 band contiguous"),
-                );
+                bytemuck::cast_slice_mut::<u8, u16>(&mut buf)
+                    .copy_from_slice(b.as_slice().expect("u16 band contiguous"));
                 buf
             },
             |bytes| bytemuck::cast_slice::<u8, u16>(bytes).to_vec(),
@@ -466,9 +507,8 @@ fn warp_affine(
             &mut resizer,
             |b| {
                 let mut buf = vec![0u8; b.len() * 4];
-                bytemuck::cast_slice_mut::<u8, f32>(&mut buf).copy_from_slice(
-                    b.as_slice().expect("f32 band contiguous"),
-                );
+                bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
+                    .copy_from_slice(b.as_slice().expect("f32 band contiguous"));
                 buf
             },
             |bytes| bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
@@ -534,9 +574,8 @@ fn resample_mask_nearest(
     };
     let (h, w) = mask.dim();
     let bytes: Vec<u8> = mask.iter().map(|&v| if v { 255u8 } else { 0u8 }).collect();
-    let src_img =
-        fr::images::Image::from_vec_u8(w as u32, h as u32, bytes, fr::PixelType::U8)
-            .map_err(|e| AgError::Warp(format!("mask resize src: {e}")))?;
+    let src_img = fr::images::Image::from_vec_u8(w as u32, h as u32, bytes, fr::PixelType::U8)
+        .map_err(|e| AgError::Warp(format!("mask resize src: {e}")))?;
     let mut dst_img = fr::images::Image::new(dst_w as u32, dst_h as u32, fr::PixelType::U8);
     // Always nearest for masks — bilinear/cubic smudges sharp boundaries.
     let mask_opts = fr::ResizeOptions::new()
@@ -556,6 +595,7 @@ fn resample_mask_nearest(
 /// Per-band loop driving `fast_image_resize`, parallelised over bands via
 /// rayon. Each thread gets its own `Resizer` (cheap to construct), so RGB
 /// or RGBA tiles see a 3-4x speedup on multi-core machines.
+#[allow(clippy::too_many_arguments)]
 fn resize_bands<T: bytemuck::Pod + Default + Send + Sync>(
     src_arr: &Array3<T>,
     pixel_type: fast_image_resize::PixelType,
@@ -581,13 +621,9 @@ fn resize_bands<T: bytemuck::Pod + Default + Send + Sync>(
         .map(|b| {
             let band = src_arr.index_axis(Axis(0), b);
             let src_bytes = to_bytes(&band);
-            let src_img = fr::images::Image::from_vec_u8(
-                src_w as u32,
-                src_h as u32,
-                src_bytes,
-                pixel_type,
-            )
-            .map_err(|e| AgError::Warp(format!("fast_image_resize src: {e}")))?;
+            let src_img =
+                fr::images::Image::from_vec_u8(src_w as u32, src_h as u32, src_bytes, pixel_type)
+                    .map_err(|e| AgError::Warp(format!("fast_image_resize src: {e}")))?;
             let mut dst_img = fr::images::Image::new(dst_w as u32, dst_h as u32, pixel_type);
             let mut local = fr::Resizer::new();
             local

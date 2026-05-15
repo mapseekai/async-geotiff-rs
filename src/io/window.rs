@@ -146,8 +146,7 @@ pub fn stitch_with_info<A: Borrow<Array>>(
                 let dst_c0 = (world_c0 - col_off) as usize;
                 let dst_c1 = (world_c1 - col_off) as usize;
                 let band_take = bands.min(s[0]);
-                let src_sub =
-                    typed_view.slice(s![..band_take, src_r0..src_r1, src_c0..src_c1]);
+                let src_sub = typed_view.slice(s![..band_take, src_r0..src_r1, src_c0..src_c1]);
                 out.slice_mut(s![..band_take, dst_r0..dst_r1, dst_c0..dst_c1])
                     .assign(&src_sub);
             }
@@ -167,9 +166,9 @@ pub fn stitch_with_info<A: Borrow<Array>>(
         TypedArray::Int8(_)
         | TypedArray::UInt64(_)
         | TypedArray::Int64(_)
-        | TypedArray::Bool(_) => stitch_upcast_to_f32(
-            arrays, coords, info, col_off, row_off, width, height,
-        ),
+        | TypedArray::Bool(_) => {
+            stitch_upcast_to_f32(arrays, coords, info, col_off, row_off, width, height)
+        }
     }
 }
 

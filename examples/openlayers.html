@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>async-geotiff — OpenLayers</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/ol@9.2.4/ol.css"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      #map {
+        position: absolute;
+        inset: 0;
+      }
+      .toolbar {
+        position: absolute;
+        z-index: 10;
+        top: 12px;
+        left: 12px;
+        right: 12px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: flex-end;
+        background: rgba(255, 255, 255, 0.95);
+        padding: 12px 16px;
+        border-radius: 10px;
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.18);
+        font:
+          13px system-ui,
+          sans-serif;
+      }
+      .field {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+      .field label {
+        font-weight: 600;
+        font-size: 11px;
+        color: #444;
+      }
+      .field.wide input,
+      .field.wide select {
+        min-width: 220px;
+      }
+      input,
+      select {
+        padding: 5px 6px;
+        border: 1px solid #ccc;
+        border-radius: 5px;
+        font: inherit;
+      }
+      button {
+        padding: 6px 14px;
+        border: 0;
+        border-radius: 5px;
+        background: #2563eb;
+        color: #fff;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .nav {
+        margin-left: auto;
+        font-size: 12px;
+      }
+      .nav a {
+        color: #2563eb;
+        margin-left: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <form class="toolbar" id="style-form">
+      <div class="field wide">
+        <label for="dataset">Dataset</label>
+        <select id="dataset" name="dataset"></select>
+      </div>
+      <div class="field">
+        <label for="colormap">Colormap</label>
+        <select id="colormap" name="colormap_name">
+          <option value="">greys</option>
+          <option value="viridis">viridis</option>
+          <option value="magma">magma</option>
+          <option value="inferno">inferno</option>
+          <option value="plasma">plasma</option>
+          <option value="cividis">cividis</option>
+          <option value="turbo">turbo</option>
+        </select>
+      </div>
+      <div class="field wide">
+        <label for="rescale">Rescale</label>
+        <input
+          id="rescale"
+          name="rescale"
+          type="text"
+          value="0,255;0,255;0,255"
+        />
+      </div>
+      <div class="field">
+        <label for="bidx">Bands</label>
+        <input id="bidx" name="bidx" type="text" value="1,2,3" />
+      </div>
+      <div class="field">
+        <label for="resampling">Kernel</label>
+        <select id="resampling" name="resampling">
+          <option value="nearest">nearest</option>
+          <option value="bilinear">bilinear</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="opacity">Opacity</label>
+        <input
+          id="opacity"
+          type="range"
+          min="0"
+          max="1"
+          step="0.05"
+          value="0.9"
+        />
+      </div>
+      <button type="submit">Apply</button>
+      <span class="nav">
+        viewer:
+        <a href="/maplibre">MapLibre</a>
+        <a href="/openlayers">OpenLayers</a>
+        <a href="/leaflet">Leaflet</a>
+      </span>
+    </form>
+    <script src="https://cdn.jsdelivr.net/npm/ol@9.2.4/dist/ol.js"></script>
+    <script>
+      const ORIGIN = window.location.origin;
+      const TILE_PATH = "/tiles/WebMercatorQuad/{z}/{x}/{y}.png";
+      let styleVersion = 0;
+      const c = {
+        dataset: document.getElementById("dataset"),
+        colormap: document.getElementById("colormap"),
+        rescale: document.getElementById("rescale"),
+        bidx: document.getElementById("bidx"),
+        resampling: document.getElementById("resampling"),
+        opacity: document.getElementById("opacity"),
+      };
+
+      function appendRepeated(p, name, value, sep) {
+        value
+          .split(sep)
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .forEach((v) => p.append(name, v));
+      }
+      function tileUrl() {
+        const p = new URLSearchParams();
+        if (c.dataset.value) p.set("dataset", c.dataset.value);
+        appendRepeated(p, "bidx", c.bidx.value, ",");
+        appendRepeated(p, "rescale", c.rescale.value, ";");
+        if (c.colormap.value) p.set("colormap_name", c.colormap.value);
+        p.set("resampling", c.resampling.value);
+        p.set("reproject", c.resampling.value);
+        p.set("tilesize", "256");
+        p.set("_v", String(styleVersion));
+        return `${ORIGIN}${TILE_PATH}?${p.toString()}`;
+      }
+
+      const cogSource = new ol.source.XYZ({ url: tileUrl(), maxZoom: 22 });
+      const cogLayer = new ol.layer.Tile({
+        source: cogSource,
+        opacity: Number(c.opacity.value),
+      });
+      const map = new ol.Map({
+        target: "map",
+        layers: [new ol.layer.Tile({ source: new ol.source.OSM() }), cogLayer],
+        view: new ol.View({ center: [0, 0], zoom: 2 }),
+      });
+
+      function applyStyle() {
+        styleVersion += 1;
+        cogLayer.setOpacity(Number(c.opacity.value));
+        // Replacing the source drops OL's whole tile cache, so every zoom
+        // level re-fetches with the new style (no stale-on-zoom).
+        cogLayer.setSource(new ol.source.XYZ({ url: tileUrl(), maxZoom: 22 }));
+      }
+
+      async function flyToDataset() {
+        if (!c.dataset.value) return;
+        try {
+          const r = await fetch(
+            `${ORIGIN}/bounds?dataset=${encodeURIComponent(c.dataset.value)}`,
+          );
+          if (!r.ok) return;
+          const b = await r.json();
+          if (Array.isArray(b) && b.length === 4 && b.every(Number.isFinite)) {
+            const ext = ol.proj.transformExtent(b, "EPSG:4326", "EPSG:3857");
+            map.getView().fit(ext, {
+              padding: [40, 40, 40, 40],
+              duration: 800,
+              maxZoom: 19,
+            });
+          }
+        } catch (_) {}
+      }
+
+      document.getElementById("style-form").addEventListener("submit", (e) => {
+        e.preventDefault();
+        applyStyle();
+      });
+      c.dataset.addEventListener("change", () => {
+        applyStyle();
+        flyToDataset();
+      });
+      c.opacity.addEventListener("input", () =>
+        cogLayer.setOpacity(Number(c.opacity.value)),
+      );
+
+      (async function init() {
+        try {
+          const r = await fetch(`${ORIGIN}/datasets`);
+          if (!r.ok) return;
+          const names = await r.json();
+          if (!Array.isArray(names) || !names.length) return;
+          c.dataset.innerHTML = "";
+          for (const n of names) {
+            const o = document.createElement("option");
+            o.value = n;
+            o.textContent = n;
+            c.dataset.appendChild(o);
+          }
+          c.dataset.value = names[0];
+          applyStyle();
+          flyToDataset();
+        } catch (_) {}
+      })();
+    </script>
+  </body>
+</html>

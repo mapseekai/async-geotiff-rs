@@ -42,10 +42,19 @@ impl Projector {
 
     /// Convert in place a batch of `(x, y)` points.
     pub fn convert(&self, pts: &mut [(f64, f64)]) -> AgResult<()> {
-        self.inner
-            .convert_array(pts)
-            .map(|_| ())
-            .map_err(|e| AgError::Warp(format!("convert: {e}")))
+        self.inner.convert_array(pts).map(|_| ()).map_err(|e| {
+            let msg = e.to_string();
+            let lower = msg.to_ascii_lowercase();
+            // PROJ reports "Point outside of projection domain" (and
+            // similar latitude/longitude-range messages) for coords a
+            // tile may legitimately cover near the CRS edge. Tag these
+            // so the tiler can blank the tile instead of 500-ing.
+            if lower.contains("outside") || lower.contains("domain") || lower.contains("range") {
+                AgError::ProjectionDomain(msg)
+            } else {
+                AgError::Warp(format!("convert: {msg}"))
+            }
+        })
     }
 
     pub fn src(&self) -> &Crs {
@@ -99,6 +108,12 @@ pub fn with_cached<R>(
 /// cross-CRS XYZ tile on a 33×33 control grid. All other CRS pairs go
 /// through `with_cached` → PROJ.
 pub fn convert_batch(src: &Crs, dst: &Crs, pts: &mut [(f64, f64)]) -> AgResult<()> {
+    // Identity: same CRS is a no-op. Lets the generic grid path serve
+    // same-CRS boundary tiles (where warp_affine would stretch a clamped
+    // crop) without paying a PROJ pipeline build.
+    if src == dst {
+        return Ok(());
+    }
     if is_epsg(src, 4326) && is_epsg(dst, 3857) {
         crate::warp::mercator::lonlat_to_mercator(pts);
         return Ok(());

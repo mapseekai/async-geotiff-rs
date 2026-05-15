@@ -28,6 +28,12 @@ pub enum AgError {
     #[error("warp: {0}")]
     Warp(String),
 
+    /// A coordinate fell outside the source/target projection's valid
+    /// domain. Not a failure: the tiler treats this as "nothing here"
+    /// and returns a transparent tile (mirrors rio-tiler/titiler).
+    #[error("projection domain: {0}")]
+    ProjectionDomain(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

@@ -16,9 +16,7 @@ use object_store::{ClientOptions, ObjectStore};
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
-use crate::io::window::{
-    stitch_mask_with_info, stitch_with_info, tile_range_for_window, IfdInfo,
-};
+use crate::io::window::{stitch_mask_with_info, stitch_with_info, tile_range_for_window, IfdInfo};
 use crate::pixel::{ImageData, PixelData};
 
 /// Cache key for a decoded source-pixel window. One `CogReader` serves a
@@ -62,10 +60,7 @@ fn image_data_weight(d: &ImageData) -> u32 {
         PixelData::U32(_) | PixelData::I32(_) | PixelData::F32(_) => 4,
         PixelData::F64(_) => 8,
     };
-    let px = elem
-        * d.pixels.bands()
-        * d.pixels.height()
-        * d.pixels.width();
+    let px = elem * d.pixels.bands() * d.pixels.height() * d.pixels.width();
     let mask = d.mask.as_ref().map_or(0, |m| m.len());
     u32::try_from(px + mask).unwrap_or(u32::MAX)
 }
@@ -155,11 +150,7 @@ impl CogReader {
         let (data_ifds, mask_ifds) = classify_ifds(&tiff)?;
         let alpha_bands: Vec<Option<usize>> = data_ifds
             .iter()
-            .map(|&idx| {
-                tiff.ifds()
-                    .get(idx)
-                    .and_then(alpha_band_index)
-            })
+            .map(|&idx| tiff.ifds().get(idx).and_then(alpha_band_index))
             .collect();
         Ok(Self {
             tiff,
@@ -179,6 +170,36 @@ impl CogReader {
 
     pub fn transform(&self) -> GeoTransform {
         self.transform
+    }
+
+    /// Full-resolution image extent in WGS84 lon/lat as
+    /// `[west, south, east, north]`. Reprojects the four corners from the
+    /// source CRS (skipped when already 4326). Used by viewers to fly to
+    /// the dataset.
+    pub fn wgs84_bounds(&self) -> AgResult<[f64; 4]> {
+        let (w, h) = self.level_dimensions(0)?;
+        let tr = self.transform;
+        let mut corners = [
+            tr.forward(0.0, 0.0),
+            tr.forward(w as f64, 0.0),
+            tr.forward(w as f64, h as f64),
+            tr.forward(0.0, h as f64),
+        ];
+        let wgs84 = Crs::epsg(4326);
+        if self.src_crs != wgs84 {
+            crate::warp::Projector::new(&self.src_crs, &wgs84)?.convert(&mut corners)?;
+        }
+        let mut west = f64::INFINITY;
+        let mut east = f64::NEG_INFINITY;
+        let mut south = f64::INFINITY;
+        let mut north = f64::NEG_INFINITY;
+        for (lon, lat) in corners {
+            west = west.min(lon);
+            east = east.max(lon);
+            south = south.min(lat);
+            north = north.max(lat);
+        }
+        Ok([west, south, east, north])
     }
 
     pub fn overview_count(&self) -> usize {
@@ -442,7 +463,6 @@ impl CogReader {
         };
         Ok(self.tiff.ifds().get(*mask_idx))
     }
-
 }
 
 /// World-space AABB of a pixel rectangle under any (possibly rotated/sheared)
@@ -466,8 +486,23 @@ fn transform_bbox(transform: GeoTransform, col: i64, row: i64, w: u64, h: u64) -
 /// Defaults tuned for COG tile servers: keep many idle keep-alive sockets per
 /// origin so back-to-back tile requests skip the TLS handshake. Mirrors the
 /// `obstore` connection-pool tuning recommended for async-geotiff.
+///
+/// `allow_http(true)`: object_store refuses plain `http://` URLs by default
+/// (it fails at request-build time with a "builder error", before any
+/// network). A COG tile server commonly fronts an internal object store
+/// (MinIO, on-prem S3) reached over `http://host:port`, so plain HTTP must
+/// be permitted. HTTPS endpoints are unaffected.
 fn default_client_options() -> ClientOptions {
+    // `with_allow_http2`: object_store defaults to HTTP/1.1-only
+    // (`http1_only: true`), so even HTTPS object stores get no
+    // multiplexing — every concurrent tile range request needs its own
+    // TCP/TLS handshake, which dominates cold-start latency when a viewer
+    // fans out a full screen of tiles. Allowing HTTP/2 lets HTTPS
+    // endpoints negotiate h2 via ALPN (one connection, many streams);
+    // plaintext endpoints transparently stay on HTTP/1.1.
     ClientOptions::new()
+        .with_allow_http(true)
+        .with_allow_http2()
         .with_pool_max_idle_per_host(64)
         .with_pool_idle_timeout(Duration::from_secs(90))
         .with_timeout(Duration::from_secs(30))
@@ -586,8 +621,11 @@ fn alpha_band_index(ifd: &ImageFileDirectory) -> Option<usize> {
     let total_bands = ifd.samples_per_pixel() as usize;
     let base = total_bands.checked_sub(extras.len())?;
     extras.iter().enumerate().find_map(|(i, e)| {
-        matches!(e, ExtraSamples::AssociatedAlpha | ExtraSamples::UnassociatedAlpha)
-            .then_some(base + i)
+        matches!(
+            e,
+            ExtraSamples::AssociatedAlpha | ExtraSamples::UnassociatedAlpha
+        )
+        .then_some(base + i)
     })
 }
 
@@ -680,7 +718,13 @@ mod tests {
     async fn cache_returns_same_arc_on_hit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let cache = build_window_cache(CacheConfig::default());
-        let key = WindowKey { level: 0, col: 0, row: 0, w: 8, h: 8 };
+        let key = WindowKey {
+            level: 0,
+            col: 0,
+            row: 0,
+            w: 8,
+            h: 8,
+        };
         let calls = AtomicUsize::new(0);
         let init = || async {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -697,7 +741,13 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let cache = build_window_cache(CacheConfig::default());
         let calls = Arc::new(AtomicUsize::new(0));
-        let key = WindowKey { level: 2, col: 5, row: 7, w: 256, h: 256 };
+        let key = WindowKey {
+            level: 2,
+            col: 5,
+            row: 7,
+            w: 256,
+            h: 256,
+        };
         let mut handles = Vec::new();
         for _ in 0..8 {
             let cache = cache.clone();

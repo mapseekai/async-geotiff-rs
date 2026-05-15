@@ -56,6 +56,17 @@ impl PixelData {
         }
     }
 
+    /// Like [`to_f64`](Self::to_f64) but borrows the buffer for the
+    /// already-`f64` case (`Cow::Borrowed`) instead of cloning a full
+    /// `bands×H×W` array. The scalar cross-CRS warp only reads the
+    /// promoted array, so f64 COGs pay zero extra allocation.
+    pub fn as_f64(&self) -> std::borrow::Cow<'_, Array3<f64>> {
+        match self {
+            Self::F64(a) => std::borrow::Cow::Borrowed(a),
+            other => std::borrow::Cow::Owned(other.to_f64()),
+        }
+    }
+
     /// Split off band `b` as an `Array2<bool>` (truthy = non-zero) and
     /// return the remaining planar `(bands-1, H, W)` buffer. Used by the
     /// CogReader to promote an `ExtraSamples=Alpha` band to a validity

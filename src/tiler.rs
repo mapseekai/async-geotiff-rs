@@ -9,8 +9,8 @@ use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::io::CogReader;
 use crate::pixel::ImageData;
-use crate::render::pipeline::{render, CompiledRenderSpec};
-use crate::style::query::{compile, RenderSpec};
+use crate::render::pipeline::render;
+use crate::style::query::{compile_cached, RenderSpec};
 use crate::tms::{Tms, TmsKind};
 use crate::warp;
 
@@ -21,6 +21,11 @@ pub struct Tiler {
 impl Tiler {
     pub fn new(reader: Arc<CogReader>) -> Self {
         Self { reader }
+    }
+
+    /// WGS84 `[west, south, east, north]` extent of the dataset.
+    pub fn wgs84_bounds(&self) -> AgResult<[f64; 4]> {
+        self.reader.wgs84_bounds()
     }
 
     pub async fn tile(
@@ -51,7 +56,12 @@ impl Tiler {
         let bbox_in_src = if self.reader.src_crs() == &dst_crs {
             dst_bbox
         } else {
-            Self::reproject_bbox_sync(&dst_bbox, &dst_crs, self.reader.src_crs())?
+            match Self::reproject_bbox_sync(&dst_bbox, &dst_crs, self.reader.src_crs()) {
+                Ok(b) => b,
+                // Tile lies outside the projection's valid domain → blank.
+                Err(AgError::ProjectionDomain(_)) => return empty_tile(spec.tilesize as usize),
+                Err(e) => return Err(e),
+            }
         };
 
         // 2. Pick overview in source CRS units. Each overview has its own transform.
@@ -81,8 +91,7 @@ impl Tiler {
             .ok_or_else(|| AgError::Warp("source GeoTransform not invertible".into()))?;
         let same_crs = self.reader.src_crs() == &dst_crs;
         let level_gsd = self.reader.level_gsd(level).unwrap_or(target_gsd);
-        let res_matches = level_gsd > 0.0
-            && ((target_gsd - level_gsd).abs() / level_gsd) < 0.01;
+        let res_matches = level_gsd > 0.0 && ((target_gsd - level_gsd).abs() / level_gsd) < 0.01;
         let aligned = same_crs && res_matches;
         let dur_setup = t_req.elapsed();
 
@@ -95,9 +104,7 @@ impl Tiler {
         // aligned-read insight: zero resample, zero PROJ, one read.
         let ts = spec.tilesize as usize;
         if same_crs && res_matches {
-            if let Some((pc, pr)) =
-                Self::passthrough_window(&level_tr, &dst_bbox, ts)
-            {
+            if let Some((pc, pr)) = Self::passthrough_window(&level_tr, &dst_bbox, ts) {
                 if let Ok((iw, ih)) = self.reader.level_dimensions(level) {
                     let in_bounds = pc >= 0
                         && pr >= 0
@@ -105,7 +112,10 @@ impl Tiler {
                         && (pr as u64 + ts as u64) <= ih as u64;
                     if in_bounds {
                         tracing::debug!(
-                            pc, pr, ts, level,
+                            pc,
+                            pr,
+                            ts,
+                            level,
                             "L2 passthrough — skipping warp entirely"
                         );
                         let t = Instant::now();
@@ -115,14 +125,12 @@ impl Tiler {
                             .await?;
                         let dur_read = t.elapsed();
                         let t = Instant::now();
-                        let compiled: CompiledRenderSpec = compile(spec)?;
+                        let compiled = compile_cached(spec).await?;
                         let dur_compile = t.elapsed();
                         let t = Instant::now();
-                        let png = tokio::task::spawn_blocking(move || {
-                            render(&src, &compiled)
-                        })
-                        .await
-                        .map_err(|e| AgError::Warp(format!("join: {e}")))??;
+                        let png = tokio::task::spawn_blocking(move || render(&src, &compiled))
+                            .await
+                            .map_err(|e| AgError::Warp(format!("join: {e}")))??;
                         let dur_render = t.elapsed();
                         tracing::debug!(
                             ?dur_setup,
@@ -166,15 +174,21 @@ impl Tiler {
             spec.reproject
         };
         let t = Instant::now();
-        let warped: ImageData = tokio::task::spawn_blocking(move || {
+        let warped: ImageData = match tokio::task::spawn_blocking(move || {
             warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
         })
         .await
-        .map_err(|e| AgError::Warp(format!("join: {e}")))??;
+        .map_err(|e| AgError::Warp(format!("join: {e}")))?
+        {
+            Ok(w) => w,
+            // Grid point outside the projection's valid domain → blank.
+            Err(AgError::ProjectionDomain(_)) => return empty_tile(spec.tilesize as usize),
+            Err(e) => return Err(e),
+        };
         let dur_warp = t.elapsed();
 
         let t = Instant::now();
-        let compiled: CompiledRenderSpec = compile(spec)?;
+        let compiled = compile_cached(spec).await?;
         let dur_compile = t.elapsed();
         let t = Instant::now();
         let png = tokio::task::spawn_blocking(move || render(&warped, &compiled))
@@ -265,10 +279,24 @@ impl Tiler {
     }
 }
 
+/// Fully-transparent tile PNG. The bytes are constant for a given size,
+/// so encode once and memoize: out-of-bounds / out-of-domain tiles are
+/// common (whole viewport at COG edges), and PNG deflate on the async
+/// worker would otherwise stall the reactor under load.
 fn empty_tile(size: usize) -> AgResult<Bytes> {
-    use ndarray::Array3;
-    let rgba = Array3::<u8>::zeros((size, size, 4));
-    crate::render::encode::encode_png(&rgba)
+    use std::collections::HashMap;
+    use std::sync::{OnceLock, RwLock};
+
+    static CACHE: OnceLock<RwLock<HashMap<usize, Bytes>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    if let Some(bytes) = cache.read().unwrap().get(&size) {
+        return Ok(bytes.clone());
+    }
+    let rgba = ndarray::Array3::<u8>::zeros((size, size, 4));
+    let png = crate::render::encode::encode_png(&rgba)?;
+    cache.write().unwrap().insert(size, png.clone());
+    Ok(png)
 }
 
 #[cfg(test)]

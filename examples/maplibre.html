@@ -132,6 +132,10 @@
   <body>
     <div id="map"></div>
     <form class="toolbar" id="style-form">
+      <div class="field wide">
+        <label for="dataset">Dataset</label>
+        <select id="dataset" name="dataset"></select>
+      </div>
       <div class="field">
         <label for="colormap">Colormap</label>
         <select id="colormap" name="colormap_name">
@@ -164,6 +168,12 @@
         <input id="opacity" name="opacity" type="range" min="0" max="1" step="0.05">
       </div>
       <button type="submit">Apply</button>
+      <span style="margin-left:auto;font-size:12px">
+        viewer:
+        <a href="/" style="color:#2563eb;margin-left:8px">MapLibre</a>
+        <a href="/openlayers" style="color:#2563eb;margin-left:8px">OpenLayers</a>
+        <a href="/leaflet" style="color:#2563eb;margin-left:8px">Leaflet</a>
+      </span>
     </form>
     <div class="status" id="status"></div>
 
@@ -175,6 +185,7 @@
       const pageParams = new URLSearchParams(window.location.search);
 
       const controls = {
+        dataset: document.getElementById("dataset"),
         colormap: document.getElementById("colormap"),
         rescale: document.getElementById("rescale"),
         bidx: document.getElementById("bidx"),
@@ -235,6 +246,9 @@
 
       function tileParams() {
         const params = new URLSearchParams();
+        if (controls.dataset && controls.dataset.value) {
+          params.set("dataset", controls.dataset.value);
+        }
         appendRepeated(params, "bidx", controls.bidx.value, ",");
         appendRepeated(params, "rescale", controls.rescale.value, ";");
         if (controls.colormap.value) {
@@ -246,8 +260,16 @@
         return params;
       }
 
+      // Bumped on every Apply. Appended only to the map's tile-source URL
+      // (not the permalink) so a style change forces MapLibre AND the
+      // browser HTTP cache to treat every zoom level's tiles as new —
+      // otherwise cached overview/child tiles keep the previous style on
+      // zoom. The server ignores unknown query keys, so `_v` is inert.
+      let styleVersion = 0;
+
       function tileUrl() {
         const params = tileParams();
+        params.set("_v", String(styleVersion));
         return `${tileOrigin()}${TILE_PATH}?${params.toString()}`;
       }
 
@@ -315,14 +337,95 @@
 
       document.getElementById("style-form").addEventListener("submit", (event) => {
         event.preventDefault();
-        map.getSource("cog-raster").setTiles([tileUrl()]);
-        map.setPaintProperty("cog-raster", "raster-opacity", Number(controls.opacity.value));
+        styleVersion += 1;
+        // setTiles() only refreshes currently-visible tiles; MapLibre's
+        // per-zoom tile pyramid keeps tiles fetched with the old URL, so
+        // zooming reverts to the original style. Fully rebuild the source
+        // and layer to invalidate the whole pyramid. Re-adding cog-raster
+        // last keeps it above osm-raster.
+        const opacity = Number(controls.opacity.value);
+        if (map.getLayer("cog-raster")) {
+          map.removeLayer("cog-raster");
+        }
+        if (map.getSource("cog-raster")) {
+          map.removeSource("cog-raster");
+        }
+        map.addSource("cog-raster", {
+          type: "raster",
+          tiles: [tileUrl()],
+          tileSize: 256,
+          minzoom: 0,
+          maxzoom: 22,
+          attribution: "async-geotiff"
+        });
+        map.addLayer({
+          id: "cog-raster",
+          type: "raster",
+          source: "cog-raster",
+          paint: { "raster-opacity": opacity }
+        });
         syncStatus();
         syncPermalink();
       });
 
       controls.opacity.addEventListener("input", () => {
         map.setPaintProperty("cog-raster", "raster-opacity", Number(controls.opacity.value));
+      });
+
+      // Populate the dataset switcher from the server's /datasets list.
+      // Selecting one and rebuilding the source goes through the same
+      // pyramid-invalidating path as Apply (so zoom keeps the dataset).
+      (async function loadDatasets() {
+        try {
+          const resp = await fetch(`${tileOrigin()}/datasets`);
+          if (!resp.ok) return;
+          const names = await resp.json();
+          if (!Array.isArray(names) || names.length === 0) return;
+          const wanted = pageParams.get("dataset");
+          controls.dataset.innerHTML = "";
+          for (const name of names) {
+            const opt = document.createElement("option");
+            opt.value = name;
+            opt.textContent = name;
+            controls.dataset.appendChild(opt);
+          }
+          controls.dataset.value =
+            wanted && names.includes(wanted) ? wanted : names[0];
+          // Rebuild the COG source against the selected dataset, then
+          // fly to its extent.
+          document.getElementById("style-form").requestSubmit();
+          flyToDataset();
+        } catch (_) {
+          /* no /datasets endpoint (single-COG mode) — leave as-is */
+        }
+      })();
+
+      async function flyToDataset() {
+        const ds = controls.dataset && controls.dataset.value;
+        if (!ds) return;
+        try {
+          const r = await fetch(
+            `${tileOrigin()}/bounds?dataset=${encodeURIComponent(ds)}`
+          );
+          if (!r.ok) return;
+          const b = await r.json();
+          if (Array.isArray(b) && b.length === 4 && b.every(Number.isFinite)) {
+            map.fitBounds(
+              [
+                [b[0], b[1]],
+                [b[2], b[3]]
+              ],
+              { padding: 40, duration: 800 }
+            );
+          }
+        } catch (_) {
+          /* no /bounds (single-COG mode) */
+        }
+      }
+
+      controls.dataset.addEventListener("change", () => {
+        document.getElementById("style-form").requestSubmit();
+        flyToDataset();
       });
 
       map.on("moveend", syncPermalink);

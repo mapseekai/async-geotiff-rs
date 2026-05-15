@@ -166,6 +166,26 @@ pub fn compile(spec: &RenderSpec) -> AgResult<CompiledRenderSpec> {
     })
 }
 
+/// Cached [`compile`]. Every tile in a viewport carries an identical
+/// `RenderSpec`, so the nom color-formula parse + colormap LUT build is
+/// pure per-request redundancy. Keyed by the spec's `Debug` string
+/// (stable, and `f64` fields make `Hash`/`Eq` impractical). Returns a
+/// shared `Arc` so cache hits clone a pointer. Concurrent misses may
+/// both compile — `compile` is cheap and idempotent, so single-flight
+/// isn't worth the closure-lifetime cost here.
+pub async fn compile_cached(spec: &RenderSpec) -> AgResult<std::sync::Arc<CompiledRenderSpec>> {
+    use std::sync::{Arc, OnceLock};
+    static CACHE: OnceLock<moka::future::Cache<String, Arc<CompiledRenderSpec>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| moka::future::Cache::new(256));
+    let key = format!("{spec:?}");
+    if let Some(hit) = cache.get(&key).await {
+        return Ok(hit);
+    }
+    let compiled = Arc::new(compile(spec)?);
+    cache.insert(key, compiled.clone()).await;
+    Ok(compiled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

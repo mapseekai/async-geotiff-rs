@@ -87,9 +87,9 @@ mod tests {
     fn roundtrip_preserves_points() {
         let mut pts = [
             (0.0, 0.0),
-            (116.4, 39.9),       // Beijing
-            (-73.98, 40.75),     // NYC
-            (151.21, -33.87),    // Sydney
+            (116.4, 39.9),    // Beijing
+            (-73.98, 40.75),  // NYC
+            (151.21, -33.87), // Sydney
             (179.99, 70.0),
         ];
         let original = pts;
@@ -132,12 +132,7 @@ mod tests {
     fn inverse_matches_proj_within_1nrad() {
         use proj::Proj;
         let p = Proj::new_known_crs("EPSG:3857", "EPSG:4326", None).unwrap();
-        let mut samples = vec![
-            (0.0, 0.0),
-            (R * PI, R * PI / 2.0),
-            (-1e7, 5e6),
-            (2e6, -3e6),
-        ];
+        let mut samples = vec![(0.0, 0.0), (R * PI, R * PI / 2.0), (-1e7, 5e6), (2e6, -3e6)];
         let mut expected = samples.clone();
         p.convert_array(&mut expected).unwrap();
         mercator_to_lonlat(&mut samples);

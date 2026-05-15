@@ -23,7 +23,8 @@ pub fn encode_png(rgba: &Array3<u8>) -> AgResult<Bytes> {
         .as_slice()
         .expect("rgba array must be contiguous after as_standard_layout");
     let mut buf = Vec::with_capacity((w * h * 4) as usize);
-    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::NoFilter);
+    let encoder =
+        PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::NoFilter);
     encoder
         .write_image(raw, w, h, ColorType::Rgba8.into())
         .map_err(|e| crate::error::AgError::Tiff(format!("png encode: {e}")))?;
