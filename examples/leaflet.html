@@ -95,6 +95,20 @@
           <option value="turbo">turbo</option>
         </select>
       </div>
+      <div class="field">
+        <label for="stretch">Stretch</label>
+        <select id="stretch" name="stretch">
+          <option value="auto">auto (stddev 2σ)</option>
+          <option value="custom">custom (rescale)</option>
+          <option value="minmax">min/max</option>
+          <option value="percent">percentile</option>
+          <option value="stddev">mean ± kσ</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="stretchArg">pc / σ</label>
+        <input id="stretchArg" type="text" placeholder="2,98 or 2.5" />
+      </div>
       <div class="field wide">
         <label for="rescale">Rescale</label>
         <input
@@ -142,6 +156,8 @@
       const c = {
         dataset: document.getElementById("dataset"),
         colormap: document.getElementById("colormap"),
+        stretch: document.getElementById("stretch"),
+        stretchArg: document.getElementById("stretchArg"),
         rescale: document.getElementById("rescale"),
         bidx: document.getElementById("bidx"),
         resampling: document.getElementById("resampling"),
@@ -159,7 +175,20 @@
         const p = new URLSearchParams();
         if (c.dataset.value) p.set("dataset", c.dataset.value);
         appendRepeated(p, "bidx", c.bidx.value, ",");
-        appendRepeated(p, "rescale", c.rescale.value, ";");
+        // custom rescale > stretch mode > auto (no params → server stddev 2σ)
+        const mode = c.stretch.value;
+        const arg = c.stretchArg.value.trim();
+        if (mode === "custom") {
+          appendRepeated(p, "rescale", c.rescale.value, ";");
+        } else if (mode === "minmax") {
+          p.set("stretch", "minmax");
+        } else if (mode === "percent") {
+          p.set("stretch", "percent");
+          if (arg) p.set("pc", arg);
+        } else if (mode === "stddev") {
+          p.set("stretch", "stddev");
+          if (arg) p.set("sigma", arg);
+        }
         if (c.colormap.value) p.set("colormap_name", c.colormap.value);
         p.set("resampling", c.resampling.value);
         p.set("reproject", c.resampling.value);
@@ -222,6 +251,13 @@
         applyStyle();
         flyToDataset();
       });
+      c.stretch.addEventListener("change", () => {
+        c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
+        c.rescale.disabled = c.stretch.value !== "custom";
+        applyStyle();
+      });
+      c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
+      c.rescale.disabled = c.stretch.value !== "custom";
       c.opacity.addEventListener("input", () =>
         cogLayer.setOpacity(Number(c.opacity.value)),
       );
