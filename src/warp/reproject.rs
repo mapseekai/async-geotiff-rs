@@ -16,6 +16,40 @@ const WARP_EDGE_EPS: f64 = 0.5;
 const WARP_GRID_SIZE: usize = 32;
 const SUBTILE_MAX_ERR_PX: f64 = 0.33;
 
+/// Source-pixel coords `(sc, sr)` for every dst column of dst row `r`,
+/// using the warp grid. Extracted so the average kernel can difference
+/// row `r` against row `r+1` for the vertical Jacobian.
+#[inline]
+fn row_src_coords(
+    r: usize,
+    dst_h: usize,
+    dst_w: usize,
+    col_table: &[(usize, usize, f64)],
+    grid_src_pix: &[(f64, f64)],
+) -> Vec<(f64, f64)> {
+    let gi = (r as f64 + 0.5) * (WARP_GRID_SIZE as f64) / (dst_h as f64);
+    let i0 = (gi.floor() as usize).min(WARP_GRID_SIZE - 1);
+    let i1 = i0 + 1;
+    let di = gi - i0 as f64;
+    let row_i0 = i0 * (WARP_GRID_SIZE + 1);
+    let row_i1 = i1 * (WARP_GRID_SIZE + 1);
+    let mut out = Vec::with_capacity(dst_w);
+    for &(j0, j1, dj) in col_table.iter() {
+        let p00 = grid_src_pix[row_i0 + j0];
+        let p01 = grid_src_pix[row_i0 + j1];
+        let p10 = grid_src_pix[row_i1 + j0];
+        let p11 = grid_src_pix[row_i1 + j1];
+        let w00 = (1.0 - di) * (1.0 - dj);
+        let w01 = (1.0 - di) * dj;
+        let w10 = di * (1.0 - dj);
+        let w11 = di * dj;
+        let sc = p00.0 * w00 + p01.0 * w01 + p10.0 * w10 + p11.0 * w11;
+        let sr = p00.1 * w00 + p01.1 * w01 + p10.1 * w10 + p11.1 * w11;
+        out.push((sc, sr));
+    }
+    out
+}
+
 pub fn warp(
     src: &ImageData,
     dst_crs: &Crs,
@@ -161,28 +195,12 @@ pub fn warp(
     let rows: Vec<(usize, Vec<bool>, Vec<Vec<f64>>)> = (0..dst_h)
         .into_par_iter()
         .map(|r| {
-            let gi = (r as f64 + 0.5) * (WARP_GRID_SIZE as f64) / (dst_h as f64);
-            let i0 = (gi.floor() as usize).min(WARP_GRID_SIZE - 1);
-            let i1 = i0 + 1;
-            let di = gi - i0 as f64;
-            let row_i0 = i0 * (WARP_GRID_SIZE + 1);
-            let row_i1 = i1 * (WARP_GRID_SIZE + 1);
+            let coords = row_src_coords(r, dst_h, dst_w, &col_table, &grid_src_pix);
 
             let mut mask_row = vec![true; dst_w];
             let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
 
-            for (c, &(j0, j1, dj)) in col_table.iter().enumerate() {
-                let p00 = grid_src_pix[row_i0 + j0];
-                let p01 = grid_src_pix[row_i0 + j1];
-                let p10 = grid_src_pix[row_i1 + j0];
-                let p11 = grid_src_pix[row_i1 + j1];
-                let w00 = (1.0 - di) * (1.0 - dj);
-                let w01 = (1.0 - di) * dj;
-                let w10 = di * (1.0 - dj);
-                let w11 = di * dj;
-                let sc = p00.0 * w00 + p01.0 * w01 + p10.0 * w10 + p11.0 * w11;
-                let sr = p00.1 * w00 + p01.1 * w01 + p10.1 * w10 + p11.1 * w11;
-
+            for (c, &(sc, sr)) in coords.iter().enumerate() {
                 mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
                 for (b, band_view) in band_views.iter().enumerate() {
                     band_rows[b][c] =
