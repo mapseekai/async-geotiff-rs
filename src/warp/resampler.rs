@@ -17,9 +17,10 @@ pub enum Resampling {
     /// Lanczos3 windowed sinc (6-tap). Highest quality, slowest of the
     /// SIMD kernels. Matches titiler's `resampling=lanczos`.
     Lanczos,
-    /// Box mean over the source footprint a destination pixel covers.
-    /// Downsampling antialiasing for continuous data; matches titiler /
-    /// gdalwarp `resampling=average`.
+    /// Box-filter mean over the source footprint a destination pixel
+    /// covers: correct averaging antialiasing when downsampling, but
+    /// degrades to nearest-neighbour when upsampling (same behaviour as
+    /// GDAL / titiler `resampling=average`).
     Average,
 }
 
@@ -103,8 +104,6 @@ impl Resampling {
                 }
                 get(r, c)
             }
-            // Cross-CRS cubic uses the bilinear weight kernel (PROJ error
-            // dominates; a true 16-tap scalar loop adds cost for no quality).
             // Cross-CRS sampler: all non-nearest kernels share the 4-tap
             // bilinear path (PROJ error dominates; the SIMD wide kernels
             // are exercised only in the same-CRS / subtile-affine fast path).
