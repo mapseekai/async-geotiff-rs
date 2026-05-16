@@ -118,7 +118,13 @@ impl CogReader {
                 .build()
                 .map_err(|e| AgError::Tiff(format!("http store: {e}")))?,
         );
-        let reader = ObjectReader::new(store, Path::from(path));
+        // `split_http_url` returns the percent-ENCODED URL path, so use
+        // the decoding constructor. `Path::from` would treat `%` as a
+        // literal and double-encode non-ASCII names (e.g. CJK filenames),
+        // making the loopback GET 404 → tile 500.
+        let object_path = Path::from_url_path(&path)
+            .map_err(|e| AgError::Tiff(format!("invalid object path {path:?}: {e}")))?;
+        let reader = ObjectReader::new(store, object_path);
         Self::open_with_reader_and_config(reader, config).await
     }
 
@@ -669,5 +675,32 @@ mod tests {
     fn split_http_url_keeps_port() {
         let (base, _path) = split_http_url("http://localhost:8080/data/scene.tif").unwrap();
         assert_eq!(base, "http://localhost:8080");
+    }
+
+    #[test]
+    fn non_ascii_path_round_trips_via_from_url_path() {
+        use object_store::path::Path;
+
+        // Mirror server::dataset_url: the `url` crate percent-encodes a
+        // non-ASCII filename into the path segment.
+        let mut u = url::Url::parse("http://127.0.0.1:8080").unwrap();
+        u.path_segments_mut()
+            .unwrap()
+            .push("data")
+            .push("测试-中文.tif");
+        let (_base, path) = split_http_url(u.as_str()).unwrap();
+        assert!(path.contains('%'), "split keeps the URL-encoded path");
+
+        // The trap: `Path::from` treats input as a DECODED logical path,
+        // so it re-encodes the `%`, double-encoding the filename.
+        assert_ne!(Path::from(path.as_str()).as_ref(), "data/测试-中文.tif");
+
+        // The fix: `Path::from_url_path` decodes the URL-encoded path, so
+        // object_store re-encodes it exactly once for the loopback GET and
+        // the server's `/data/:name` handler sees the original filename.
+        assert_eq!(
+            Path::from_url_path(&path).unwrap().as_ref(),
+            "data/测试-中文.tif"
+        );
     }
 }
