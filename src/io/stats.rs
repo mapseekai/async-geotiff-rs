@@ -45,6 +45,97 @@ impl Histogram {
     }
 }
 
+use ndarray::{Array3, Axis};
+
+#[derive(Debug, Clone)]
+pub struct BandStat {
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    pub stddev: f64,
+    pub hist: Histogram,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatasetStats {
+    /// Indexed by original (full) band order.
+    pub bands: Vec<BandStat>,
+    pub provenance: Provenance,
+}
+
+/// Per-band stats from a planar `(bands, H, W)` f64 array, excluding
+/// `nodata` and non-finite samples. `hist_bins` is the histogram
+/// resolution (256 in production).
+pub fn band_stats_from_f64(
+    arr: &Array3<f64>,
+    nodata: Option<f64>,
+    hist_bins: usize,
+) -> Vec<BandStat> {
+    let bins = hist_bins.max(1);
+    let mut out = Vec::with_capacity(arr.shape()[0]);
+    for b in 0..arr.shape()[0] {
+        let band = arr.index_axis(Axis(0), b);
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut sum = 0.0_f64;
+        let mut sumsq = 0.0_f64;
+        let mut count = 0_u64;
+        for &v in band.iter() {
+            if !v.is_finite() {
+                continue;
+            }
+            if let Some(nd) = nodata {
+                if (v - nd).abs() < 1e-9 {
+                    continue;
+                }
+            }
+            min = min.min(v);
+            max = max.max(v);
+            sum += v;
+            sumsq += v * v;
+            count += 1;
+        }
+        if count == 0 {
+            out.push(BandStat {
+                min: 0.0,
+                max: 1.0,
+                mean: 0.0,
+                stddev: 0.0,
+                hist: Histogram { min: 0.0, max: 1.0, counts: vec![0; bins] },
+            });
+            continue;
+        }
+        let mean = sum / count as f64;
+        let var = (sumsq / count as f64) - mean * mean;
+        let stddev = var.max(0.0).sqrt();
+        let mut counts = vec![0u64; bins];
+        let span = (max - min).max(1e-12);
+        for &v in band.iter() {
+            if !v.is_finite() {
+                continue;
+            }
+            if let Some(nd) = nodata {
+                if (v - nd).abs() < 1e-9 {
+                    continue;
+                }
+            }
+            let mut idx = (((v - min) / span) * bins as f64) as usize;
+            if idx >= bins {
+                idx = bins - 1;
+            }
+            counts[idx] += 1;
+        }
+        out.push(BandStat {
+            min,
+            max,
+            mean,
+            stddev,
+            hist: Histogram { min, max, counts },
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +161,29 @@ mod tests {
     fn quantile_degenerate_returns_min() {
         let h = Histogram { min: 5.0, max: 5.0, counts: vec![0, 0] };
         assert_eq!(h.quantile(50.0), 5.0);
+    }
+
+    #[test]
+    fn kernel_basic_stats_and_nodata_exclusion() {
+        use ndarray::Array3;
+        // 1 band, 1x4: values 0(nodata), 2, 4, 6 → over {2,4,6}.
+        let arr =
+            Array3::from_shape_vec((1, 1, 4), vec![0.0, 2.0, 4.0, 6.0]).unwrap();
+        let s = band_stats_from_f64(&arr, Some(0.0), 8);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].min, 2.0);
+        assert_eq!(s[0].max, 6.0);
+        assert!((s[0].mean - 4.0).abs() < 1e-9);
+        // population stddev of {2,4,6} = sqrt(8/3) ≈ 1.6329931619
+        assert!((s[0].stddev - (8.0_f64 / 3.0).sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn kernel_all_nodata_is_safe() {
+        use ndarray::Array3;
+        let arr = Array3::from_shape_vec((1, 1, 2), vec![0.0, 0.0]).unwrap();
+        let s = band_stats_from_f64(&arr, Some(0.0), 4);
+        assert_eq!(s[0].min, 0.0);
+        assert_eq!(s[0].max, 1.0);
     }
 }
