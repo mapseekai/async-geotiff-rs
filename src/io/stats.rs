@@ -210,6 +210,47 @@ pub fn parse_embedded_stats(
     Some(DatasetStats { bands: out, provenance: Provenance::Exact })
 }
 
+use crate::error::AgResult;
+use crate::io::CogReader;
+
+const HIST_BINS: usize = 256;
+
+/// Embedded `STATISTICS_*` tags (exact) when present; otherwise compute
+/// from the highest (smallest) overview (estimated). `Ok(None)` when the
+/// COG has no overview to fall back to — caller then uses
+/// `stretch::fallback_rescale`. Reads ≈ the top overview only (a few
+/// hundred KB), independent of full-resolution size.
+pub async fn load_dataset_stats(reader: &CogReader) -> AgResult<Option<DatasetStats>> {
+    // 1) Exact path: embedded tags on the full-res IFD. Scope the IFD
+    //    borrow so it ends before the later `read_window` call.
+    {
+        let ifd = reader.data_ifd(0)?;
+        let bands = ifd.samples_per_pixel() as usize;
+        if let Some(exact) = parse_embedded_stats(
+            ifd.gdal_metadata(),
+            ifd.min_sample_value(),
+            ifd.max_sample_value(),
+            bands,
+        ) {
+            return Ok(Some(exact));
+        }
+    }
+
+    // 2) Estimated path: read the highest overview in full.
+    let top = reader.level_count().saturating_sub(1);
+    if top == 0 {
+        return Ok(None);
+    }
+    let (w, h) = reader.level_dimensions(top)?;
+    let img = reader.read_window(top, 0, 0, w as u64, h as u64).await?;
+    let arr = img.pixels.to_f64();
+    let stats = band_stats_from_f64(&arr, img.nodata, HIST_BINS);
+    Ok(Some(DatasetStats {
+        bands: stats,
+        provenance: Provenance::Estimated,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +332,29 @@ mod tests {
         assert!(parse_embedded_stats(None, None, None, 1).is_none());
         // Malformed XML → None (no usable min/max).
         assert!(parse_embedded_stats(Some("<not xml"), None, None, 1).is_none());
+    }
+
+    // Exercises the estimated (overview) path against a local fixture.
+    // Ignored by default: requires a multi-overview UInt16 COG on disk.
+    #[tokio::test]
+    #[ignore = "requires local data/SVN3-..._cog.tif"]
+    async fn estimated_stats_from_overview() {
+        use async_tiff::reader::ObjectReader;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path;
+        use std::sync::Arc;
+
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+        let p = Path::from(
+            "data/SVN3-01_20250814_L2D0000203064_01_6112500050210001-FUS_3857_cog.tif",
+        );
+        let reader = crate::io::CogReader::open_with_reader(ObjectReader::new(fs, p))
+            .await
+            .unwrap();
+        let s = load_dataset_stats(&reader).await.unwrap().unwrap();
+        assert_eq!(s.provenance, Provenance::Estimated);
+        assert_eq!(s.bands.len(), 3);
+        assert!(s.bands[0].min >= 0.0 && s.bands[0].max < 65535.0);
+        assert!(s.bands[0].max > s.bands[0].min);
     }
 }
