@@ -55,8 +55,8 @@ behind feature flags post-MVP).
 | `nodata`        | no  | `?nodata=nan` | overrides dataset nodata (accepts `nan`, `inf`, `-inf`, float) |
 | `colormap_name` | no  | `?colormap_name=viridis` | from `colorous`: viridis/magma/inferno/plasma/cividis/turbo/greys |
 | `color_formula` | no  | `?color_formula=gamma%20RGB%201.5` | rio-color subset (`gamma`, `sigmoidal`, `saturation`) |
-| `resampling`    | no  | `?resampling=bilinear` | `nearest` (default), `bilinear` |
-| `reproject`     | no  | `?reproject=bilinear` | warp-time kernel |
+| `resampling`    | no  | `?resampling=average` | `nearest` (default), `bilinear`, `cubic`, `cubic_spline`, `lanczos`, `average` — `average` is a box mean over the covered source pixels (titiler/GDAL `average`): antialiasing on downsample, nearest on upsample |
+| `reproject`     | no  | `?reproject=bilinear` | warp-time kernel (same kernel names as `resampling`) |
 | `tilesize`      | no  | `?tilesize=512` | default 256; allowed values: 64, 128, 256, 512, 1024 |
 
 Default tile size is **256** (not titiler's 512) for wider XYZ-client
