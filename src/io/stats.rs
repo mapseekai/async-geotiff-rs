@@ -242,6 +242,13 @@ pub async fn load_dataset_stats(reader: &CogReader) -> AgResult<Option<DatasetSt
         return Ok(None);
     }
     let (w, h) = reader.level_dimensions(top)?;
+    // Estimated path must stay a small read (spec: ≈ top overview only).
+    // If the only/highest overview is unexpectedly large, skip rather than
+    // spike memory; caller falls back to stretch::fallback_rescale.
+    const MAX_OVERVIEW_PIXELS: u64 = 16 * 1024 * 1024;
+    if w as u64 * h as u64 > MAX_OVERVIEW_PIXELS {
+        return Ok(None);
+    }
     let img = reader.read_window(top, 0, 0, w as u64, h as u64).await?;
     let arr = img.pixels.to_f64();
     let stats = band_stats_from_f64(&arr, img.nodata, HIST_BINS);

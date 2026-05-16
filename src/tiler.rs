@@ -107,7 +107,7 @@ impl Tiler {
 
         let bands = image.pixels.bands();
         let bidx: Vec<usize> = if compiled.bidx.is_empty() {
-            if bands >= 3 {
+            if bands >= 3 && compiled.composite.bands >= 3 {
                 vec![0, 1, 2]
             } else {
                 vec![0]

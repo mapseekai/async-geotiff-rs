@@ -88,6 +88,11 @@ pub fn resolve_rescale(
 /// Integers → dtype natural range; floats → per-tile min/max of the
 /// warped buffer (excludes nodata / non-finite). `bidx` already
 /// resolved to concrete bands.
+///
+/// Note: for float tiles whose only samples are nodata / non-finite this
+/// yields the `(0.0, 1.0)` sentinel, which can mis-scale partially-valid
+/// edge tiles of float COGs lacking overviews — a known no-stats-path
+/// limitation.
 pub fn fallback_rescale(
     pixels: &PixelData,
     nodata: Option<f64>,
