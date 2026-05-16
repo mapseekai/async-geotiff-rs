@@ -48,7 +48,10 @@ behind feature flags post-MVP).
 | Parameter | Repeat | Example | Notes |
 |---|---|---|---|
 | `bidx`          | yes | `?bidx=1&bidx=2&bidx=3` | 1-indexed band selection |
-| `rescale`       | yes | `?rescale=0,3000&rescale=0,3000` | per-band `min,max` stretch |
+| `rescale`       | yes | `?rescale=0,3000&rescale=0,3000` | per-band `min,max` stretch (Custom; highest priority) |
+| `stretch`       | no  | `?stretch=percent&pc=2,98` | auto stretch mode: `minmax`, `percent`, `stddev` |
+| `pc`            | no  | `?pc=2,98` | percentile cut for `stretch=percent` (default `2,98`) |
+| `sigma`         | no  | `?sigma=2.5` | σ multiplier for `stretch=stddev` (default `2.0`) |
 | `nodata`        | no  | `?nodata=nan` | overrides dataset nodata (accepts `nan`, `inf`, `-inf`, float) |
 | `colormap_name` | no  | `?colormap_name=viridis` | from `colorous`: viridis/magma/inferno/plasma/cividis/turbo/greys |
 | `color_formula` | no  | `?color_formula=gamma%20RGB%201.5` | rio-color subset (`gamma`, `sigmoidal`, `saturation`) |
@@ -60,6 +63,28 @@ Default tile size is **256** (not titiler's 512) for wider XYZ-client
 compatibility; pass `?tilesize=512` to override. Tile sizes are restricted to
 the power-of-two values above to prevent unbounded allocations and keep viewer
 tile grids predictable.
+
+### Data stretching (non-uint8 rasters)
+
+UInt16/Int16/Float COGs need a value range or they render saturated white.
+Stretch priority: explicit **`rescale`** (Custom) → **`stretch`** mode →
+**default `stretch=stddev` with `sigma=2.0`** when nothing is passed. `u8`
+RGB keeps its 0–255 fast path and is never auto-stretched.
+
+| Mode | Example | Range per band |
+|---|---|---|
+| Custom    | `?rescale=470,660&rescale=470,700&rescale=350,730` | exactly as given |
+| MinMax    | `?stretch=minmax` | dataset `min … max` |
+| Percent   | `?stretch=percent&pc=2,98` | 2nd … 98th percentile (QGIS cumulative cut) |
+| StdDev    | `?stretch=stddev&sigma=2.5` | `mean ± 2.5·σ` (clamped to min/max) |
+| *(none)*  | `?` (no stretch params) | ≡ `stretch=stddev&sigma=2.0` |
+
+Statistics come from the COG's embedded `STATISTICS_*` GDAL tags when
+present (**exact**), otherwise from a one-shot read of the highest
+overview (**estimated**, computed once per dataset and memoized). For
+accurate ranges on tag-less COGs, write stats offline (e.g.
+`gdal_edit.py -stats file.tif`). Invalid params (`?stretch=bogus`,
+`?pc=2`, `?sigma=0`, or `pc`/`sigma` without `stretch=`) return HTTP 400.
 
 ## Supported TileMatrixSets
 
@@ -111,7 +136,7 @@ src/
     window.rs         source tile-range and stitch helpers
   warp/               Projector + Resampling + coarse-grid warp
   render/             colour, colormap, color_formula, composite, encode, pipeline
-  style/              titiler-style URL query parser + compiler
+  style/              titiler-style params parser (`TileStyle`) + compiler
   tiler.rs            orchestrator
 examples/
   serve.rs            demo entrypoint and viewer wiring
