@@ -19,7 +19,6 @@ const SUBTILE_MAX_ERR_PX: f64 = 0.33;
 /// Source-pixel coords `(sc, sr)` for every dst column of dst row `r`,
 /// using the warp grid. Extracted so the average kernel can difference
 /// row `r` against row `r+1` for the vertical Jacobian.
-#[inline]
 fn row_src_coords(
     r: usize,
     dst_h: usize,
