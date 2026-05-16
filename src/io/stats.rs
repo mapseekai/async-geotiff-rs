@@ -136,6 +136,80 @@ pub fn band_stats_from_f64(
     out
 }
 
+/// Parse exact stats from a COG's GDAL_METADATA XML, falling back to
+/// TIFF `SMin/SMaxSampleValue`. Returns `None` when neither yields a
+/// usable min/max for every band. Histogram comes from
+/// `STATISTICS_HISTOMIN/HISTOMAX/HISTONUMBINS/HISTOBINS` when present,
+/// otherwise a single-bin placeholder (percentile then ≈ min/max).
+pub fn parse_embedded_stats(
+    gdal_metadata: Option<&str>,
+    smin: Option<&[u16]>,
+    smax: Option<&[u16]>,
+    bands: usize,
+) -> Option<DatasetStats> {
+    // Pull `<Item name="X" sample="N">V</Item>` into (name, sample, value).
+    fn items(xml: &str) -> Vec<(String, usize, String)> {
+        let mut v = Vec::new();
+        for chunk in xml.split("<Item").skip(1) {
+            let Some(open_end) = chunk.find('>') else { continue };
+            let attrs = &chunk[..open_end];
+            let body = &chunk[open_end + 1..];
+            let Some(close) = body.find("</Item>") else { continue };
+            let value = body[..close].trim().to_string();
+            let name = attr(attrs, "name");
+            let sample = attr(attrs, "sample").parse::<usize>().unwrap_or(0);
+            if !name.is_empty() {
+                v.push((name, sample, value));
+            }
+        }
+        v
+    }
+    fn attr(attrs: &str, key: &str) -> String {
+        let pat = format!("{key}=\"");
+        let Some(start) = attrs.find(&pat) else { return String::new() };
+        let rest = &attrs[start + pat.len()..];
+        rest.find('"').map(|e| rest[..e].to_string()).unwrap_or_default()
+    }
+
+    let parsed = gdal_metadata.map(items).unwrap_or_default();
+    let get = |name: &str, b: usize| -> Option<f64> {
+        parsed
+            .iter()
+            .find(|(n, s, _)| n == name && *s == b)
+            .and_then(|(_, _, v)| v.parse::<f64>().ok())
+    };
+
+    let mut out = Vec::with_capacity(bands);
+    for b in 0..bands {
+        let min = get("STATISTICS_MINIMUM", b).or_else(|| {
+            smin.and_then(|s| s.get(b)).map(|&x| x as f64)
+        })?;
+        let max = get("STATISTICS_MAXIMUM", b).or_else(|| {
+            smax.and_then(|s| s.get(b)).map(|&x| x as f64)
+        })?;
+        let mean = get("STATISTICS_MEAN", b).unwrap_or((min + max) / 2.0);
+        let stddev = get("STATISTICS_STDDEV", b).unwrap_or((max - min) / 4.0);
+        let hist = {
+            let hmin = get("STATISTICS_HISTOMIN", b).unwrap_or(min);
+            let hmax = get("STATISTICS_HISTOMAX", b).unwrap_or(max);
+            let counts: Vec<u64> = parsed
+                .iter()
+                .find(|(n, s, _)| n == "STATISTICS_HISTOBINS" && *s == b)
+                .map(|(_, _, v)| {
+                    v.split(|c: char| c == ',' || c.is_whitespace())
+                        .filter(|t| !t.is_empty())
+                        .filter_map(|t| t.parse::<u64>().ok())
+                        .collect()
+                })
+                .filter(|c: &Vec<u64>| !c.is_empty())
+                .unwrap_or_else(|| vec![1]);
+            Histogram { min: hmin, max: hmax, counts }
+        };
+        out.push(BandStat { min, max, mean, stddev, hist });
+    }
+    Some(DatasetStats { bands: out, provenance: Provenance::Exact })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +259,37 @@ mod tests {
         let s = band_stats_from_f64(&arr, Some(0.0), 4);
         assert_eq!(s[0].min, 0.0);
         assert_eq!(s[0].max, 1.0);
+    }
+
+    #[test]
+    fn parses_gdal_metadata_per_band() {
+        let xml = r#"<GDALMetadata>
+<Item name="STATISTICS_MINIMUM" sample="0">79</Item>
+<Item name="STATISTICS_MAXIMUM" sample="0">1896</Item>
+<Item name="STATISTICS_MEAN" sample="0">565</Item>
+<Item name="STATISTICS_STDDEV" sample="0">45</Item>
+<Item name="STATISTICS_MINIMUM" sample="1">74</Item>
+<Item name="STATISTICS_MAXIMUM" sample="1">2213</Item>
+</GDALMetadata>"#;
+        let s = parse_embedded_stats(Some(xml), None, None, 2).unwrap();
+        assert_eq!(s.provenance, Provenance::Exact);
+        assert_eq!(s.bands[0].min, 79.0);
+        assert_eq!(s.bands[0].max, 1896.0);
+        assert_eq!(s.bands[0].mean, 565.0);
+        assert_eq!(s.bands[1].min, 74.0);
+        // band 1 has no MEAN tag → midpoint fallback
+        assert!((s.bands[1].mean - (74.0 + 2213.0) / 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn falls_back_to_sminmax_then_none() {
+        // No XML, but SMin/SMax tags present.
+        let s = parse_embedded_stats(None, Some(&[10, 20]), Some(&[100, 200]), 2).unwrap();
+        assert_eq!(s.bands[0].min, 10.0);
+        assert_eq!(s.bands[1].max, 200.0);
+        // Nothing at all → None.
+        assert!(parse_embedded_stats(None, None, None, 1).is_none());
+        // Malformed XML → None (no usable min/max).
+        assert!(parse_embedded_stats(Some("<not xml"), None, None, 1).is_none());
     }
 }
