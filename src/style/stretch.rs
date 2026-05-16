@@ -37,8 +37,9 @@ pub fn parse_stretch_kind(
         }
         "stddev" => {
             let k = sigma.unwrap_or(2.0);
-            // `!(k > 0.0)` (not `k <= 0.0`) so NaN is also rejected.
-            if !(k > 0.0) {
+            // Require finite and positive; this also rejects NaN/inf,
+            // which `k <= 0.0` alone would let through.
+            if !(k.is_finite() && k > 0.0) {
                 return Err(AgError::query("sigma", format!("must be > 0, got {k}")));
             }
             Ok(StretchSpec::StdDev { k })
