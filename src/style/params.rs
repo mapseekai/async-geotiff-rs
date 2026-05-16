@@ -79,7 +79,15 @@ impl TileStyle {
     /// — the caller checks `rescale` first.
     pub fn resolved_stretch(&self) -> AgResult<Option<StretchSpec>> {
         match &self.stretch_kind {
-            None => Ok(None),
+            None => {
+                if self.stretch_pc.is_some() || self.stretch_sigma.is_some() {
+                    return Err(AgError::query(
+                        "stretch",
+                        "pc/sigma given without stretch=",
+                    ));
+                }
+                Ok(None)
+            }
             Some(k) => Ok(Some(parse_stretch_kind(
                 k,
                 self.stretch_pc,
@@ -305,10 +313,18 @@ mod tests {
 
     #[test]
     fn parses_stretch_params() {
+        use crate::style::stretch::StretchSpec;
+
         let s = TileStyle::from_query("stretch=percent&pc=2,98").unwrap();
         assert_eq!(
             s.resolved_stretch().unwrap(),
-            Some(crate::style::stretch::StretchSpec::Percent { lo: 2.0, hi: 98.0 })
+            Some(StretchSpec::Percent { lo: 2.0, hi: 98.0 })
+        );
+
+        let sd = TileStyle::from_query("stretch=stddev&sigma=3.0").unwrap();
+        assert_eq!(
+            sd.resolved_stretch().unwrap(),
+            Some(StretchSpec::StdDev { k: 3.0 })
         );
 
         let none = TileStyle::from_query("").unwrap();
@@ -316,5 +332,13 @@ mod tests {
 
         let bad = TileStyle::from_query("stretch=nope").unwrap();
         assert!(bad.resolved_stretch().is_err());
+
+        // Malformed pc → error at query parse time (AgError::query).
+        assert!(TileStyle::from_query("stretch=percent&pc=abc,2").is_err());
+        assert!(TileStyle::from_query("stretch=percent&pc=2").is_err());
+
+        // Orphan pc/sigma without stretch= → rejected (not silently dropped).
+        let orphan = TileStyle::from_query("pc=2,98").unwrap();
+        assert!(orphan.resolved_stretch().is_err());
     }
 }
