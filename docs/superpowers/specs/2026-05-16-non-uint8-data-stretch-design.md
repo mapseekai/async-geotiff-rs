@@ -1,180 +1,200 @@
-# 非 uint8 栅格数据的默认拉伸设计
+# 栅格数据拉伸:多模式 rescale 设计
 
 日期：2026-05-16
-状态：设计已批准
+状态：设计已批准（v2，扩展为多模式）
 
 ## 问题
 
-当请求一个非 uint8 的 COG（UInt16、Int16、UInt32、Int32、Float32、
-Float64）瓦片，且**未**指定显式的 `?rescale=` 查询参数时，渲染器会套用
-硬编码的 `0–255` 范围（`src/style/params.rs` 中的 `auto_rgb` /
-单波段自动路径）。于是 UInt16 的值（0–65535）几乎全部饱和到 255，
-客户端看到的是一张近乎全白的图。
+当请求非 uint8 的 COG（UInt16 等）瓦片且未指定显式 `?rescale=` 时，
+渲染器套用硬编码 `0–255`，导致 UInt16（0–65535）几乎全饱和成白。
+此外，固定的自定义 min/max 不够用：不同数据需要不同的拉伸策略
+（最大最小值、百分比裁剪、均值±标准差），希望对标 QGIS 提供可选
+拉伸模式，并在前端不传参时给出合理默认。
 
-titiler/rio-tiler 通过从 COG 中存储的**数据集波段统计值**推导默认拉伸
-范围来规避这一问题。本设计为本项目加入相同行为。
+## 需求（锁定）
 
-## 已确定的决策（锁定）
+拉伸方式从“单一自定义”升级为**带模式**，共四种（对标 QGIS）：
 
-- 默认范围来源：**来自 COG 元数据的数据集统计值**，并在缺失时按
-  回退链处理。
-- 由统计值推导范围的公式：**原始 `STATISTICS_MINIMUM` →
-  `STATISTICS_MAXIMUM`**（可预测，与 GDAL/titiler 默认一致；不做
-  σ/百分位对比度拉伸）。
-- Float（F32/F64）且无统计标签：**按本瓦片 min/max**（无统计的整数
-  使用 dtype 自然范围；仅在罕见的“无统计 float”情形下接受可能的
-  瓦片接缝）。
-- 适用范围：仅在未给显式 `rescale` 且 dtype 不是 U8 时触发。U8 的行为
-  及 U8 快速路径保持不变。
+1. **自定义 / UserDefined**（现状）：`rescale=min,max`，每波段重复。
+2. **最大最小值 / MinMax**：用数据真实 min/max，按波段。
+3. **百分比裁剪 / Cumulative count cut**：如 2%–98%，区间可配，按波段。
+4. **均值±标准差 / StdDev**：`mean ± k·σ`，k 默认 2.0，按波段。
 
-## 架构（方案 A：在 tiler 中、读取与渲染之间解析）
+优先级：`rescale`（自定义） > `stretch`（模式） > **默认 `stddev`，k=2.0**。
 
-理由：`compile()` / `compile_cached()` 构建 `rescale`，但无法获知数据集
-的 dtype 或统计值，且 moka 样式缓存不能以数据集身份作为键。因此默认
-范围在“读取+重投影”之后、样式编译之后再解析，然后传入 `render()`
-（其签名已接受 rescale）。`params.rs` 保持与数据集无关；`render()` /
-`pipeline.rs` 热路径不受影响。
+### 查询参数
 
 ```
-CogReader.read_window()              src/io/cog.rs (约 412 行)
-  ├─ 现有：gdal_nodata() → nodata
-  └─ 新增：parse_band_stats(data_ifd.gdal_metadata(),
-                            data_ifd.min_sample_value(),
-                            data_ifd.max_sample_value())
-        → band_stats: Option<Vec<(f64,f64)>>   （按原始波段索引）
-  ↓
-ImageData { …, nodata, band_stats }  src/pixel.rs:113  （新增一个字段）
-  ↓
-warp::warp()                          原样传递 band_stats
-  ↓
-tiler.tile()  第 5/6 步衔接处         src/tiler.rs  （新增一个调用点）
-  if compiled.rescale.is_empty() && !is_u8(pixels) && !explicit_range_composite:
-      effective = resolve_default_rescale(&pixels, band_stats, &compiled.bidx)
-  else:
-      effective = compiled.rescale
-  ↓
-render(pixels, &effective, …)         src/render/pipeline.rs（签名不变）
+# 自定义（最高优先级，保持现状）
+?rescale=470,660&rescale=470,700&rescale=350,730
+
+# 最大最小值
+?stretch=minmax
+
+# 百分比裁剪 2%–98%
+?stretch=percent&pc=2,98
+
+# 均值±σ，k=2.5
+?stretch=stddev&sigma=2.5
+
+# 不传任何拉伸参数 → 等价 ?stretch=stddev&sigma=2.0
 ```
 
-注意：统计标签描述的是全分辨率波段。从概览（overview）层级读取不会
-显著改变值分布，titiler 也具备同样特性，因此无论概览层级如何，统计值
-都按原样使用。
+- `stretch` 取值：`minmax` | `percent` | `stddev`（大小写不敏感）。
+- `pc=lo,hi`：百分位区间，默认 `2,98`；仅 `percent` 用；全局值，
+  对所有波段生效，但产出的截断点按波段各自计算。
+- `sigma=k`：标准差倍数，默认 `2.0`；仅 `stddev` 用；全局值，
+  每波段用各自的 mean/σ。
+- 同时给 `rescale` 与 `stretch` → `rescale` 胜，忽略 `stretch`。
+- `stretch` 值非法 → 返回明确 400 错误（参数校验，非静默）。
+- 所有模式均**按波段独立**计算（与 QGIS 默认一致）。
+- u8 且 `stretch` 未给且 `rescale` 未给：保持现有 u8 快速路径，
+  **不**套用默认 stddev（u8 0–255 已正确，零行为/性能变化）。
+  显式 `stretch` 对 u8 同样生效。
 
-## 组件 1 —— 统计值解析（`src/io/stats.rs`，新建）
+## 统计数据来源（锁定）
+
+MinMax / 百分比 / 均值±σ 都需要统计量。策略：
+**优先读 COG 内嵌标签；缺失则从最高概览层单遍计算并按数据集缓存。**
+
+内嵌标签（GDAL_METADATA，TIFF 标签 42112，`async_tiff 0.3.0`
+`gdal_metadata()`）：
+
+- `STATISTICS_MINIMUM` / `STATISTICS_MAXIMUM` / `STATISTICS_MEAN` /
+  `STATISTICS_STDDEV`（按 `sample=` 波段索引）。
+- 直方图（百分位用）：`STATISTICS_HISTOMIN` / `STATISTICS_HISTOMAX` /
+  `STATISTICS_HISTONUMBINS` / `STATISTICS_HISTOBINS`（逗号分隔计数）。
+- 退而其次的 min/max 来源：TIFF `SMinSampleValue` /
+  `SMaxSampleValue`（标签 340/341）。
+
+缺失任一所需量时，对该数据集触发**一次性概览计算**：读取最高
+（最小）概览层全幅，单遍算出每波段 `min/max/mean/σ` 与定长直方图
+（默认 256 bin，范围取 min..max），结果缓存。`nodata`（本例为 0）
+与掩膜无效样本在所有统计中排除。
+
+缓存：moka，键为 `dataset URI`，值为 `Arc<DatasetStats>`。首个用到
+统计的请求承担一次性计算延迟（9GB 文件也只读最高概览，秒级），
+之后命中缓存。与现有 moka 样式缓存相互独立，互不污染键。
+
+## 架构
+
+`compile()` / 样式缓存仍与数据集无关；统计获取需异步 IO（读概览），
+故放在 tiler 中、读取与渲染之间解析，结果作为 effective rescale 传入
+`render()`（签名已接受 rescale）。`render()` / `pipeline.rs` 热路径
+不变。
+
+```
+请求解析（server.rs）
+  ├─ rescale=...           → StretchSpec::Custom(Vec<(f64,f64)>)
+  ├─ stretch=minmax        → StretchSpec::MinMax
+  ├─ stretch=percent&pc=.. → StretchSpec::Percent{lo,hi}
+  ├─ stretch=stddev&sigma= → StretchSpec::StdDev{k}
+  └─ 均无                   → StretchSpec::StdDev{k:2.0}（u8 除外，见上）
+  ↓
+tiler.tile()  读取+重投影后、render 前：
+  let effective: Vec<(f64,f64)> = match stretch_spec {
+      Custom(v)        => v,
+      _ if is_u8 && spec_is_default => 走原 u8 快速路径,
+      mode             => {
+          let stats = stats_provider.get(dataset_uri).await?; // 标签或概览计算+缓存
+          resolve_rescale(mode, &stats, &compiled.bidx)
+      }
+  };
+  ↓
+render(pixels, &effective, …)   src/render/pipeline.rs（签名不变）
+```
+
+注意：统计标签/概览描述全幅波段分布，从某概览层渲染不显著改变分布，
+故统计跨缩放级别一致复用（与 titiler/QGIS estimate 同理）。
+
+## 组件 1 —— 拉伸规格解析（`src/style/stretch.rs`，新建）
 
 ```rust
-/// 从 COG 元数据解析的每波段 (min, max)，0 基波段索引。
-pub fn parse_band_stats(
-    gdal_metadata: Option<&str>,
-    min_sample_value: Option<&[u16]>,
-    max_sample_value: Option<&[u16]>,
-) -> Option<Vec<(f64, f64)>>;
-```
-
-GDAL_METADATA（TIFF 标签 42112，`async_tiff 0.3.0` 通过
-`gdal_metadata()` 暴露）是一个 XML 字符串：
-
-```xml
-<GDALMetadata>
-  <Item name="STATISTICS_MINIMUM" sample="0">128</Item>
-  <Item name="STATISTICS_MAXIMUM" sample="0">4071</Item>
-  <Item name="STATISTICS_MINIMUM" sample="1">96</Item>
-  ...
-</GDALMetadata>
-```
-
-每个波段的解析优先级：
-
-1. GDAL_METADATA 中的 `STATISTICS_MINIMUM` / `STATISTICS_MAXIMUM`，
-   按 `sample=` 索引匹配。
-2. 若存在则取 TIFF `SMinSampleValue` / `SMaxSampleValue`
-   （`min_sample_value()` / `max_sample_value()`，标签 340/341）。
-3. 两者均无该波段 → 该波段为 `None`（由下游处理）。
-
-解析采用对 `<Item name=… sample=…>value</Item>` 的小型手写扫描——不引入
-新依赖。XML 缺失或格式错误返回 `None`，绝不报错。与 `cog.rs:412`
-现有的 `gdal_nodata().and_then(|s| s.parse().ok())` 模式保持一致。
-
-## 组件 2 —— `ImageData` 管线接入
-
-`src/pixel.rs:113` 新增一个字段：
-
-```rust
-pub struct ImageData {
-    pub pixels: PixelData,
-    pub mask: Option<Array2<bool>>,
-    pub bbox: Bbox,
-    pub crs: Crs,
-    pub transform: GeoTransform,
-    pub nodata: Option<f64>,
-    pub band_stats: Option<Vec<(f64, f64)>>, // 新增：全波段 (min,max)
+pub enum StretchSpec {
+    Custom(Vec<(f64, f64)>),     // 每波段 (min,max)，沿用现有 rescale 解析
+    MinMax,
+    Percent { lo: f64, hi: f64 },// 默认 2.0, 98.0
+    StdDev  { k: f64 },          // 默认 2.0
 }
+
+/// 从查询参数解析。rescale 优先；否则按 stretch；都无 → StdDev{2.0}。
+/// 非法 stretch / pc / sigma → Err（400）。
+pub fn parse_stretch(params: &Query) -> Result<StretchSpec, ParamError>;
 ```
 
-`band_stats` 按**原始**波段顺序索引。`warp` 原样传递该字段（仅一行
-结构体字段拷贝；不改动数值）。其他 `ImageData` 构造处设
-`band_stats: None`。
+校验：`pc` 满足 `0<=lo<hi<=100`；`sigma>0`；`stretch` 仅三枚举值。
 
-## 组件 3 —— `resolve_default_rescale`（`src/style/rescale.rs`，新建）
+## 组件 2 —— 数据集统计（`src/io/stats.rs`，新建）
 
 ```rust
-pub fn resolve_default_rescale(
-    pixels: &PixelData,
-    band_stats: Option<&[(f64, f64)]>,
-    bidx: &[usize],            // 0 基的已编译/已选波段
+pub struct BandStat {
+    pub min: f64, pub max: f64,
+    pub mean: f64, pub stddev: f64,
+    pub hist: Histogram,   // 边界 + 计数，用于分位
+}
+pub struct DatasetStats { pub bands: Vec<BandStat> } // 按原始波段索引
+
+/// 标签优先；缺量则读最高概览单遍计算。按 dataset URI 缓存。
+pub async fn dataset_stats(reader: &CogReader) -> AgResult<Arc<DatasetStats>>;
+
+/// 解析 GDAL_METADATA / SMin·SMaxSampleValue / 直方图标签。
+fn parse_embedded_stats(ifd: &Ifd) -> Option<DatasetStats>;
+```
+
+直方图分位：在累计计数上线性插值求 `lo%`、`hi%` 对应值（近似，
+与 QGIS estimate 一致）。
+
+## 组件 3 —— rescale 求解（`src/style/stretch.rs`）
+
+```rust
+pub fn resolve_rescale(
+    spec: &StretchSpec,
+    stats: &DatasetStats,
+    bidx: &[usize],          // 0 基已编译波段
 ) -> Vec<(f64, f64)>;
 ```
 
-纯函数（无 IO）。对每个选中的波段，按优先级：
+逐选中波段：
 
-1. **该波段有统计值** → 取 `band_stats` 中的原始 `(min, max)`。
-2. **无统计、整数 dtype** → dtype 自然范围：
-   - U16 → `(0.0, 65535.0)`
-   - I16 → `(-32768.0, 32767.0)`
-   - U32 → `(0.0, 4294967295.0)`
-   - I32 → `(-2147483648.0, 2147483647.0)`
-   - U8 → 不会到达（调用方已跳过 u8）
-3. **无统计、float dtype（F32/F64）** → 本瓦片 min/max：对该波段像素
-   单遍扫描，跳过 nodata 与掩膜无效样本。
+- `Custom(v)`：直接返回 `v`（不需要 stats）。
+- `MinMax`：`(b.min, b.max)`。
+- `Percent{lo,hi}`：`(hist.quantile(lo), hist.quantile(hi))`。
+- `StdDev{k}`：`(b.mean - k*b.stddev, b.mean + k*b.stddev)`，
+  再夹到 `[b.min, b.max]`。
 
-退化情形保护：
+退化保护：
 
-- `max <= min`（平坦波段 / 全 nodata 瓦片）→ 扩展为 `(min, min + 1.0)`。
-- float 单遍扫描未找到有效样本 → `(0.0, 1.0)`。
+- `max <= min`（平坦/全 nodata）→ 扩为 `(min, min + 1.0)`。
+- `Custom` 波段数与选中波段数不匹配 → 复用最后一组或返回 400
+  （与现有 rescale 行为保持一致，实现时确认现状并对齐）。
 
-这是拉伸策略的唯一归属处，且无需 IO 即可完整单元测试。`tiler.rs`
-调用点是 float 回退唯一需要访问像素的地方，而那里恰好持有重投影后的
-`PixelData`。
+## ImageData 改动
 
-## 触发条件
-
-仅在**全部**满足时套用默认值：
-
-- 编译后的样式 `rescale` 为空（未给 `?rescale=`），且
-- dtype 不是 U8，且
-- 该 composite 不是离散 / 显式 vmin-vmax 的 colormap（它们已自带范围）。
-
-显式 `?rescale=` 始终优先。U8 保持现有快速路径不变（8 位 RGB 行为与
-性能零变化）。单波段非 u8（自动 "greys" colormap）与三波段非 u8
-auto-RGB 都走该解析器。
+不再新增 `band_stats` 字段（v1 方案废弃）：统计改由
+`stats.rs` 的按数据集缓存提供，避免每瓦片搬运。`ImageData`
+保持现状不变。
 
 ## 错误处理
 
-本特性绝不引入硬错误。GDAL XML 格式错误、标签缺失、全 nodata 瓦片
-均沿优先级链静默回退。
+- 参数层（`stretch`/`pc`/`sigma` 非法）→ 明确 400，便于前端排错。
+- 统计层（标签缺失、概览读取/解码失败、全 nodata）→ 不致命：
+  概览计算失败则回退“整数用 dtype 自然范围、float 用本瓦片 min/max”
+  并记录 warn；保证仍出图。
 
 ## 测试
 
-- 单元（`stats.rs`）：多波段 `sample=` 项；缺项；XML 格式错误 →
-  `None`；SMin/SMax 回退路径。
-- 单元（`rescale.rs`）：各优先级分支；退化 `max<=min`；float 单遍
-  扫描跳过 nodata；`bidx` 重排选中正确的统计项。
-- 集成：含统计值的合成 UInt16 COG → 输出覆盖完整色调范围（断言并非
-  近乎全白）；不含统计值的 UInt16 → dtype 范围路径（记录偏暗的
-  权衡）；无统计的 F32 → 本瓦片路径产生可见对比。
-- 回归：现有 U8 RGB 瓦片与改动前逐字节一致（守护快速路径）。
+- 单元（`stretch.rs` 解析）：rescale 优先于 stretch；缺省→StdDev2.0；
+  非法 stretch/pc/sigma→Err；大小写不敏感。
+- 单元（`stretch.rs` 求解）：四模式数值正确；StdDev 夹到 min/max；
+  退化 `max<=min`；bidx 重排取对波段。
+- 单元（`stats.rs`）：GDAL_METADATA 多波段解析；直方图分位线性插值；
+  SMin/SMax 回退；nodata 排除。
+- 集成：含统计标签的合成 UInt16 COG → 各模式输出符合预期；
+  无标签 UInt16（即本例数据集）→ 概览计算路径产出可见对比、
+  默认 stddev 不再全白；F32 概览计算可见对比。
+- 回归：U8 RGB 默认请求与改动前逐字节一致（守护快速路径）。
 
 ## 不在范围内（YAGNI）
 
-百分位 / mean±σ 对比度拉伸；GDAL SCALE/OFFSET 应用；整数的逐瓦片
-拉伸；`/statistics` 端点；u8 的自动对比度。
+GDAL SCALE/OFFSET 应用；逐瓦片 estimate 模式（QGIS 的“当前范围”）；
+gamma / sigmoid 等非线性拉伸；`/statistics` 端点；u8 默认自动对比度。
