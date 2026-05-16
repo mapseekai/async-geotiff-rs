@@ -4,6 +4,7 @@
 
 use crate::error::{AgError, AgResult};
 use crate::io::stats::DatasetStats;
+use crate::pixel::PixelData;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StretchSpec {
@@ -79,6 +80,55 @@ pub fn resolve_rescale(
                 hi = lo + 1.0;
             }
             (lo, hi)
+        })
+        .collect()
+}
+
+/// Used only when no embedded stats AND no overview to compute from.
+/// Integers → dtype natural range; floats → per-tile min/max of the
+/// warped buffer (excludes nodata / non-finite). `bidx` already
+/// resolved to concrete bands.
+pub fn fallback_rescale(
+    pixels: &PixelData,
+    nodata: Option<f64>,
+    bidx: &[usize],
+) -> Vec<(f64, f64)> {
+    use ndarray::Axis;
+    let dtype_range: Option<(f64, f64)> = match pixels {
+        PixelData::U8(_) => Some((0.0, 255.0)),
+        PixelData::U16(_) => Some((0.0, 65535.0)),
+        PixelData::I16(_) => Some((-32768.0, 32767.0)),
+        PixelData::U32(_) => Some((0.0, 4_294_967_295.0)),
+        PixelData::I32(_) => Some((-2_147_483_648.0, 2_147_483_647.0)),
+        PixelData::F32(_) | PixelData::F64(_) => None,
+    };
+    if let Some(r) = dtype_range {
+        return bidx.iter().map(|_| r).collect();
+    }
+    // Float: per-tile min/max.
+    let arr = pixels.to_f64();
+    bidx.iter()
+        .map(|&b| {
+            let band = arr.index_axis(Axis(0), b.min(arr.shape()[0].saturating_sub(1)));
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for &v in band.iter() {
+                if !v.is_finite() {
+                    continue;
+                }
+                if let Some(nd) = nodata {
+                    if (v - nd).abs() < 1e-9 {
+                        continue;
+                    }
+                }
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            if hi <= lo {
+                (0.0, 1.0)
+            } else {
+                (lo, hi)
+            }
         })
         .collect()
 }
@@ -169,5 +219,24 @@ mod tests {
         // Out-of-range band 5 reused last band → same range as band 0.
         assert_eq!(r[0], r[1]);
         assert_eq!(r[1], (1.0, 9.0));
+    }
+
+    #[test]
+    fn fallback_integer_uses_dtype_range() {
+        use crate::pixel::PixelData;
+        use ndarray::Array3;
+        let p = PixelData::U16(Array3::from_elem((1, 2, 2), 500u16));
+        assert_eq!(fallback_rescale(&p, None, &[0]), vec![(0.0, 65535.0)]);
+    }
+
+    #[test]
+    fn fallback_float_uses_per_tile_minmax_excluding_nodata() {
+        use crate::pixel::PixelData;
+        use ndarray::Array3;
+        let p = PixelData::F32(
+            Array3::from_shape_vec((1, 1, 4), vec![-9999.0f32, 1.0, 5.0, 9.0]).unwrap(),
+        );
+        let r = fallback_rescale(&p, Some(-9999.0), &[0]);
+        assert_eq!(r, vec![(1.0, 9.0)]);
     }
 }
