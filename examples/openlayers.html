@@ -130,6 +130,16 @@
         </select>
       </div>
       <div class="field">
+        <label for="tilesize">Tile size</label>
+        <select id="tilesize" name="tilesize">
+          <option value="64">64</option>
+          <option value="128">128</option>
+          <option value="256" selected>256</option>
+          <option value="512">512</option>
+          <option value="1024">1024</option>
+        </select>
+      </div>
+      <div class="field">
         <label for="opacity">Opacity</label>
         <input
           id="opacity"
@@ -161,6 +171,7 @@
         rescale: document.getElementById("rescale"),
         bidx: document.getElementById("bidx"),
         resampling: document.getElementById("resampling"),
+        tilesize: document.getElementById("tilesize"),
         opacity: document.getElementById("opacity"),
       };
 
@@ -192,7 +203,7 @@
         if (c.colormap.value) p.set("colormap_name", c.colormap.value);
         p.set("resampling", c.resampling.value);
         p.set("reproject", c.resampling.value);
-        p.set("tilesize", "256");
+        p.set("tilesize", c.tilesize.value || "256");
         p.set("_v", String(styleVersion));
         return `${ORIGIN}${TILE_PATH}?${p.toString()}`;
       }
@@ -250,6 +261,7 @@
         c.rescale.disabled = c.stretch.value !== "custom";
         applyStyle();
       });
+      c.tilesize.addEventListener("change", applyStyle);
       c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
       c.rescale.disabled = c.stretch.value !== "custom";
       c.opacity.addEventListener("input", () =>

@@ -179,6 +179,16 @@
         </select>
       </div>
       <div class="field">
+        <label for="tilesize">Tile size</label>
+        <select id="tilesize" name="tilesize">
+          <option value="64">64</option>
+          <option value="128">128</option>
+          <option value="256">256</option>
+          <option value="512">512</option>
+          <option value="1024">1024</option>
+        </select>
+      </div>
+      <div class="field">
         <label for="opacity">Opacity</label>
         <input id="opacity" name="opacity" type="range" min="0" max="1" step="0.05">
       </div>
@@ -207,6 +217,7 @@
         rescale: document.getElementById("rescale"),
         bidx: document.getElementById("bidx"),
         resampling: document.getElementById("resampling"),
+        tilesize: document.getElementById("tilesize"),
         opacity: document.getElementById("opacity"),
         status: document.getElementById("status")
       };
@@ -220,6 +231,7 @@
       controls.rescale.value = pageParams.getAll("rescale").join(";") || "0,255;0,255;0,255";
       controls.bidx.value = pageParams.getAll("bidx").join(",") || "1,2,3";
       controls.resampling.value = pageParams.get("resampling") ?? "bilinear";
+      controls.tilesize.value = pageParams.get("tilesize") ?? "256";
       controls.opacity.value = pageParams.get("opacity") ?? "0.85";
 
       function tileOrigin() {
@@ -293,7 +305,7 @@
         }
         params.set("resampling", controls.resampling.value);
         params.set("reproject", controls.resampling.value);
-        params.set("tilesize", "256");
+        params.set("tilesize", controls.tilesize.value || "256");
         return params;
       }
 
@@ -480,6 +492,10 @@
         document.getElementById("style-form").requestSubmit();
       });
       syncStretchUi();
+
+      controls.tilesize.addEventListener("change", () => {
+        document.getElementById("style-form").requestSubmit();
+      });
 
       map.on("moveend", syncPermalink);
       map.on("load", syncStatus);
