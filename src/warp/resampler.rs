@@ -163,6 +163,65 @@ impl Resampling {
             }
         }
     }
+
+    /// Box-mean over the source footprint `[sc-rx, sc+rx] x [sr-ry, sr+ry]`.
+    /// `rx`/`ry` are half-footprint sizes in source pixels (from the warp
+    /// Jacobian). When the footprint is below one source pixel the result
+    /// degenerates to bilinear (no pixel blocks on upsample). Averages only
+    /// `valid` pixels; all-invalid (or empty box) returns `fill`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_average(
+        self,
+        view: ArrayView2<f64>,
+        valid: Option<ArrayView2<bool>>,
+        sc: f64,
+        sr: f64,
+        rx: f64,
+        ry: f64,
+        fill: f64,
+    ) -> f64 {
+        let (h, w) = (view.shape()[0], view.shape()[1]);
+        if w == 0 || h == 0 {
+            return fill;
+        }
+        // Sub-pixel footprint => bilinear (reuses edge-clamp + mask logic).
+        if rx < 0.5 && ry < 0.5 {
+            return Self::Bilinear.sample_masked(view, valid, sc, sr, fill);
+        }
+        let c_lo = (sc - rx).floor().max(0.0) as usize;
+        let c_hi = ((sc + rx).ceil() as i64).clamp(0, w as i64 - 1) as usize;
+        let r_lo = (sr - ry).floor().max(0.0) as usize;
+        let r_hi = ((sr + ry).ceil() as i64).clamp(0, h as i64 - 1) as usize;
+
+        let contig = view.as_slice();
+        let mask_contig = valid.as_ref().and_then(|m| m.as_slice());
+        let mut sum = 0.0;
+        let mut count = 0u32;
+        for r in r_lo..=r_hi {
+            for c in c_lo..=c_hi {
+                let ok = match (mask_contig, valid) {
+                    (Some(s), _) => s[r * w + c],
+                    (None, Some(m)) => m[[r, c]],
+                    (None, None) => true,
+                };
+                if !ok {
+                    continue;
+                }
+                let val = match contig {
+                    Some(s) => s[r * w + c],
+                    None => view[[r, c]],
+                };
+                sum += val;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            fill
+        } else {
+            sum / count as f64
+        }
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +256,36 @@ mod tests {
         assert_eq!(Resampling::parse("bicubic"), Some(Resampling::Cubic));
         assert_eq!(Resampling::parse("foo"), None);
         assert_eq!(Resampling::parse("average"), Some(Resampling::Average));
+    }
+
+    #[test]
+    fn average_box_mean() {
+        // 4x4 ramp 0..16; full-tile footprint => arithmetic mean = 7.5
+        let a = ndarray::Array2::from_shape_fn((4, 4), |(r, c)| (r * 4 + c) as f64);
+        let v = Resampling::Average.sample_average(a.view(), None, 1.5, 1.5, 1.5, 1.5, -1.0);
+        assert_relative_eq!(v, 7.5);
+    }
+
+    #[test]
+    fn average_respects_mask() {
+        let a = ndarray::Array2::from_elem((4, 4), 10.0);
+        let mut m = ndarray::Array2::from_elem((4, 4), true);
+        m[[0, 0]] = false; // one invalid pixel, value still 10 elsewhere
+        let v = Resampling::Average.sample_average(
+            a.view(), Some(m.view()), 1.5, 1.5, 1.5, 1.5, -1.0);
+        assert_relative_eq!(v, 10.0); // mean of valid pixels (all 10)
+
+        let none_valid = ndarray::Array2::from_elem((4, 4), false);
+        let f = Resampling::Average.sample_average(
+            a.view(), Some(none_valid.view()), 1.5, 1.5, 1.5, 1.5, -7.0);
+        assert_eq!(f, -7.0); // all invalid => fill
+    }
+
+    #[test]
+    fn average_degenerates_to_bilinear() {
+        let a = array![[0.0, 10.0], [0.0, 10.0]];
+        let avg = Resampling::Average.sample_average(a.view(), None, 0.5, 0.0, 0.3, 0.3, 0.0);
+        let bil = Resampling::Bilinear.sample_masked(a.view(), None, 0.5, 0.0, 0.0);
+        assert_eq!(avg, bil); // sub-1px footprint delegates to bilinear
     }
 }
