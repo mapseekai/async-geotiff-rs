@@ -1,3 +1,5 @@
-pub mod query;
+pub mod params;
+pub mod stretch;
 
-pub use query::{compile, RenderSpec};
+pub use params::{compile, TileStyle};
+pub use stretch::StretchSpec;

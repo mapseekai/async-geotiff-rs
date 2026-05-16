@@ -9,16 +9,23 @@ use tokio::sync::Semaphore;
 use crate::blocking::default_blocking_permits;
 use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
+use crate::io::stats::{load_dataset_stats, DatasetStats};
 use crate::io::CogReader;
-use crate::pixel::ImageData;
-use crate::render::pipeline::render;
-use crate::style::query::{compile_cached, RenderSpec};
+use crate::pixel::{ImageData, PixelData};
+use crate::render::pipeline::{render, CompiledTileStyle};
+use crate::style::params::compile_cached;
+use crate::style::stretch::{fallback_rescale, resolve_rescale, StretchSpec};
+use crate::style::TileStyle;
 use crate::tms::{Tms, TmsKind};
 use crate::warp;
+use tokio::sync::OnceCell;
+
+const PASSTHROUGH_PIXEL_TOLERANCE: f64 = 1e-3;
 
 pub struct Tiler {
     reader: Arc<CogReader>,
     tile_cpu_semaphore: Arc<Semaphore>,
+    stats: OnceCell<Option<Arc<DatasetStats>>>,
 }
 
 /// Runtime limits for a [`Tiler`].
@@ -53,6 +60,7 @@ impl Tiler {
         Self {
             reader,
             tile_cpu_semaphore: Arc::new(Semaphore::new(config.blocking_task_limit())),
+            stats: OnceCell::new(),
         }
     }
 
@@ -61,13 +69,81 @@ impl Tiler {
         self.reader.wgs84_bounds()
     }
 
+    /// Lazily computed once per dataset, then memoized for the life of
+    /// this `Tiler` (which `AppState.tilers` keeps alive across all tile
+    /// requests). `?rescale=` requests never call this.
+    async fn dataset_stats(&self) -> AgResult<Option<Arc<DatasetStats>>> {
+        self.stats
+            .get_or_try_init(|| async {
+                Ok::<_, AgError>(load_dataset_stats(&self.reader).await?.map(Arc::new))
+            })
+            .await
+            .cloned()
+    }
+
+    /// Resolve the effective rescale and inject it into a cloned
+    /// `CompiledTileStyle`. Priority: explicit `rescale` (Custom) →
+    /// `?stretch=` mode → default StdDev k=2.0 (u8 keeps its fast path).
+    /// Sets BOTH `rescale` (RGB path / fast-path identity) and
+    /// `composite.vmin/vmax` (single-band Gradient path).
+    async fn effective_compiled(
+        &self,
+        style: &TileStyle,
+        compiled: &Arc<CompiledTileStyle>,
+        image: &ImageData,
+    ) -> AgResult<Arc<CompiledTileStyle>> {
+        if !style.rescale.is_empty() {
+            return Ok(Arc::clone(compiled));
+        }
+        let spec: StretchSpec = match style.resolved_stretch()? {
+            Some(s) => s,
+            None => {
+                if matches!(image.pixels, PixelData::U8(_)) {
+                    return Ok(Arc::clone(compiled));
+                }
+                StretchSpec::DEFAULT
+            }
+        };
+
+        let bands = image.pixels.bands();
+        let bidx: Vec<usize> = if compiled.bidx.is_empty() {
+            if bands >= 3 && compiled.composite.bands >= 3 {
+                vec![0, 1, 2]
+            } else {
+                vec![0]
+            }
+        } else {
+            compiled.bidx.clone()
+        };
+
+        let ranges = match self.dataset_stats().await? {
+            Some(stats) => {
+                let r = resolve_rescale(&spec, &stats, &bidx);
+                // Empty → malformed stats (no bands); degrade gracefully.
+                if r.is_empty() {
+                    fallback_rescale(&image.pixels, image.nodata, &bidx)
+                } else {
+                    r
+                }
+            }
+            None => fallback_rescale(&image.pixels, image.nodata, &bidx),
+        };
+
+        let mut next = (**compiled).clone();
+        next.rescale = ranges.clone();
+        next.composite.vmin = Some(ranges.iter().map(|r| r.0).collect());
+        next.composite.vmax = Some(ranges.iter().map(|r| r.1).collect());
+        next.auto_rgb = false;
+        Ok(Arc::new(next))
+    }
+
     pub async fn tile(
         &self,
         tms_kind: TmsKind,
         z: u8,
         x: u32,
         y: u32,
-        spec: &RenderSpec,
+        style: &TileStyle,
     ) -> AgResult<Bytes> {
         let t_req = Instant::now();
         let tms = Tms::new(tms_kind)?;
@@ -92,14 +168,14 @@ impl Tiler {
             match Self::reproject_bbox_sync(&dst_bbox, &dst_crs, self.reader.src_crs()) {
                 Ok(b) => b,
                 // Tile lies outside the projection's valid domain → blank.
-                Err(AgError::ProjectionDomain(_)) => return empty_tile(spec.tilesize as usize),
+                Err(AgError::ProjectionDomain(_)) => return empty_tile(style.tilesize as usize),
                 Err(e) => return Err(e),
             }
         };
 
         // 2. Pick overview in source CRS units. Each overview has its own transform.
         let target_gsd =
-            bbox_in_src.width().abs().max(bbox_in_src.height().abs()) / f64::from(spec.tilesize);
+            bbox_in_src.width().abs().max(bbox_in_src.height().abs()) / f64::from(style.tilesize);
         let level = self.reader.pick_overview(target_gsd);
 
         tracing::debug!(?bbox_in_src, target_gsd, level, "picked overview");
@@ -135,7 +211,7 @@ impl Tiler {
         // no-op identity crop. Skip it entirely and feed the windowed read
         // straight to render — this is the big payoff of rio-tiler's
         // aligned-read insight: zero resample, zero PROJ, one read.
-        let ts = spec.tilesize as usize;
+        let ts = style.tilesize as usize;
         if same_crs && res_matches {
             if let Some((pc, pr)) = Self::passthrough_window(&level_tr, &dst_bbox, ts) {
                 if let Ok((iw, ih)) = self.reader.level_dimensions(level) {
@@ -158,7 +234,10 @@ impl Tiler {
                             .await?;
                         let dur_read = t.elapsed();
                         let t = Instant::now();
-                        let compiled = compile_cached(spec).await?;
+                        let compiled = compile_cached(style).await?;
+                        let compiled = self
+                            .effective_compiled(style, &compiled, &src)
+                            .await?;
                         let dur_compile = t.elapsed();
                         let t = Instant::now();
                         let png = self
@@ -191,7 +270,7 @@ impl Tiler {
                 ?bbox_in_src, raw_window = ?raw, level, ?level_dims,
                 "tile entirely outside COG; returning transparent"
             );
-            return empty_tile(spec.tilesize as usize);
+            return empty_tile(style.tilesize as usize);
         }
         tracing::debug!(col, row, w, h, "read window (clamped)");
         let t = Instant::now();
@@ -202,9 +281,9 @@ impl Tiler {
         // still needed for same-CRS reads because the requested COG window may not
         // be the same size or placement as the output XYZ tile.
         let resampling = if src.crs == dst_crs {
-            spec.resampling
+            style.resampling
         } else {
-            spec.reproject
+            style.reproject
         };
         let t = Instant::now();
         let warped: ImageData = match self
@@ -215,13 +294,16 @@ impl Tiler {
         {
             Ok(w) => w,
             // Grid point outside the projection's valid domain → blank.
-            Err(AgError::ProjectionDomain(_)) => return empty_tile(spec.tilesize as usize),
+            Err(AgError::ProjectionDomain(_)) => return empty_tile(style.tilesize as usize),
             Err(e) => return Err(e),
         };
         let dur_warp = t.elapsed();
 
         let t = Instant::now();
-        let compiled = compile_cached(spec).await?;
+        let compiled = compile_cached(style).await?;
+        let compiled = self
+            .effective_compiled(style, &compiled, &warped)
+            .await?;
         let dur_compile = t.elapsed();
         let t = Instant::now();
         let png = self
@@ -270,18 +352,19 @@ impl Tiler {
         dst_bbox: &Bbox,
         ts: usize,
     ) -> Option<(i64, i64)> {
-        const TOL: f64 = 1e-3;
         let inv = level_tr.inverse()?;
         // Top-left and bottom-right corners → source pixel coords.
         let (c0, r0) = inv.forward(dst_bbox.xmin, dst_bbox.ymax);
         let (c1, r1) = inv.forward(dst_bbox.xmax, dst_bbox.ymin);
         let frac = |v: f64| (v - v.round()).abs();
-        if frac(c0) > TOL || frac(r0) > TOL {
+        if frac(c0) > PASSTHROUGH_PIXEL_TOLERANCE || frac(r0) > PASSTHROUGH_PIXEL_TOLERANCE {
             return None;
         }
         let span_c = (c1 - c0).abs();
         let span_r = (r1 - r0).abs();
-        if (span_c - ts as f64).abs() > TOL || (span_r - ts as f64).abs() > TOL {
+        if (span_c - ts as f64).abs() > PASSTHROUGH_PIXEL_TOLERANCE
+            || (span_r - ts as f64).abs() > PASSTHROUGH_PIXEL_TOLERANCE
+        {
             return None;
         }
         Some((c0.round() as i64, r0.round() as i64))
@@ -395,5 +478,19 @@ mod tests {
         // World span 512 but ts=256 → 2 m/px request, not unit scale.
         let bbox = Bbox::new(0.0, -256.0, 512.0, 256.0);
         assert_eq!(Tiler::passthrough_window(&gt, &bbox, 256), None);
+    }
+
+    #[test]
+    fn u8_default_request_keeps_rescale_empty() {
+        // effective_compiled's u8 short-circuit is reached when:
+        //   rescale empty  &&  stretch_kind None  &&  PixelData::U8
+        // We assert the decision predicate here (pure, no IO):
+        use crate::style::TileStyle;
+        let style = TileStyle::from_query("").unwrap();
+        assert!(style.rescale.is_empty());
+        assert!(style.resolved_stretch().unwrap().is_none());
+        // The combination above + U8 → effective_compiled returns the
+        // input Arc unchanged (verified by the full-suite run, which
+        // exercises real u8 fixtures through render()).
     }
 }
