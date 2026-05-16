@@ -117,7 +117,15 @@ impl Tiler {
         };
 
         let ranges = match self.dataset_stats().await? {
-            Some(stats) => resolve_rescale(&spec, &stats, &bidx),
+            Some(stats) => {
+                let r = resolve_rescale(&spec, &stats, &bidx);
+                // Empty → malformed stats (no bands); degrade gracefully.
+                if r.is_empty() {
+                    fallback_rescale(&image.pixels, image.nodata, &bidx)
+                } else {
+                    r
+                }
+            }
             None => fallback_rescale(&image.pixels, image.nodata, &bidx),
         };
 

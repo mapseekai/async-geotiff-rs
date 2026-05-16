@@ -2,6 +2,10 @@
 //! one-shot top-overview computation (estimated). See
 //! docs/superpowers/specs/2026-05-16-non-uint8-data-stretch-design.md.
 
+use crate::error::AgResult;
+use crate::io::CogReader;
+use ndarray::{Array3, Axis};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Provenance {
     Exact,
@@ -45,8 +49,6 @@ impl Histogram {
     }
 }
 
-use ndarray::{Array3, Axis};
-
 #[derive(Debug, Clone)]
 pub struct BandStat {
     pub min: f64,
@@ -72,6 +74,16 @@ pub fn band_stats_from_f64(
     hist_bins: usize,
 ) -> Vec<BandStat> {
     let bins = hist_bins.max(1);
+    // A sample counts toward stats only if finite and not nodata.
+    let valid = |v: f64| {
+        if !v.is_finite() {
+            return false;
+        }
+        match nodata {
+            Some(nd) => (v - nd).abs() >= 1e-9,
+            None => true,
+        }
+    };
     let mut out = Vec::with_capacity(arr.shape()[0]);
     for b in 0..arr.shape()[0] {
         let band = arr.index_axis(Axis(0), b);
@@ -81,13 +93,8 @@ pub fn band_stats_from_f64(
         let mut sumsq = 0.0_f64;
         let mut count = 0_u64;
         for &v in band.iter() {
-            if !v.is_finite() {
+            if !valid(v) {
                 continue;
-            }
-            if let Some(nd) = nodata {
-                if (v - nd).abs() < 1e-9 {
-                    continue;
-                }
             }
             min = min.min(v);
             max = max.max(v);
@@ -111,13 +118,8 @@ pub fn band_stats_from_f64(
         let mut counts = vec![0u64; bins];
         let span = (max - min).max(1e-12);
         for &v in band.iter() {
-            if !v.is_finite() {
+            if !valid(v) {
                 continue;
-            }
-            if let Some(nd) = nodata {
-                if (v - nd).abs() < 1e-9 {
-                    continue;
-                }
             }
             let mut idx = (((v - min) / span) * bins as f64) as usize;
             if idx >= bins {
@@ -209,9 +211,6 @@ pub fn parse_embedded_stats(
     }
     Some(DatasetStats { bands: out, provenance: Provenance::Exact })
 }
-
-use crate::error::AgResult;
-use crate::io::CogReader;
 
 const HIST_BINS: usize = 256;
 

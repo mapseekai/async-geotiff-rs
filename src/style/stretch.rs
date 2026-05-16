@@ -54,18 +54,29 @@ pub fn parse_stretch_kind(
 /// `bidx` is 0-based original band indices (already resolved by the
 /// caller to concrete bands, never empty). Degenerate `hi <= lo` is
 /// widened to `(lo, lo + 1.0)` so the render divide stays finite.
+///
+/// Returns an empty `Vec` when `stats` carries no bands (a malformed
+/// dataset); the caller treats that as "no usable stats" and falls
+/// back to [`fallback_rescale`] instead of this panicking on a
+/// per-request path.
 pub fn resolve_rescale(
     spec: &StretchSpec,
     stats: &DatasetStats,
     bidx: &[usize],
 ) -> Vec<(f64, f64)> {
+    if stats.bands.is_empty() {
+        return Vec::new();
+    }
     bidx.iter()
         .map(|&b| {
+            // `stats.bands` is non-empty (checked above); `.last()`
+            // covers an out-of-range `b`, and `bands[0]` is a final
+            // total fallback that can never actually be reached.
             let s = stats
                 .bands
                 .get(b)
                 .or_else(|| stats.bands.last())
-                .expect("DatasetStats always has >= 1 band");
+                .unwrap_or(&stats.bands[0]);
             let (lo, mut hi) = match spec {
                 StretchSpec::MinMax => (s.min, s.max),
                 StretchSpec::Percent { lo, hi } => {
@@ -224,6 +235,18 @@ mod tests {
         // Out-of-range band 5 reused last band → same range as band 0.
         assert_eq!(r[0], r[1]);
         assert_eq!(r[1], (1.0, 9.0));
+    }
+
+    #[test]
+    fn empty_stats_returns_empty_not_panic() {
+        // Malformed dataset (no bands) must NOT panic on a request path;
+        // caller falls back when the result is empty.
+        let stats = DatasetStats {
+            bands: vec![],
+            provenance: Provenance::Estimated,
+        };
+        let r = resolve_rescale(&StretchSpec::MinMax, &stats, &[0, 1, 2]);
+        assert!(r.is_empty());
     }
 
     #[test]
