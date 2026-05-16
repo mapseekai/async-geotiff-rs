@@ -6,12 +6,13 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::http::Method;
 use axum::{routing::get, Router};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use async_geotiff::error::{AgError, AgResult};
 use async_geotiff::io::CogReader;
-use async_geotiff::style::query::RenderSpec;
+use async_geotiff::style::TileStyle;
 use async_geotiff::tiler::Tiler;
 use async_geotiff::tms::TmsKind;
 
@@ -94,7 +95,9 @@ pub fn router(state: AppState) -> Router {
         .route("/bounds", get(bounds_handler))
         .route(
             "/data/:name",
-            get(data_file_handler).options(cors_preflight),
+            get(data_file_handler)
+                .head(data_file_handler)
+                .options(cors_preflight),
         )
         .with_state(state)
 }
@@ -131,7 +134,7 @@ pub async fn tile_handler(
         .find(|(k, _)| k == "dataset")
         .map(|(_, v)| v.clone());
 
-    let spec = match RenderSpec::from_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+    let style = match TileStyle::from_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
         Ok(s) => s,
         Err(e) => return with_cors((StatusCode::BAD_REQUEST, e.to_string()).into_response()),
     };
@@ -141,7 +144,7 @@ pub async fn tile_handler(
         Err(e) => return error_response(e),
     };
 
-    match tiler.tile(tms_kind, z, x, y, &spec).await {
+    match tiler.tile(tms_kind, z, x, y, &style).await {
         Ok(bytes) => with_cors(([("content-type", "image/png")], bytes).into_response()),
         Err(e) => error_response(e),
     }
@@ -201,7 +204,14 @@ fn parse_byte_range(h: &str, total: u64) -> Option<(u64, u64)> {
     }
     let (s, e) = spec.split_once('-')?;
     if s.trim().is_empty() {
-        return None;
+        // Suffix range `bytes=-N`: the last N bytes. TIFF/COG readers use
+        // this to fetch the file footer before they know the total size.
+        let n: u64 = e.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let start = total.saturating_sub(n);
+        return Some((start, total - 1));
     }
     let start: u64 = s.trim().parse().ok()?;
     let end: u64 = if e.trim().is_empty() {
@@ -222,6 +232,7 @@ fn parse_byte_range(h: &str, total: u64) -> Option<(u64, u64)> {
 pub async fn data_file_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     if name.contains('/') || name.contains("..") || !state.datasets.iter().any(|d| d == &name) {
@@ -243,6 +254,23 @@ pub async fn data_file_handler(
             )
         }
     };
+
+    // object_store's HTTP store issues a HEAD to learn the object size
+    // before it ever does a ranged read. The size must be discoverable
+    // regardless of file size, so HEAD must bypass the body-size cap and
+    // never touch file bytes — answer purely from metadata.
+    if method == Method::HEAD {
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_LENGTH, total)
+            .body(Body::empty());
+        return match resp {
+            Ok(r) => with_cors(r),
+            Err(_) => with_cors((StatusCode::INTERNAL_SERVER_ERROR, "head").into_response()),
+        };
+    }
 
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let range = match range_header {

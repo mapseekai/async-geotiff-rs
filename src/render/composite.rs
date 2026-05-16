@@ -9,6 +9,9 @@ use crate::error::AgResult;
 use crate::render::colormap::{builtin_lut, lut_from_stops, Lut};
 use crate::render::colour::Colour;
 
+const RGB_DEFAULT_LO: [f64; 3] = [0.0; 3];
+const RGB_DEFAULT_HI: [f64; 3] = [255.0; 3];
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ColourDefinition {
@@ -69,10 +72,8 @@ impl HandleGet for Composite {
                 // Fall back to byte-range defaults if vmin/vmax aren't set —
                 // a malformed URL or test path that constructs Rgb without
                 // ranges shouldn't crash the renderer.
-                const DEFAULT_LO: [f64; 3] = [0.0; 3];
-                const DEFAULT_HI: [f64; 3] = [255.0; 3];
-                let lo: &[f64] = self.vmin.as_deref().unwrap_or(&DEFAULT_LO);
-                let hi: &[f64] = self.vmax.as_deref().unwrap_or(&DEFAULT_HI);
+                let lo: &[f64] = self.vmin.as_deref().unwrap_or(&RGB_DEFAULT_LO);
+                let hi: &[f64] = self.vmax.as_deref().unwrap_or(&RGB_DEFAULT_HI);
                 if let Some(nd) = nodata {
                     for (i, v) in values.iter().enumerate().take(3) {
                         if i < nd.len() && is_nodata(*v, nd[i]) {

@@ -7,35 +7,35 @@ use crate::io::stats::DatasetStats;
 use crate::pixel::PixelData;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum StretchSpec {
+pub enum Stretch {
     MinMax,
     Percent { lo: f64, hi: f64 },
     StdDev { k: f64 },
 }
 
-impl StretchSpec {
+impl Stretch {
     /// The default applied when no `rescale` and no `stretch` are given
     /// (caller decides whether the dtype is eligible — u8 keeps its
     /// fast path and never reaches here).
-    pub const DEFAULT: StretchSpec = StretchSpec::StdDev { k: 2.0 };
+    pub const DEFAULT: Stretch = Stretch::StdDev { k: 2.0 };
 }
 
-/// Build a `StretchSpec` from already-parsed raw params. `kind` is the
+/// Build a `Stretch` from already-parsed raw params. `kind` is the
 /// `stretch=` value; `pc`/`sigma` are the optional companion params.
 /// Invalid input → `AgError::query` (maps to HTTP 400).
 pub fn parse_stretch_kind(
     kind: &str,
     pc: Option<(f64, f64)>,
     sigma: Option<f64>,
-) -> AgResult<StretchSpec> {
+) -> AgResult<Stretch> {
     match kind.to_ascii_lowercase().as_str() {
-        "minmax" => Ok(StretchSpec::MinMax),
+        "minmax" => Ok(Stretch::MinMax),
         "percent" => {
             let (lo, hi) = pc.unwrap_or((2.0, 98.0));
             if !(0.0..=100.0).contains(&lo) || !(0.0..=100.0).contains(&hi) || lo >= hi {
                 return Err(AgError::query("pc", format!("invalid percentile {lo},{hi}")));
             }
-            Ok(StretchSpec::Percent { lo, hi })
+            Ok(Stretch::Percent { lo, hi })
         }
         "stddev" => {
             let k = sigma.unwrap_or(2.0);
@@ -44,13 +44,13 @@ pub fn parse_stretch_kind(
             if !(k.is_finite() && k > 0.0) {
                 return Err(AgError::query("sigma", format!("must be > 0, got {k}")));
             }
-            Ok(StretchSpec::StdDev { k })
+            Ok(Stretch::StdDev { k })
         }
         other => Err(AgError::query("stretch", format!("unknown mode {other}"))),
     }
 }
 
-/// Map a `StretchSpec` to per-band `(lo, hi)` for the selected bands.
+/// Map a `Stretch` to per-band `(lo, hi)` for the selected bands.
 /// `bidx` is 0-based original band indices (already resolved by the
 /// caller to concrete bands, never empty). Degenerate `hi <= lo` is
 /// widened to `(lo, lo + 1.0)` so the render divide stays finite.
@@ -60,7 +60,7 @@ pub fn parse_stretch_kind(
 /// back to [`fallback_rescale`] instead of this panicking on a
 /// per-request path.
 pub fn resolve_rescale(
-    spec: &StretchSpec,
+    spec: &Stretch,
     stats: &DatasetStats,
     bidx: &[usize],
 ) -> Vec<(f64, f64)> {
@@ -78,11 +78,11 @@ pub fn resolve_rescale(
                 .or_else(|| stats.bands.last())
                 .unwrap_or(&stats.bands[0]);
             let (lo, mut hi) = match spec {
-                StretchSpec::MinMax => (s.min, s.max),
-                StretchSpec::Percent { lo, hi } => {
+                Stretch::MinMax => (s.min, s.max),
+                Stretch::Percent { lo, hi } => {
                     (s.hist.quantile(*lo), s.hist.quantile(*hi))
                 }
-                StretchSpec::StdDev { k } => (
+                Stretch::StdDev { k } => (
                     (s.mean - k * s.stddev).max(s.min),
                     (s.mean + k * s.stddev).min(s.max),
                 ),
@@ -156,14 +156,14 @@ mod tests {
 
     #[test]
     fn parses_three_modes_case_insensitive() {
-        assert_eq!(parse_stretch_kind("MinMax", None, None).unwrap(), StretchSpec::MinMax);
+        assert_eq!(parse_stretch_kind("MinMax", None, None).unwrap(), Stretch::MinMax);
         assert_eq!(
             parse_stretch_kind("percent", Some((1.0, 99.0)), None).unwrap(),
-            StretchSpec::Percent { lo: 1.0, hi: 99.0 }
+            Stretch::Percent { lo: 1.0, hi: 99.0 }
         );
         assert_eq!(
             parse_stretch_kind("STDDEV", None, Some(3.0)).unwrap(),
-            StretchSpec::StdDev { k: 3.0 }
+            Stretch::StdDev { k: 3.0 }
         );
     }
 
@@ -171,11 +171,11 @@ mod tests {
     fn percent_and_stddev_defaults() {
         assert_eq!(
             parse_stretch_kind("percent", None, None).unwrap(),
-            StretchSpec::Percent { lo: 2.0, hi: 98.0 }
+            Stretch::Percent { lo: 2.0, hi: 98.0 }
         );
         assert_eq!(
             parse_stretch_kind("stddev", None, None).unwrap(),
-            StretchSpec::StdDev { k: 2.0 }
+            Stretch::StdDev { k: 2.0 }
         );
     }
 
@@ -204,24 +204,24 @@ mod tests {
 
     #[test]
     fn minmax_uses_band_extremes() {
-        let r = resolve_rescale(&StretchSpec::MinMax, &ds(79.0, 1896.0, 565.0, 45.0), &[0]);
+        let r = resolve_rescale(&Stretch::MinMax, &ds(79.0, 1896.0, 565.0, 45.0), &[0]);
         assert_eq!(r, vec![(79.0, 1896.0)]);
     }
 
     #[test]
     fn stddev_clamps_to_minmax() {
         // mean 565, sd 45, k 2 → (475, 655); within [79,1896] so unchanged.
-        let r = resolve_rescale(&StretchSpec::StdDev { k: 2.0 }, &ds(79.0, 1896.0, 565.0, 45.0), &[0]);
+        let r = resolve_rescale(&Stretch::StdDev { k: 2.0 }, &ds(79.0, 1896.0, 565.0, 45.0), &[0]);
         assert!((r[0].0 - 475.0).abs() < 1e-9);
         assert!((r[0].1 - 655.0).abs() < 1e-9);
         // Huge k → clamps to min/max.
-        let r2 = resolve_rescale(&StretchSpec::StdDev { k: 999.0 }, &ds(79.0, 1896.0, 565.0, 45.0), &[0]);
+        let r2 = resolve_rescale(&Stretch::StdDev { k: 999.0 }, &ds(79.0, 1896.0, 565.0, 45.0), &[0]);
         assert_eq!(r2, vec![(79.0, 1896.0)]);
     }
 
     #[test]
     fn degenerate_range_widened() {
-        let r = resolve_rescale(&StretchSpec::MinMax, &ds(5.0, 5.0, 5.0, 0.0), &[0]);
+        let r = resolve_rescale(&Stretch::MinMax, &ds(5.0, 5.0, 5.0, 0.0), &[0]);
         assert_eq!(r, vec![(5.0, 6.0)]);
     }
 
@@ -230,7 +230,7 @@ mod tests {
         // Band index 5 is out of range for a 1-band dataset → must fall
         // back to the last (only) band's stats, not panic.
         let stats = ds(1.0, 9.0, 5.0, 1.0);
-        let r = resolve_rescale(&StretchSpec::MinMax, &stats, &[0, 5]);
+        let r = resolve_rescale(&Stretch::MinMax, &stats, &[0, 5]);
         assert_eq!(r.len(), 2);
         // Out-of-range band 5 reused last band → same range as band 0.
         assert_eq!(r[0], r[1]);
@@ -245,7 +245,7 @@ mod tests {
             bands: vec![],
             provenance: Provenance::Estimated,
         };
-        let r = resolve_rescale(&StretchSpec::MinMax, &stats, &[0, 1, 2]);
+        let r = resolve_rescale(&Stretch::MinMax, &stats, &[0, 1, 2]);
         assert!(r.is_empty());
     }
 

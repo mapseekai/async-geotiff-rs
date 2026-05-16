@@ -17,13 +17,13 @@ use crate::render::composite::{Composite, HandleGet};
 use crate::render::encode::encode_png;
 use crate::warp::resampler::Resampling;
 
-// `tile_size` and `resampling` on CompiledRenderSpec are kept for callers
-// (style/query.rs), but the render pipeline assumes warp has already produced
-// an `image` matching `spec.tile_size` exactly — no resize happens here.
+// `tile_size` and `resampling` on CompiledTileStyle are kept for callers
+// (style/params.rs), but the render pipeline assumes warp has already produced
+// an `image` matching `style.tile_size` exactly — no resize happens here.
 
 /// Precompiled render plan for the hot path.
 #[derive(Debug, Clone)]
-pub struct CompiledRenderSpec {
+pub struct CompiledTileStyle {
     pub composite: Composite,
     pub rescale: Vec<(f64, f64)>,
     pub formula: Vec<Op>,
@@ -34,26 +34,26 @@ pub struct CompiledRenderSpec {
     pub auto_rgb: bool,
 }
 
-pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
+pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
     let bands = image.pixels.bands();
     let h = image.pixels.height();
     let w = image.pixels.width();
     let n = h * w;
 
-    let auto_rgb = spec.auto_rgb && bands >= 3;
+    let auto_rgb = style.auto_rgb && bands >= 3;
 
     // Fast path: source already u8, 3 bands, identity rescale, no formula.
     // Skip the f64 cast + per-pixel scale_to_u8: copy R/G/B bytes directly
     // into the interleaved RGBA buffer. This is the dominant case for 8-bit
     // RGB COGs (Sentinel TCI, NAIP, drone orthos), where every other render
     // path is wasted CPU.
-    if let Some(rgba) = try_u8_rgb_fastpath(image, spec, auto_rgb, h, w) {
+    if let Some(rgba) = try_u8_rgb_fastpath(image, style, auto_rgb, h, w) {
         return encode_png(&rgba);
     }
 
     let src = image.pixels.to_f64();
-    let bidx: Vec<usize> = if spec.bidx.is_empty() {
-        match (auto_rgb, spec.composite.bands) {
+    let bidx: Vec<usize> = if style.bidx.is_empty() {
+        match (auto_rgb, style.composite.bands) {
             (true, _) => vec![0, 1, 2],
             (false, 1) => vec![0],
             (false, 3) if bands >= 3 => vec![0, 1, 2],
@@ -64,7 +64,7 @@ pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
             }
         }
     } else {
-        spec.bidx.clone()
+        style.bidx.clone()
     };
     for &band in &bidx {
         if band >= bands {
@@ -83,17 +83,17 @@ pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
         .map(|&b| src.index_axis(Axis(0), b).to_owned())
         .collect();
 
-    let nodata = spec.nodata.or(image.nodata);
+    let nodata = style.nodata.or(image.nodata);
     let valid: Option<Array2<bool>> = compute_valid_mask(image, &band_views, nodata, h, w);
 
     let rgba: Array3<u8> = match band_views.len() {
-        1 => render_single_band(&band_views[0], valid.as_ref(), spec),
+        1 => render_single_band(&band_views[0], valid.as_ref(), style),
         3 => render_three_band(
             &band_views[0],
             &band_views[1],
             &band_views[2],
             valid.as_ref(),
-            spec,
+            style,
             auto_rgb,
         )?,
         other => {
@@ -104,8 +104,8 @@ pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
     };
 
     // Render assumes the warp stage has already produced an image at
-    // `spec.tile_size`; if not, the encoded PNG simply matches input dims.
-    let _ = spec.tile_size;
+    // `style.tile_size`; if not, the encoded PNG simply matches input dims.
+    let _ = style.tile_size;
     encode_png(&rgba)
 }
 
@@ -119,7 +119,7 @@ pub fn render(image: &ImageData, spec: &CompiledRenderSpec) -> AgResult<Bytes> {
 /// nodata/mask only affect the alpha channel.
 fn try_u8_rgb_fastpath(
     image: &ImageData,
-    spec: &CompiledRenderSpec,
+    style: &CompiledTileStyle,
     auto_rgb: bool,
     h: usize,
     w: usize,
@@ -131,33 +131,33 @@ fn try_u8_rgb_fastpath(
         PixelData::U8(a) => a,
         _ => return None,
     };
-    if !spec.formula.is_empty() {
+    if !style.formula.is_empty() {
         return None;
     }
     let bands = src.shape()[0];
-    let bidx: [usize; 3] = if spec.bidx.is_empty() {
+    let bidx: [usize; 3] = if style.bidx.is_empty() {
         let want_rgb =
-            (auto_rgb || matches!(spec.composite.kind, CompositeKind::Rgb)) && bands >= 3;
+            (auto_rgb || matches!(style.composite.kind, CompositeKind::Rgb)) && bands >= 3;
         if !want_rgb {
             return None;
         }
         [0, 1, 2]
-    } else if spec.bidx.len() == 3 && spec.bidx.iter().all(|&b| b < bands) {
-        [spec.bidx[0], spec.bidx[1], spec.bidx[2]]
+    } else if style.bidx.len() == 3 && style.bidx.iter().all(|&b| b < bands) {
+        [style.bidx[0], style.bidx[1], style.bidx[2]]
     } else {
         return None;
     };
     // Identity rescale check: empty, or each (lo, hi) is (0, 255).
-    let identity = spec.rescale.is_empty()
-        || (spec.rescale.len() == 3
-            && spec
+    let identity = style.rescale.is_empty()
+        || (style.rescale.len() == 3
+            && style
                 .rescale
                 .iter()
                 .all(|(lo, hi)| *lo == 0.0 && *hi == 255.0));
     if !identity {
         return None;
     }
-    let nodata = spec.nodata.or(image.nodata);
+    let nodata = style.nodata.or(image.nodata);
     let nd_u8: Option<u8> = nodata.and_then(|nd| {
         if nd.is_finite() && (0.0..=255.0).contains(&nd) {
             Some(nd as u8)
@@ -257,10 +257,10 @@ fn apply_valid_to_alpha(rgba: &mut Array3<u8>, valid: Option<&Array2<bool>>) {
 fn render_single_band(
     band: &Array2<f64>,
     valid: Option<&Array2<bool>>,
-    spec: &CompiledRenderSpec,
+    style: &CompiledTileStyle,
 ) -> Array3<u8> {
     use crate::render::composite::CompositeKind;
-    let comp = &spec.composite;
+    let comp = &style.composite;
     let (h, w) = band.dim();
 
     match comp.kind {
@@ -302,12 +302,12 @@ fn render_three_band(
     g_band: &Array2<f64>,
     b_band: &Array2<f64>,
     valid: Option<&Array2<bool>>,
-    spec: &CompiledRenderSpec,
+    style: &CompiledTileStyle,
     auto_rgb: bool,
 ) -> AgResult<Array3<u8>> {
     let (h, w) = r_band.dim();
-    let has_formula = !spec.formula.is_empty();
-    let ranges = rgb_ranges(spec);
+    let has_formula = !style.formula.is_empty();
+    let ranges = rgb_ranges(style);
 
     if has_formula {
         // Color formula goes via Lab/Lch and is unavoidably per-pixel.
@@ -318,7 +318,7 @@ fn render_three_band(
             let r = normalize(rv, ranges[0]);
             let g = normalize(gv, ranges[1]);
             let b = normalize(bv, ranges[2]);
-            let (r, g, b) = crate::render::color_formula::apply(&spec.formula, r, g, b);
+            let (r, g, b) = crate::render::color_formula::apply(&style.formula, r, g, b);
             rgba[[r_idx, c_idx, 0]] = unit_to_u8(r);
             rgba[[r_idx, c_idx, 1]] = unit_to_u8(g);
             rgba[[r_idx, c_idx, 2]] = unit_to_u8(b);
@@ -330,7 +330,7 @@ fn render_three_band(
 
     if auto_rgb
         || matches!(
-            spec.composite.kind,
+            style.composite.kind,
             crate::render::composite::CompositeKind::Rgb
         )
     {
@@ -377,7 +377,7 @@ fn render_three_band(
     Zip::indexed(r_band).for_each(|(r_idx, c_idx), &rv| {
         let gv = g_band[[r_idx, c_idx]];
         let bv = b_band[[r_idx, c_idx]];
-        let px = spec.composite.get(&[rv, gv, bv], None);
+        let px = style.composite.get(&[rv, gv, bv], None);
         rgba.slice_mut(s![r_idx, c_idx, ..])
             .iter_mut()
             .zip(px.iter())
@@ -406,11 +406,11 @@ fn interleave_lut(idx: &Array2<u8>, lut: &[[u8; 4]; 256], rgba: &mut Array3<u8>)
     }
 }
 
-fn rgb_ranges(spec: &CompiledRenderSpec) -> [(f64, f64); 3] {
+fn rgb_ranges(style: &CompiledTileStyle) -> [(f64, f64); 3] {
     [
-        spec.rescale.first().copied().unwrap_or((0.0, 255.0)),
-        spec.rescale.get(1).copied().unwrap_or((0.0, 255.0)),
-        spec.rescale.get(2).copied().unwrap_or((0.0, 255.0)),
+        style.rescale.first().copied().unwrap_or((0.0, 255.0)),
+        style.rescale.get(1).copied().unwrap_or((0.0, 255.0)),
+        style.rescale.get(2).copied().unwrap_or((0.0, 255.0)),
     ]
 }
 
@@ -453,7 +453,7 @@ mod tests {
             Some(vec![1.0]),
         )
         .unwrap();
-        let spec = CompiledRenderSpec {
+        let style = CompiledTileStyle {
             composite: comp,
             rescale: vec![],
             formula: vec![],
@@ -463,7 +463,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
         };
-        let bytes = render(&img, &spec).unwrap();
+        let bytes = render(&img, &style).unwrap();
         assert!(bytes.starts_with(b"\x89PNG"));
     }
 
@@ -486,7 +486,7 @@ mod tests {
             Some(vec![1.0]),
         )
         .unwrap();
-        let spec = CompiledRenderSpec {
+        let style = CompiledTileStyle {
             composite: comp,
             rescale: vec![],
             formula: vec![],
@@ -496,7 +496,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
         };
-        let bytes = render(&img, &spec).unwrap();
+        let bytes = render(&img, &style).unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (8, 8));
     }
@@ -518,7 +518,7 @@ mod tests {
             Some(vec![1.0]),
         )
         .unwrap();
-        let spec = CompiledRenderSpec {
+        let style = CompiledTileStyle {
             composite: comp,
             rescale: vec![(0.0, 100.0)],
             formula: vec![],
@@ -528,7 +528,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
         };
-        let bytes = render(&img, &spec).unwrap();
+        let bytes = render(&img, &style).unwrap();
         let rgba = image::load_from_memory(&bytes).unwrap().to_rgba8();
         assert_eq!(rgba.get_pixel(0, 0).0[3], 0);
         assert_eq!(rgba.get_pixel(1, 0).0[3], 255);
@@ -551,7 +551,7 @@ mod tests {
             Some(vec![1.0]),
         )
         .unwrap();
-        let spec = CompiledRenderSpec {
+        let style = CompiledTileStyle {
             composite: comp,
             rescale: vec![],
             formula: vec![],
@@ -561,7 +561,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
         };
-        assert!(render(&img, &spec).is_err());
+        assert!(render(&img, &style).is_err());
     }
 
     #[test]
@@ -581,7 +581,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let spec = CompiledRenderSpec {
+        let style = CompiledTileStyle {
             composite: comp,
             rescale: vec![(0.0, 255.0), (0.0, 255.0), (0.0, 255.0)],
             formula: vec![],
@@ -592,7 +592,7 @@ mod tests {
             auto_rgb: false,
         };
 
-        let bytes = render(&img, &spec).unwrap();
+        let bytes = render(&img, &style).unwrap();
         let rgba = image::load_from_memory(&bytes).unwrap().to_rgba8();
         assert_eq!(rgba.get_pixel(0, 0).0, [128, 64, 32, 255]);
     }
@@ -614,7 +614,7 @@ mod tests {
             Some(vec![1.0]),
         )
         .unwrap();
-        let spec = CompiledRenderSpec {
+        let style = CompiledTileStyle {
             composite: comp,
             rescale: vec![],
             formula: vec![],
@@ -625,7 +625,7 @@ mod tests {
             auto_rgb: true,
         };
 
-        let bytes = render(&img, &spec).unwrap();
+        let bytes = render(&img, &style).unwrap();
         let rgba = image::load_from_memory(&bytes).unwrap().to_rgba8();
         assert_eq!(rgba.get_pixel(0, 0).0, [120, 80, 40, 255]);
     }

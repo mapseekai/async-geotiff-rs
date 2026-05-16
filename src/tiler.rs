@@ -14,7 +14,7 @@ use crate::io::CogReader;
 use crate::pixel::{ImageData, PixelData};
 use crate::render::pipeline::{render, CompiledTileStyle};
 use crate::style::params::compile_cached;
-use crate::style::stretch::{fallback_rescale, resolve_rescale, StretchSpec};
+use crate::style::stretch::{fallback_rescale, resolve_rescale, Stretch};
 use crate::style::TileStyle;
 use crate::tms::{Tms, TmsKind};
 use crate::warp;
@@ -95,13 +95,13 @@ impl Tiler {
         if !style.rescale.is_empty() {
             return Ok(Arc::clone(compiled));
         }
-        let spec: StretchSpec = match style.resolved_stretch()? {
+        let spec: Stretch = match style.resolved_stretch()? {
             Some(s) => s,
             None => {
                 if matches!(image.pixels, PixelData::U8(_)) {
                     return Ok(Arc::clone(compiled));
                 }
-                StretchSpec::DEFAULT
+                Stretch::DEFAULT
             }
         };
 

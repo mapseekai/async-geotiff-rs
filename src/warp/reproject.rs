@@ -12,6 +12,10 @@ use crate::error::{AgError, AgResult};
 use crate::pixel::{ImageData, PixelData};
 use crate::warp::resampler::Resampling;
 
+const WARP_EDGE_EPS: f64 = 0.5;
+const WARP_GRID_SIZE: usize = 32;
+const SUBTILE_MAX_ERR_PX: f64 = 0.33;
+
 pub fn warp(
     src: &ImageData,
     dst_crs: &Crs,
@@ -50,9 +54,10 @@ pub fn warp(
         let (y0, y1) = (ty.min(by), ty.max(by));
         let sw = src.pixels.width() as f64;
         let sh = src.pixels.height() as f64;
-        const EDGE_EPS: f64 = 0.5;
-        let fully_in_bounds =
-            x0 >= -EDGE_EPS && y0 >= -EDGE_EPS && x1 <= sw + EDGE_EPS && y1 <= sh + EDGE_EPS;
+        let fully_in_bounds = x0 >= -WARP_EDGE_EPS
+            && y0 >= -WARP_EDGE_EPS
+            && x1 <= sw + WARP_EDGE_EPS
+            && y1 <= sh + WARP_EDGE_EPS;
         if fully_in_bounds {
             return warp_affine(
                 src,
@@ -71,12 +76,12 @@ pub fn warp(
     // of intermediate dst→src pixel coords. The Projector is fetched from a
     // thread-local cache (see `projection::with_cached`) so back-to-back
     // tile requests on the same worker thread skip PROJ context init.
-    const N: usize = 32;
-    let mut grid_dst: Vec<(f64, f64)> = Vec::with_capacity((N + 1) * (N + 1));
-    for i in 0..=N {
-        for j in 0..=N {
-            let dx = dst_bbox.xmin + (j as f64) * dst_bbox.width() / (N as f64);
-            let dy = dst_bbox.ymax - (i as f64) * dst_bbox.height() / (N as f64);
+    let mut grid_dst: Vec<(f64, f64)> =
+        Vec::with_capacity((WARP_GRID_SIZE + 1) * (WARP_GRID_SIZE + 1));
+    for i in 0..=WARP_GRID_SIZE {
+        for j in 0..=WARP_GRID_SIZE {
+            let dx = dst_bbox.xmin + (j as f64) * dst_bbox.width() / (WARP_GRID_SIZE as f64);
+            let dy = dst_bbox.ymax - (i as f64) * dst_bbox.height() / (WARP_GRID_SIZE as f64);
             grid_dst.push((dx, dy));
         }
     }
@@ -103,7 +108,7 @@ pub fn warp(
         resampling,
         dst_transform,
         &grid_src_pix,
-        N,
+        WARP_GRID_SIZE,
     )? {
         return Ok(out);
     }
@@ -131,13 +136,14 @@ pub fn warp(
 
     // Per-column precomputation: j0/j1/dj table reused for every row.
     // Pixel-center sampling: dst column c spans world width 1/dst_w of the
-    // tile; its centre maps to fractional grid index `(c + 0.5) / dst_w * N`.
+    // tile; its centre maps to fractional grid index
+    // `(c + 0.5) / dst_w * WARP_GRID_SIZE`.
     // Earlier (c / dst_w) put the sample at the pixel corner, causing a
     // 0.5-px global offset versus gdalwarp / rio-tiler.
     let col_table: Vec<(usize, usize, f64)> = (0..dst_w)
         .map(|c| {
-            let gj = (c as f64 + 0.5) * (N as f64) / (dst_w as f64);
-            let j0 = (gj.floor() as usize).min(N - 1);
+            let gj = (c as f64 + 0.5) * (WARP_GRID_SIZE as f64) / (dst_w as f64);
+            let j0 = (gj.floor() as usize).min(WARP_GRID_SIZE - 1);
             (j0, j0 + 1, gj - j0 as f64)
         })
         .collect();
@@ -155,12 +161,12 @@ pub fn warp(
     let rows: Vec<(usize, Vec<bool>, Vec<Vec<f64>>)> = (0..dst_h)
         .into_par_iter()
         .map(|r| {
-            let gi = (r as f64 + 0.5) * (N as f64) / (dst_h as f64);
-            let i0 = (gi.floor() as usize).min(N - 1);
+            let gi = (r as f64 + 0.5) * (WARP_GRID_SIZE as f64) / (dst_h as f64);
+            let i0 = (gi.floor() as usize).min(WARP_GRID_SIZE - 1);
             let i1 = i0 + 1;
             let di = gi - i0 as f64;
-            let row_i0 = i0 * (N + 1);
-            let row_i1 = i1 * (N + 1);
+            let row_i0 = i0 * (WARP_GRID_SIZE + 1);
+            let row_i1 = i1 * (WARP_GRID_SIZE + 1);
 
             let mut mask_row = vec![true; dst_w];
             let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
@@ -235,10 +241,6 @@ fn try_subtile_affine(
     grid_src_pix: &[(f64, f64)],
     n: usize,
 ) -> AgResult<Option<ImageData>> {
-    // Tolerance for switching to the SIMD path: under one third of a
-    // source pixel, indistinguishable after the resampling kernel.
-    const MAX_ERR_PX: f64 = 0.33;
-
     let idx = |i: usize, j: usize| i * (n + 1) + j;
     let p00 = grid_src_pix[idx(0, 0)];
     let p0n = grid_src_pix[idx(0, n)];
@@ -247,7 +249,7 @@ fn try_subtile_affine(
 
     // The samples at the four grid corners give us the linear approximation
     // src = lerp(corners; di, dj). Check that this linear model approximates
-    // every interior grid point within MAX_ERR_PX.
+    // every interior grid point within SUBTILE_MAX_ERR_PX.
     let mut max_err2 = 0.0_f64;
     for i in 0..=n {
         let di = i as f64 / n as f64;
@@ -270,7 +272,7 @@ fn try_subtile_affine(
             }
         }
     }
-    if max_err2.sqrt() > MAX_ERR_PX {
+    if max_err2.sqrt() > SUBTILE_MAX_ERR_PX {
         return Ok(None);
     }
 
@@ -279,7 +281,7 @@ fn try_subtile_affine(
     // the src_x should be ~constant.
     let top_y_drift = (p00.1 - p0n.1).abs();
     let left_x_drift = (p00.0 - pn0.0).abs();
-    if top_y_drift > MAX_ERR_PX || left_x_drift > MAX_ERR_PX {
+    if top_y_drift > SUBTILE_MAX_ERR_PX || left_x_drift > SUBTILE_MAX_ERR_PX {
         return Ok(None);
     }
 
@@ -300,14 +302,13 @@ fn try_subtile_affine(
     // full dst tile stretches the valid strip across the whole tile
     // (smeared edges on COG-perimeter tiles at deep zoom). Fall back to the
     // scalar sampler, which returns transparent fill for out-of-bounds src
-    // coords. EDGE_EPS = 0.5 keeps the same sub-pixel seam-halo tolerance
+    // coords. WARP_EDGE_EPS keeps the same sub-pixel seam-halo tolerance
     // as the resampler edge handling, so fully-interior tiles still take
     // this SIMD fast path.
-    const EDGE_EPS: f64 = 0.5;
-    if min_x < -EDGE_EPS
-        || min_y < -EDGE_EPS
-        || max_x > src_w + EDGE_EPS
-        || max_y > src_h + EDGE_EPS
+    if min_x < -WARP_EDGE_EPS
+        || min_y < -WARP_EDGE_EPS
+        || max_x > src_w + WARP_EDGE_EPS
+        || max_y > src_h + WARP_EDGE_EPS
     {
         return Ok(None);
     }

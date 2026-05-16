@@ -62,4 +62,6 @@ strip = false
 [[example]]
 name = "serve"
 
-# [[bench]] section deferred to Task 24 when benches/tile_bench.rs is added
+[[bench]]
+name = "resampler_bench"
+harness = false

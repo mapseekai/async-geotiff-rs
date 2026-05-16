@@ -4,7 +4,7 @@ use crate::error::{AgError, AgResult};
 use crate::render::color_formula::{parse as parse_formula, Op};
 use crate::render::composite::{ColourDefinition, Composite};
 use crate::render::pipeline::CompiledTileStyle;
-use crate::style::stretch::{parse_stretch_kind, StretchSpec};
+use crate::style::stretch::{parse_stretch_kind, Stretch};
 use crate::warp::resampler::Resampling;
 
 pub const ALLOWED_TILE_SIZES: [u32; 5] = [64, 128, 256, 512, 1024];
@@ -73,11 +73,11 @@ impl TileStyle {
     }
 
     /// `None` → caller applies the dtype-aware default (u8 keeps its
-    /// fast path; others use `StretchSpec::DEFAULT`). `Some(spec)` →
+    /// fast path; others use `Stretch::DEFAULT`). `Some(spec)` →
     /// an explicit `?stretch=` mode. Invalid params → `AgError::query`
     /// (HTTP 400). A non-empty `rescale` (Custom) makes this irrelevant
     /// — the caller checks `rescale` first.
-    pub fn resolved_stretch(&self) -> AgResult<Option<StretchSpec>> {
+    pub fn resolved_stretch(&self) -> AgResult<Option<Stretch>> {
         match &self.stretch_kind {
             None => {
                 if self.stretch_pc.is_some() || self.stretch_sigma.is_some() {
@@ -313,18 +313,18 @@ mod tests {
 
     #[test]
     fn parses_stretch_params() {
-        use crate::style::stretch::StretchSpec;
+        use crate::style::stretch::Stretch;
 
         let s = TileStyle::from_query("stretch=percent&pc=2,98").unwrap();
         assert_eq!(
             s.resolved_stretch().unwrap(),
-            Some(StretchSpec::Percent { lo: 2.0, hi: 98.0 })
+            Some(Stretch::Percent { lo: 2.0, hi: 98.0 })
         );
 
         let sd = TileStyle::from_query("stretch=stddev&sigma=3.0").unwrap();
         assert_eq!(
             sd.resolved_stretch().unwrap(),
-            Some(StretchSpec::StdDev { k: 3.0 })
+            Some(Stretch::StdDev { k: 3.0 })
         );
 
         let none = TileStyle::from_query("").unwrap();

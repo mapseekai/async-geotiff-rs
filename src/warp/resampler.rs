@@ -64,6 +64,29 @@ impl Resampling {
         }
         let cf = col.clamp(0.0, (w - 1) as f64);
         let rf = row.clamp(0.0, (h - 1) as f64);
+
+        // Fast path: a band view sliced out of a C-order `(bands,H,W)`
+        // array is standard-contiguous, so `as_slice()` is `Some` and we
+        // can index the flat buffer directly — one fused mul-add instead
+        // of ndarray's per-access stride dot-product + bounds check. Falls
+        // back to strided `[[r,c]]` indexing when the view is non-contiguous
+        // (e.g. a `permuted_axes` zero-copy reorder).
+        let w_us = w as usize;
+        let contig = view.as_slice();
+        let get = |r: usize, c: usize| -> f64 {
+            match contig {
+                // SAFETY: callers derive `r`/`c` from `rf`/`cf`, which are
+                // clamped to `[0, h-1]` / `[0, w-1]`, so `r*w_us + c` is
+                // always `< h*w == contig.len()`.
+                Some(s) => unsafe { *s.get_unchecked(r * w_us + c) },
+                None => view[[r, c]],
+            }
+        };
+        // NB: a matching flat-index fast path for the validity mask was
+        // benchmarked and reverted — it produced 0.1% change because the
+        // masked path is dominated by the reweighting branches + divide,
+        // not the mask reads. Kept strided to avoid complexity for no gain.
+
         match self {
             Self::Nearest => {
                 let c = cf.round().clamp(0.0, (w - 1) as f64) as usize;
@@ -73,7 +96,7 @@ impl Resampling {
                         return fill;
                     }
                 }
-                view[[r, c]]
+                get(r, c)
             }
             // Cross-CRS cubic uses the bilinear weight kernel (PROJ error
             // dominates; a true 16-tap scalar loop adds cost for no quality).
@@ -92,10 +115,10 @@ impl Resampling {
                 let w01 = dc * (1.0 - dr);
                 let w10 = (1.0 - dc) * dr;
                 let w11 = dc * dr;
-                let v00 = view[[r0, c0]];
-                let v01 = view[[r0, c1]];
-                let v10 = view[[r1, c0]];
-                let v11 = view[[r1, c1]];
+                let v00 = get(r0, c0);
+                let v01 = get(r0, c1);
+                let v10 = get(r1, c0);
+                let v11 = get(r1, c1);
 
                 match valid {
                     None => {

@@ -23,6 +23,9 @@ use crate::io::decode::{decode_window, DecodeWindowJob};
 use crate::io::window::{tile_range_for_window, IfdInfo};
 use crate::pixel::ImageData;
 
+#[cfg(test)]
+const TEST_OVERVIEW_PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
+
 /// Runtime limits for a [`CogReader`].
 ///
 /// `max_decode_tasks` caps concurrent CPU-heavy decode/stitch jobs submitted
@@ -616,32 +619,29 @@ fn alpha_band_index(ifd: &ImageFileDirectory) -> Option<usize> {
 mod tests {
     use super::*;
 
-    // Full-res gsd=10, overviews 20/40/80 (levels 0..3).
-    const PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
-
     #[test]
     fn overview_brackets_target_from_below_downsample() {
         // target 30 sits between L1(20) and L2(40): rio-tiler picks the
         // FINER bracket (L1) and downsamples 20→30. Not L2 (upsample).
-        assert_eq!(pick_overview_from_gsds(&PYRAMID, 30.0), 1);
+        assert_eq!(pick_overview_from_gsds(&TEST_OVERVIEW_PYRAMID, 30.0), 1);
     }
 
     #[test]
     fn overview_zoomed_in_uses_full_res() {
         // target finer than native → full res.
-        assert_eq!(pick_overview_from_gsds(&PYRAMID, 5.0), 0);
-        assert_eq!(pick_overview_from_gsds(&PYRAMID, 10.0), 0);
+        assert_eq!(pick_overview_from_gsds(&TEST_OVERVIEW_PYRAMID, 5.0), 0);
+        assert_eq!(pick_overview_from_gsds(&TEST_OVERVIEW_PYRAMID, 10.0), 0);
     }
 
     #[test]
     fn overview_snaps_within_tolerance() {
         // target ≈ L2(40) within 0.1 → snap to L2.
-        assert_eq!(pick_overview_from_gsds(&PYRAMID, 40.05), 2);
+        assert_eq!(pick_overview_from_gsds(&TEST_OVERVIEW_PYRAMID, 40.05), 2);
     }
 
     #[test]
     fn overview_coarser_than_all_uses_coarsest() {
-        assert_eq!(pick_overview_from_gsds(&PYRAMID, 200.0), 3);
+        assert_eq!(pick_overview_from_gsds(&TEST_OVERVIEW_PYRAMID, 200.0), 3);
     }
 
     #[test]

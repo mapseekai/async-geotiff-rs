@@ -8,4 +8,4 @@ pub mod rescale;
 
 pub use colour::Colour;
 pub use composite::{ColourDefinition, Composite, HandleGet};
-pub use pipeline::{render, CompiledRenderSpec};
+pub use pipeline::{render, CompiledTileStyle};
