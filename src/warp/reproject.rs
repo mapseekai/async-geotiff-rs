@@ -818,7 +818,7 @@ mod tests {
         let vals: Vec<f64> = out.pixels.as_f64().iter().copied().collect();
         for &v in vals.iter() {
             assert!(
-                v >= 0.0 && v <= 63.0,
+                (0.0..=63.0).contains(&v),
                 "avg {v} out of source range [0, 63]"
             );
         }
@@ -849,7 +849,7 @@ mod tests {
         assert_eq!(out.pixels.width(), 4);
         let vals: Vec<f64> = out.pixels.as_f64().iter().copied().collect();
         for &v in vals.iter() {
-            assert!(v >= 0.0 && v <= 63.0, "avg {v} out of source range");
+            assert!((0.0..=63.0).contains(&v), "avg {v} out of source range");
         }
         // Guard against silent degradation to fill/constant: at least one
         // interior pixel must be a genuine mid-range average.
