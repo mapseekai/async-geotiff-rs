@@ -17,6 +17,11 @@ pub enum Resampling {
     /// Lanczos3 windowed sinc (6-tap). Highest quality, slowest of the
     /// SIMD kernels. Matches titiler's `resampling=lanczos`.
     Lanczos,
+    /// Box-filter mean over the source footprint a destination pixel
+    /// covers: correct averaging antialiasing when downsampling, but
+    /// degrades to nearest-neighbour when upsampling (same behaviour as
+    /// GDAL / titiler `resampling=average`).
+    Average,
 }
 
 impl Resampling {
@@ -27,6 +32,7 @@ impl Resampling {
             "cubic" | "bicubic" => Some(Self::Cubic),
             "cubic_spline" | "mitchell" => Some(Self::CubicSpline),
             "lanczos" | "lanczos3" => Some(Self::Lanczos),
+            "average" => Some(Self::Average),
             _ => None,
         }
     }
@@ -98,12 +104,10 @@ impl Resampling {
                 }
                 get(r, c)
             }
-            // Cross-CRS cubic uses the bilinear weight kernel (PROJ error
-            // dominates; a true 16-tap scalar loop adds cost for no quality).
             // Cross-CRS sampler: all non-nearest kernels share the 4-tap
             // bilinear path (PROJ error dominates; the SIMD wide kernels
             // are exercised only in the same-CRS / subtile-affine fast path).
-            Self::Cubic | Self::Bilinear | Self::CubicSpline | Self::Lanczos => {
+            Self::Cubic | Self::Bilinear | Self::CubicSpline | Self::Lanczos | Self::Average => {
                 let c0 = cf.floor() as usize;
                 let r0 = rf.floor() as usize;
                 let c1 = (c0 + 1).min(w as usize - 1);
@@ -159,6 +163,69 @@ impl Resampling {
             }
         }
     }
+
+    /// Box-mean over the source footprint `[sc-rx, sc+rx] x [sr-ry, sr+ry]`.
+    /// `rx`/`ry` are half-footprint sizes in source pixels (from the warp
+    /// Jacobian). When the footprint is below one source pixel the result
+    /// degenerates to bilinear (no pixel blocks on upsample). Averages only
+    /// `valid` pixels; all-invalid (or empty box) returns `fill`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_average(
+        self,
+        view: ArrayView2<f64>,
+        valid: Option<ArrayView2<bool>>,
+        sc: f64,
+        sr: f64,
+        rx: f64,
+        ry: f64,
+        fill: f64,
+    ) -> f64 {
+        let (h, w) = (view.shape()[0], view.shape()[1]);
+        if w == 0 || h == 0 {
+            return fill;
+        }
+        // PROJ can emit NaN/inf for unmapped pixels; treat as no data.
+        if !sc.is_finite() || !sr.is_finite() {
+            return fill;
+        }
+        // Sub-pixel footprint => bilinear (reuses edge-clamp + mask logic).
+        if rx < 0.5 && ry < 0.5 {
+            return Self::Bilinear.sample_masked(view, valid, sc, sr, fill);
+        }
+        let c_lo = (sc - rx).floor().max(0.0) as usize;
+        let c_hi = ((sc + rx).ceil() as i64).clamp(0, w as i64 - 1) as usize;
+        let r_lo = (sr - ry).floor().max(0.0) as usize;
+        let r_hi = ((sr + ry).ceil() as i64).clamp(0, h as i64 - 1) as usize;
+
+        let contig = view.as_slice();
+        let mask_contig = valid.as_ref().and_then(|m| m.as_slice());
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for r in r_lo..=r_hi {
+            for c in c_lo..=c_hi {
+                let ok = match (mask_contig, valid) {
+                    (Some(s), _) => s[r * w + c],
+                    (None, Some(m)) => m[[r, c]],
+                    (None, None) => true,
+                };
+                if !ok {
+                    continue;
+                }
+                let val = match contig {
+                    Some(s) => s[r * w + c],
+                    None => view[[r, c]],
+                };
+                sum += val;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            fill
+        } else {
+            sum / count as f64
+        }
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +259,45 @@ mod tests {
         assert_eq!(Resampling::parse("cubic"), Some(Resampling::Cubic));
         assert_eq!(Resampling::parse("bicubic"), Some(Resampling::Cubic));
         assert_eq!(Resampling::parse("foo"), None);
+        assert_eq!(Resampling::parse("average"), Some(Resampling::Average));
+    }
+
+    #[test]
+    fn average_box_mean() {
+        // 4x4 ramp 0..16; full-tile footprint => arithmetic mean = 7.5
+        let a = ndarray::Array2::from_shape_fn((4, 4), |(r, c)| (r * 4 + c) as f64);
+        let v = Resampling::Average.sample_average(a.view(), None, 1.5, 1.5, 1.5, 1.5, -1.0);
+        assert_relative_eq!(v, 7.5);
+    }
+
+    #[test]
+    fn average_respects_mask() {
+        let a = ndarray::Array2::from_elem((4, 4), 10.0);
+        let mut m = ndarray::Array2::from_elem((4, 4), true);
+        m[[0, 0]] = false; // one invalid pixel, value still 10 elsewhere
+        let v = Resampling::Average.sample_average(
+            a.view(), Some(m.view()), 1.5, 1.5, 1.5, 1.5, -1.0);
+        assert_relative_eq!(v, 10.0); // mean of valid pixels (all 10)
+
+        let none_valid = ndarray::Array2::from_elem((4, 4), false);
+        let f = Resampling::Average.sample_average(
+            a.view(), Some(none_valid.view()), 1.5, 1.5, 1.5, 1.5, -7.0);
+        assert_eq!(f, -7.0); // all invalid => fill
+    }
+
+    #[test]
+    fn average_nan_coords_return_fill() {
+        let a = ndarray::Array2::from_elem((4, 4), 5.0);
+        let v = Resampling::Average.sample_average(
+            a.view(), None, f64::NAN, 2.0, 2.0, 2.0, -9.0);
+        assert_eq!(v, -9.0);
+    }
+
+    #[test]
+    fn average_degenerates_to_bilinear() {
+        let a = array![[0.0, 10.0], [0.0, 10.0]];
+        let avg = Resampling::Average.sample_average(a.view(), None, 0.5, 0.0, 0.3, 0.3, 0.0);
+        let bil = Resampling::Bilinear.sample_masked(a.view(), None, 0.5, 0.0, 0.0);
+        assert_eq!(avg, bil); // sub-1px footprint delegates to bilinear
     }
 }

@@ -16,6 +16,39 @@ const WARP_EDGE_EPS: f64 = 0.5;
 const WARP_GRID_SIZE: usize = 32;
 const SUBTILE_MAX_ERR_PX: f64 = 0.33;
 
+/// Source-pixel coords `(sc, sr)` for every dst column of dst row `r`,
+/// using the warp grid. Extracted so the average kernel can difference
+/// row `r` against row `r+1` for the vertical Jacobian.
+fn row_src_coords(
+    r: usize,
+    dst_h: usize,
+    dst_w: usize,
+    col_table: &[(usize, usize, f64)],
+    grid_src_pix: &[(f64, f64)],
+) -> Vec<(f64, f64)> {
+    let gi = (r as f64 + 0.5) * (WARP_GRID_SIZE as f64) / (dst_h as f64);
+    let i0 = (gi.floor() as usize).min(WARP_GRID_SIZE - 1);
+    let i1 = i0 + 1;
+    let di = gi - i0 as f64;
+    let row_i0 = i0 * (WARP_GRID_SIZE + 1);
+    let row_i1 = i1 * (WARP_GRID_SIZE + 1);
+    let mut out = Vec::with_capacity(dst_w);
+    for &(j0, j1, dj) in col_table.iter() {
+        let p00 = grid_src_pix[row_i0 + j0];
+        let p01 = grid_src_pix[row_i0 + j1];
+        let p10 = grid_src_pix[row_i1 + j0];
+        let p11 = grid_src_pix[row_i1 + j1];
+        let w00 = (1.0 - di) * (1.0 - dj);
+        let w01 = (1.0 - di) * dj;
+        let w10 = di * (1.0 - dj);
+        let w11 = di * dj;
+        let sc = p00.0 * w00 + p01.0 * w01 + p10.0 * w10 + p11.0 * w11;
+        let sr = p00.1 * w00 + p01.1 * w01 + p10.1 * w10 + p11.1 * w11;
+        out.push((sc, sr));
+    }
+    out
+}
+
 pub fn warp(
     src: &ImageData,
     dst_crs: &Crs,
@@ -158,35 +191,73 @@ pub fn warp(
     // the row dimension, so we collect per-row (mask_row, [band_row,...])
     // results and copy into `out`/`mask` after the parallel section.
     use rayon::prelude::*;
+    let is_average = matches!(resampling, Resampling::Average);
     let rows: Vec<(usize, Vec<bool>, Vec<Vec<f64>>)> = (0..dst_h)
         .into_par_iter()
         .map(|r| {
-            let gi = (r as f64 + 0.5) * (WARP_GRID_SIZE as f64) / (dst_h as f64);
-            let i0 = (gi.floor() as usize).min(WARP_GRID_SIZE - 1);
-            let i1 = i0 + 1;
-            let di = gi - i0 as f64;
-            let row_i0 = i0 * (WARP_GRID_SIZE + 1);
-            let row_i1 = i1 * (WARP_GRID_SIZE + 1);
-
+            let coords = row_src_coords(r, dst_h, dst_w, &col_table, &grid_src_pix);
             let mut mask_row = vec![true; dst_w];
             let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
 
-            for (c, &(j0, j1, dj)) in col_table.iter().enumerate() {
-                let p00 = grid_src_pix[row_i0 + j0];
-                let p01 = grid_src_pix[row_i0 + j1];
-                let p10 = grid_src_pix[row_i1 + j0];
-                let p11 = grid_src_pix[row_i1 + j1];
-                let w00 = (1.0 - di) * (1.0 - dj);
-                let w01 = (1.0 - di) * dj;
-                let w10 = di * (1.0 - dj);
-                let w11 = di * dj;
-                let sc = p00.0 * w00 + p01.0 * w01 + p10.0 * w10 + p11.0 * w11;
-                let sr = p00.1 * w00 + p01.1 * w01 + p10.1 * w10 + p11.1 * w11;
+            if is_average {
+                // Footprint Jacobian by finite difference of source coords.
+                // Forward difference where a forward neighbour exists,
+                // backward difference at the trailing row/column — a clamped
+                // one-sided diff would collapse to zero and silently degrade
+                // the edge strip to bilinear (visible as tile-edge seams).
+                let r_fwd = (r + 1).min(dst_h - 1);
+                let r_bwd = r.saturating_sub(1);
+                let coords_r_fwd = row_src_coords(r_fwd, dst_h, dst_w, &col_table, &grid_src_pix);
+                let coords_r_bwd = if r_bwd == r {
+                    None
+                } else {
+                    Some(row_src_coords(r_bwd, dst_h, dst_w, &col_table, &grid_src_pix))
+                };
+                for c in 0..dst_w {
+                    let (sc, sr) = coords[c];
 
-                mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
-                for (b, band_view) in band_views.iter().enumerate() {
-                    band_rows[b][c] =
-                        resampling.sample_masked(*band_view, src_mask_view, sc, sr, fill);
+                    // Column step: source displacement per one dst-column.
+                    // (dx_col is the on-axis term, dy_col the shear term;
+                    //  both feed the axis-aligned footprint below.)
+                    let (col_a, col_b) = if c + 1 < dst_w {
+                        (coords[c + 1], coords[c])
+                    } else if c > 0 {
+                        (coords[c], coords[c - 1])
+                    } else {
+                        (coords[c], coords[c]) // dst_w == 1: no neighbour
+                    };
+                    let dx_col = (col_a.0 - col_b.0).abs();
+                    let dy_col = (col_a.1 - col_b.1).abs();
+
+                    // Row step: source displacement per one dst-row.
+                    let (row_a, row_b) = if r + 1 < dst_h {
+                        (coords_r_fwd[c], coords[c])
+                    } else if let Some(ref cb) = coords_r_bwd {
+                        (coords[c], cb[c])
+                    } else {
+                        (coords[c], coords[c]) // dst_h == 1: no neighbour
+                    };
+                    let dx_row = (row_a.0 - row_b.0).abs();
+                    let dy_row = (row_a.1 - row_b.1).abs();
+
+                    // Axis-aligned footprint half-extent: max source-x (and
+                    // source-y) displacement contributed by either step.
+                    let rx = (dx_col.max(dx_row) * 0.5).max(1e-6);
+                    let ry = (dy_col.max(dy_row) * 0.5).max(1e-6);
+
+                    mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
+                    for (b, band_view) in band_views.iter().enumerate() {
+                        band_rows[b][c] = resampling.sample_average(
+                            *band_view, src_mask_view, sc, sr, rx, ry, fill);
+                    }
+                }
+            } else {
+                for (c, &(sc, sr)) in coords.iter().enumerate() {
+                    mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
+                    for (b, band_view) in band_views.iter().enumerate() {
+                        band_rows[b][c] =
+                            resampling.sample_masked(*band_view, src_mask_view, sc, sr, fill);
+                    }
                 }
             }
             (r, mask_row, band_rows)
@@ -327,6 +398,7 @@ fn try_subtile_affine(
         Resampling::Cubic => fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom),
         Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
         Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
+        Resampling::Average => fr::ResizeAlg::Convolution(fr::FilterType::Box),
     };
     let options = fr::ResizeOptions::new()
         .resize_alg(alg)
@@ -463,6 +535,7 @@ fn warp_affine(
         Resampling::Cubic => fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom),
         Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
         Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
+        Resampling::Average => fr::ResizeAlg::Convolution(fr::FilterType::Box),
     };
     let options = fr::ResizeOptions::new().resize_alg(alg).crop(
         crop_left,
@@ -688,5 +761,102 @@ mod tests {
         let src = dummy_src(Crs::epsg(3857));
         let out = warp(&src, &Crs::epsg(3857), src.bbox, 4, 4, Resampling::Nearest).unwrap();
         assert_eq!(out.crs, src.crs);
+    }
+
+    /// Integration test that provably exercises the scalar `is_average` fallback branch.
+    ///
+    /// Control-flow reasoning:
+    ///   1. src CRS (EPSG:4326) ≠ dst CRS (EPSG:3857) → same-CRS fast path skipped.
+    ///   2. The dst bbox in EPSG:3857 is chosen to map partly *outside* the source
+    ///      image bounds when projected back to EPSG:4326 pixel space.  Concretely,
+    ///      the source covers lon 0–8°, lat 0–8°, but the dst bbox extends to
+    ///      ~lon −1° and ~lon 15° (in EPSG:3857 meters), so the grid corners in
+    ///      src-pixel space have min_x < 0 and max_x > src_w.  `try_subtile_affine`
+    ///      detects this at the out-of-bounds guard (lines 348-354) and returns
+    ///      `Ok(None)`, falling through to the scalar loop.
+    ///
+    /// Path oracle:
+    ///   The scalar fallback always returns `PixelData::F64(out)`.
+    ///   `try_subtile_affine` converts F64 sources to F32 and returns
+    ///   `PixelData::F32`.  Asserting `PixelData::F64` therefore FAILS if the
+    ///   implementation ever silently routes through the fast path instead.
+    #[test]
+    fn average_cross_crs_scalar_path_box_mean() {
+        // 8×8 ramp: pixel (y,x) = y*8+x, range [0, 63].
+        let arr = Array3::<f64>::from_shape_fn((1, 8, 8), |(_, y, x)| (y * 8 + x) as f64);
+        let src = ImageData {
+            pixels: PixelData::F64(arr),
+            mask: None,
+            // EPSG:4326 bbox covering lon 0–8°, lat 0–8°.
+            bbox: Bbox::new(0.0, 0.0, 8.0, 8.0),
+            crs: Crs::epsg(4326),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 8.0, 0.0, -1.0]),
+            nodata: None,
+        };
+
+        // Dst bbox in EPSG:3857 covering roughly lon −1°..15°, lat 0°..9°.
+        // This deliberately extends outside the source image on both x-edges,
+        // forcing try_subtile_affine to return None (out-of-bounds guard).
+        //   lon −1° ≈ −111_195 m,  lon 15° ≈ 1_669_792 m
+        //   lat  0° = 0 m,          lat  9° ≈ 1_003_750 m
+        let dst_bbox = Bbox::new(-111_195.0, 0.0, 1_669_792.0, 1_003_750.0);
+        let out = warp(&src, &Crs::epsg(3857), dst_bbox, 4, 4, Resampling::Average).unwrap();
+
+        // ── Path oracle ──────────────────────────────────────────────────────
+        // The scalar fallback returns F64; the SIMD fast path converts F64→F32.
+        // This assertion is the coverage guard: it fails if the test silently
+        // takes the fast path.
+        assert!(
+            matches!(out.pixels, PixelData::F64(_)),
+            "expected scalar fallback (F64 output) but got a different variant"
+        );
+
+        // ── Box-mean invariant ───────────────────────────────────────────────
+        // Every finite output value must lie in the source value range [0, 63].
+        // Out-of-bounds src coords yield fill = nodata.unwrap_or(0.0) = 0.0,
+        // which is already inside [0, 63].
+        let vals: Vec<f64> = out.pixels.as_f64().iter().copied().collect();
+        for &v in vals.iter() {
+            assert!(
+                (0.0..=63.0).contains(&v),
+                "avg {v} out of source range [0, 63]"
+            );
+        }
+        // Guard against silent degradation to fill/constant: at least one
+        // interior pixel must be a genuine mid-range average.
+        let interior = vals.iter().copied().filter(|&v| v > 5.0 && v < 58.0).count();
+        assert!(
+            interior > 0,
+            "expected interior averaged values; got none (averaging may be broken)"
+        );
+        assert_eq!(out.pixels.height(), 4);
+        assert_eq!(out.pixels.width(), 4);
+    }
+
+    #[test]
+    fn average_cross_crs_downsample_within_source_range() {
+        let arr = Array3::<f64>::from_shape_fn((1, 8, 8), |(_, y, x)| (y * 8 + x) as f64);
+        let src = ImageData {
+            pixels: PixelData::F64(arr),
+            mask: None,
+            bbox: Bbox::new(0.0, 0.0, 8.0, 8.0),
+            crs: Crs::epsg(4326),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 8.0, 0.0, -1.0]),
+            nodata: None,
+        };
+        let out = warp(&src, &Crs::epsg(3857), src.bbox, 4, 4, Resampling::Average).unwrap();
+        assert_eq!(out.pixels.height(), 4);
+        assert_eq!(out.pixels.width(), 4);
+        let vals: Vec<f64> = out.pixels.as_f64().iter().copied().collect();
+        for &v in vals.iter() {
+            assert!((0.0..=63.0).contains(&v), "avg {v} out of source range");
+        }
+        // Guard against silent degradation to fill/constant: at least one
+        // interior pixel must be a genuine mid-range average.
+        let interior = vals.iter().copied().filter(|&v| v > 5.0 && v < 58.0).count();
+        assert!(
+            interior > 0,
+            "expected interior averaged values; got none (averaging may be broken)"
+        );
     }
 }
