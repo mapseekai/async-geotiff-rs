@@ -732,6 +732,69 @@ mod tests {
         assert_eq!(out.crs, src.crs);
     }
 
+    /// Integration test that provably exercises the scalar `is_average` fallback branch.
+    ///
+    /// Control-flow reasoning:
+    ///   1. src CRS (EPSG:4326) ≠ dst CRS (EPSG:3857) → same-CRS fast path skipped.
+    ///   2. The dst bbox in EPSG:3857 is chosen to map partly *outside* the source
+    ///      image bounds when projected back to EPSG:4326 pixel space.  Concretely,
+    ///      the source covers lon 0–8°, lat 0–8°, but the dst bbox extends to
+    ///      ~lon −1° and ~lon 15° (in EPSG:3857 meters), so the grid corners in
+    ///      src-pixel space have min_x < 0 and max_x > src_w.  `try_subtile_affine`
+    ///      detects this at the out-of-bounds guard (lines 348-354) and returns
+    ///      `Ok(None)`, falling through to the scalar loop.
+    ///
+    /// Path oracle:
+    ///   The scalar fallback always returns `PixelData::F64(out)`.
+    ///   `try_subtile_affine` converts F64 sources to F32 and returns
+    ///   `PixelData::F32`.  Asserting `PixelData::F64` therefore FAILS if the
+    ///   implementation ever silently routes through the fast path instead.
+    #[test]
+    fn average_cross_crs_scalar_path_box_mean() {
+        // 8×8 ramp: pixel (y,x) = y*8+x, range [0, 63].
+        let arr = Array3::<f64>::from_shape_fn((1, 8, 8), |(_, y, x)| (y * 8 + x) as f64);
+        let src = ImageData {
+            pixels: PixelData::F64(arr),
+            mask: None,
+            // EPSG:4326 bbox covering lon 0–8°, lat 0–8°.
+            bbox: Bbox::new(0.0, 0.0, 8.0, 8.0),
+            crs: Crs::epsg(4326),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 8.0, 0.0, -1.0]),
+            nodata: None,
+        };
+
+        // Dst bbox in EPSG:3857 covering roughly lon −1°..15°, lat 0°..9°.
+        // This deliberately extends outside the source image on both x-edges,
+        // forcing try_subtile_affine to return None (out-of-bounds guard).
+        //   lon −1° ≈ −111_195 m,  lon 15° ≈ 1_669_792 m
+        //   lat  0° = 0 m,          lat  9° ≈ 1_003_750 m
+        let dst_bbox = Bbox::new(-111_195.0, 0.0, 1_669_792.0, 1_003_750.0);
+        let out = warp(&src, &Crs::epsg(3857), dst_bbox, 4, 4, Resampling::Average).unwrap();
+
+        // ── Path oracle ──────────────────────────────────────────────────────
+        // The scalar fallback returns F64; the SIMD fast path converts F64→F32.
+        // This assertion is the coverage guard: it fails if the test silently
+        // takes the fast path.
+        assert!(
+            matches!(out.pixels, PixelData::F64(_)),
+            "expected scalar fallback (F64 output) but got a different variant"
+        );
+
+        // ── Box-mean invariant ───────────────────────────────────────────────
+        // Every finite output value must lie in the source value range [0, 63].
+        // Out-of-bounds src coords yield fill = nodata.unwrap_or(0.0) = 0.0,
+        // which is already inside [0, 63].
+        let vals = out.pixels.as_f64();
+        for &v in vals.iter() {
+            assert!(
+                v >= 0.0 && v <= 63.0,
+                "avg {v} out of source range [0, 63]"
+            );
+        }
+        assert_eq!(out.pixels.height(), 4);
+        assert_eq!(out.pixels.width(), 4);
+    }
+
     #[test]
     fn average_cross_crs_downsample_within_source_range() {
         let arr = Array3::<f64>::from_shape_fn((1, 8, 8), |(_, y, x)| (y * 8 + x) as f64);
