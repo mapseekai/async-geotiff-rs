@@ -148,6 +148,21 @@
           <option value="turbo">turbo</option>
         </select>
       </div>
+      <div class="field">
+        <label for="stretch">Stretch</label>
+        <select id="stretch" name="stretch">
+          <option value="auto">auto (stddev 2σ)</option>
+          <option value="custom">custom (rescale)</option>
+          <option value="minmax">min/max</option>
+          <option value="percent">percentile</option>
+          <option value="stddev">mean ± kσ</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="stretchArg" id="stretchArgLabel">pc / σ</label>
+        <input id="stretchArg" type="text" autocomplete="off" spellcheck="false"
+               placeholder="2,98 or 2.5">
+      </div>
       <div class="field wide">
         <label for="rescale">Rescale</label>
         <input id="rescale" name="rescale" type="text" autocomplete="off" spellcheck="false">
@@ -187,6 +202,8 @@
       const controls = {
         dataset: document.getElementById("dataset"),
         colormap: document.getElementById("colormap"),
+        stretch: document.getElementById("stretch"),
+        stretchArg: document.getElementById("stretchArg"),
         rescale: document.getElementById("rescale"),
         bidx: document.getElementById("bidx"),
         resampling: document.getElementById("resampling"),
@@ -195,6 +212,11 @@
       };
 
       controls.colormap.value = pageParams.get("colormap_name") ?? "";
+      controls.stretch.value =
+        pageParams.get("stretch") ??
+        (pageParams.getAll("rescale").length ? "custom" : "auto");
+      controls.stretchArg.value =
+        pageParams.get("pc") ?? pageParams.get("sigma") ?? "";
       controls.rescale.value = pageParams.getAll("rescale").join(";") || "0,255;0,255;0,255";
       controls.bidx.value = pageParams.getAll("bidx").join(",") || "1,2,3";
       controls.resampling.value = pageParams.get("resampling") ?? "bilinear";
@@ -250,7 +272,22 @@
           params.set("dataset", controls.dataset.value);
         }
         appendRepeated(params, "bidx", controls.bidx.value, ",");
-        appendRepeated(params, "rescale", controls.rescale.value, ";");
+        // Stretch priority mirrors the server: custom rescale > stretch
+        // mode > auto (no params → server default stddev 2σ).
+        const mode = controls.stretch.value;
+        const arg = controls.stretchArg.value.trim();
+        if (mode === "custom") {
+          appendRepeated(params, "rescale", controls.rescale.value, ";");
+        } else if (mode === "minmax") {
+          params.set("stretch", "minmax");
+        } else if (mode === "percent") {
+          params.set("stretch", "percent");
+          if (arg) params.set("pc", arg);
+        } else if (mode === "stddev") {
+          params.set("stretch", "stddev");
+          if (arg) params.set("sigma", arg);
+        }
+        // mode === "auto": send neither rescale nor stretch.
         if (controls.colormap.value) {
           params.set("colormap_name", controls.colormap.value);
         }
@@ -427,6 +464,22 @@
         document.getElementById("style-form").requestSubmit();
         flyToDataset();
       });
+
+      // Reflect which companion arg the chosen stretch mode consumes,
+      // and disable the rescale box unless in custom mode.
+      function syncStretchUi() {
+        const m = controls.stretch.value;
+        const label = document.getElementById("stretchArgLabel");
+        label.textContent = m === "percent" ? "pc (lo,hi)"
+          : m === "stddev" ? "σ (k)" : "pc / σ";
+        controls.stretchArg.disabled = !(m === "percent" || m === "stddev");
+        controls.rescale.disabled = m !== "custom";
+      }
+      controls.stretch.addEventListener("change", () => {
+        syncStretchUi();
+        document.getElementById("style-form").requestSubmit();
+      });
+      syncStretchUi();
 
       map.on("moveend", syncPermalink);
       map.on("load", syncStatus);
