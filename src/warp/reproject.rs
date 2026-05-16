@@ -191,19 +191,42 @@ pub fn warp(
     // the row dimension, so we collect per-row (mask_row, [band_row,...])
     // results and copy into `out`/`mask` after the parallel section.
     use rayon::prelude::*;
+    let is_average = matches!(resampling, Resampling::Average);
     let rows: Vec<(usize, Vec<bool>, Vec<Vec<f64>>)> = (0..dst_h)
         .into_par_iter()
         .map(|r| {
             let coords = row_src_coords(r, dst_h, dst_w, &col_table, &grid_src_pix);
-
             let mut mask_row = vec![true; dst_w];
             let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
 
-            for (c, &(sc, sr)) in coords.iter().enumerate() {
-                mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
-                for (b, band_view) in band_views.iter().enumerate() {
-                    band_rows[b][c] =
-                        resampling.sample_masked(*band_view, src_mask_view, sc, sr, fill);
+            if is_average {
+                let r1 = (r + 1).min(dst_h - 1);
+                let coords_r1 = row_src_coords(r1, dst_h, dst_w, &col_table, &grid_src_pix);
+                for c in 0..dst_w {
+                    let (sc, sr) = coords[c];
+                    // Column-step Jacobian (neighbour difference; one-sided at edge).
+                    let cn = (c + 1).min(dst_w - 1);
+                    let dx_col = (coords[cn].0 - sc).abs();
+                    let dy_col = (coords[cn].1 - sr).abs();
+                    // Row-step Jacobian.
+                    let dx_row = (coords_r1[c].0 - sc).abs();
+                    let dy_row = (coords_r1[c].1 - sr).abs();
+                    let rx = (dx_col.max(dx_row) * 0.5).max(1e-6);
+                    let ry = (dy_col.max(dy_row) * 0.5).max(1e-6);
+
+                    mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
+                    for (b, band_view) in band_views.iter().enumerate() {
+                        band_rows[b][c] = resampling.sample_average(
+                            *band_view, src_mask_view, sc, sr, rx, ry, fill);
+                    }
+                }
+            } else {
+                for (c, &(sc, sr)) in coords.iter().enumerate() {
+                    mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
+                    for (b, band_view) in band_views.iter().enumerate() {
+                        band_rows[b][c] =
+                            resampling.sample_masked(*band_view, src_mask_view, sc, sr, fill);
+                    }
                 }
             }
             (r, mask_row, band_rows)
@@ -707,5 +730,25 @@ mod tests {
         let src = dummy_src(Crs::epsg(3857));
         let out = warp(&src, &Crs::epsg(3857), src.bbox, 4, 4, Resampling::Nearest).unwrap();
         assert_eq!(out.crs, src.crs);
+    }
+
+    #[test]
+    fn average_cross_crs_downsample_within_source_range() {
+        let arr = Array3::<f64>::from_shape_fn((1, 8, 8), |(_, y, x)| (y * 8 + x) as f64);
+        let src = ImageData {
+            pixels: PixelData::F64(arr),
+            mask: None,
+            bbox: Bbox::new(0.0, 0.0, 8.0, 8.0),
+            crs: Crs::epsg(4326),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 8.0, 0.0, -1.0]),
+            nodata: None,
+        };
+        let out = warp(&src, &Crs::epsg(3857), src.bbox, 4, 4, Resampling::Average).unwrap();
+        assert_eq!(out.pixels.height(), 4);
+        assert_eq!(out.pixels.width(), 4);
+        let vals = out.pixels.as_f64();
+        for &v in vals.iter() {
+            assert!(v >= 0.0 && v <= 63.0, "avg {v} out of source range");
+        }
     }
 }
