@@ -17,6 +17,10 @@ pub enum Resampling {
     /// Lanczos3 windowed sinc (6-tap). Highest quality, slowest of the
     /// SIMD kernels. Matches titiler's `resampling=lanczos`.
     Lanczos,
+    /// Box mean over the source footprint a destination pixel covers.
+    /// Downsampling antialiasing for continuous data; matches titiler /
+    /// gdalwarp `resampling=average`.
+    Average,
 }
 
 impl Resampling {
@@ -27,6 +31,7 @@ impl Resampling {
             "cubic" | "bicubic" => Some(Self::Cubic),
             "cubic_spline" | "mitchell" => Some(Self::CubicSpline),
             "lanczos" | "lanczos3" => Some(Self::Lanczos),
+            "average" => Some(Self::Average),
             _ => None,
         }
     }
@@ -103,7 +108,7 @@ impl Resampling {
             // Cross-CRS sampler: all non-nearest kernels share the 4-tap
             // bilinear path (PROJ error dominates; the SIMD wide kernels
             // are exercised only in the same-CRS / subtile-affine fast path).
-            Self::Cubic | Self::Bilinear | Self::CubicSpline | Self::Lanczos => {
+            Self::Cubic | Self::Bilinear | Self::CubicSpline | Self::Lanczos | Self::Average => {
                 let c0 = cf.floor() as usize;
                 let r0 = rf.floor() as usize;
                 let c1 = (c0 + 1).min(w as usize - 1);
@@ -192,5 +197,6 @@ mod tests {
         assert_eq!(Resampling::parse("cubic"), Some(Resampling::Cubic));
         assert_eq!(Resampling::parse("bicubic"), Some(Resampling::Cubic));
         assert_eq!(Resampling::parse("foo"), None);
+        assert_eq!(Resampling::parse("average"), Some(Resampling::Average));
     }
 }
