@@ -185,6 +185,10 @@ impl Resampling {
         if w == 0 || h == 0 {
             return fill;
         }
+        // PROJ can emit NaN/inf for unmapped pixels; treat as no data.
+        if !sc.is_finite() || !sr.is_finite() {
+            return fill;
+        }
         // Sub-pixel footprint => bilinear (reuses edge-clamp + mask logic).
         if rx < 0.5 && ry < 0.5 {
             return Self::Bilinear.sample_masked(view, valid, sc, sr, fill);
@@ -197,7 +201,7 @@ impl Resampling {
         let contig = view.as_slice();
         let mask_contig = valid.as_ref().and_then(|m| m.as_slice());
         let mut sum = 0.0;
-        let mut count = 0u32;
+        let mut count = 0usize;
         for r in r_lo..=r_hi {
             for c in c_lo..=c_hi {
                 let ok = match (mask_contig, valid) {
@@ -279,6 +283,14 @@ mod tests {
         let f = Resampling::Average.sample_average(
             a.view(), Some(none_valid.view()), 1.5, 1.5, 1.5, 1.5, -7.0);
         assert_eq!(f, -7.0); // all invalid => fill
+    }
+
+    #[test]
+    fn average_nan_coords_return_fill() {
+        let a = ndarray::Array2::from_elem((4, 4), 5.0);
+        let v = Resampling::Average.sample_average(
+            a.view(), None, f64::NAN, 2.0, 2.0, 2.0, -9.0);
+        assert_eq!(v, -9.0);
     }
 
     #[test]
