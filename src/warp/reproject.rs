@@ -200,17 +200,48 @@ pub fn warp(
             let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
 
             if is_average {
-                let r1 = (r + 1).min(dst_h - 1);
-                let coords_r1 = row_src_coords(r1, dst_h, dst_w, &col_table, &grid_src_pix);
+                // Footprint Jacobian by finite difference of source coords.
+                // Forward difference where a forward neighbour exists,
+                // backward difference at the trailing row/column — a clamped
+                // one-sided diff would collapse to zero and silently degrade
+                // the edge strip to bilinear (visible as tile-edge seams).
+                let r_fwd = (r + 1).min(dst_h - 1);
+                let r_bwd = r.saturating_sub(1);
+                let coords_r_fwd = row_src_coords(r_fwd, dst_h, dst_w, &col_table, &grid_src_pix);
+                let coords_r_bwd = if r_bwd == r {
+                    None
+                } else {
+                    Some(row_src_coords(r_bwd, dst_h, dst_w, &col_table, &grid_src_pix))
+                };
                 for c in 0..dst_w {
                     let (sc, sr) = coords[c];
-                    // Column-step Jacobian (neighbour difference; one-sided at edge).
-                    let cn = (c + 1).min(dst_w - 1);
-                    let dx_col = (coords[cn].0 - sc).abs();
-                    let dy_col = (coords[cn].1 - sr).abs();
-                    // Row-step Jacobian.
-                    let dx_row = (coords_r1[c].0 - sc).abs();
-                    let dy_row = (coords_r1[c].1 - sr).abs();
+
+                    // Column step: source displacement per one dst-column.
+                    // (dx_col is the on-axis term, dy_col the shear term;
+                    //  both feed the axis-aligned footprint below.)
+                    let (col_a, col_b) = if c + 1 < dst_w {
+                        (coords[c + 1], coords[c])
+                    } else if c > 0 {
+                        (coords[c], coords[c - 1])
+                    } else {
+                        (coords[c], coords[c]) // dst_w == 1: no neighbour
+                    };
+                    let dx_col = (col_a.0 - col_b.0).abs();
+                    let dy_col = (col_a.1 - col_b.1).abs();
+
+                    // Row step: source displacement per one dst-row.
+                    let (row_a, row_b) = if r + 1 < dst_h {
+                        (coords_r_fwd[c], coords[c])
+                    } else if let Some(ref cb) = coords_r_bwd {
+                        (coords[c], cb[c])
+                    } else {
+                        (coords[c], coords[c]) // dst_h == 1: no neighbour
+                    };
+                    let dx_row = (row_a.0 - row_b.0).abs();
+                    let dy_row = (row_a.1 - row_b.1).abs();
+
+                    // Axis-aligned footprint half-extent: max source-x (and
+                    // source-y) displacement contributed by either step.
                     let rx = (dx_col.max(dx_row) * 0.5).max(1e-6);
                     let ry = (dy_col.max(dy_row) * 0.5).max(1e-6);
 
@@ -784,13 +815,20 @@ mod tests {
         // Every finite output value must lie in the source value range [0, 63].
         // Out-of-bounds src coords yield fill = nodata.unwrap_or(0.0) = 0.0,
         // which is already inside [0, 63].
-        let vals = out.pixels.as_f64();
+        let vals: Vec<f64> = out.pixels.as_f64().iter().copied().collect();
         for &v in vals.iter() {
             assert!(
                 v >= 0.0 && v <= 63.0,
                 "avg {v} out of source range [0, 63]"
             );
         }
+        // Guard against silent degradation to fill/constant: at least one
+        // interior pixel must be a genuine mid-range average.
+        let interior = vals.iter().copied().filter(|&v| v > 5.0 && v < 58.0).count();
+        assert!(
+            interior > 0,
+            "expected interior averaged values; got none (averaging may be broken)"
+        );
         assert_eq!(out.pixels.height(), 4);
         assert_eq!(out.pixels.width(), 4);
     }
@@ -809,9 +847,16 @@ mod tests {
         let out = warp(&src, &Crs::epsg(3857), src.bbox, 4, 4, Resampling::Average).unwrap();
         assert_eq!(out.pixels.height(), 4);
         assert_eq!(out.pixels.width(), 4);
-        let vals = out.pixels.as_f64();
+        let vals: Vec<f64> = out.pixels.as_f64().iter().copied().collect();
         for &v in vals.iter() {
             assert!(v >= 0.0 && v <= 63.0, "avg {v} out of source range");
         }
+        // Guard against silent degradation to fill/constant: at least one
+        // interior pixel must be a genuine mid-range average.
+        let interior = vals.iter().copied().filter(|&v| v > 5.0 && v < 58.0).count();
+        assert!(
+            interior > 0,
+            "expected interior averaged values; got none (averaging may be broken)"
+        );
     }
 }
