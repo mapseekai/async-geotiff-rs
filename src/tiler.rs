@@ -471,4 +471,18 @@ mod tests {
         let bbox = Bbox::new(0.0, -256.0, 512.0, 256.0);
         assert_eq!(Tiler::passthrough_window(&gt, &bbox, 256), None);
     }
+
+    #[test]
+    fn u8_default_request_keeps_rescale_empty() {
+        // effective_compiled's u8 short-circuit is reached when:
+        //   rescale empty  &&  stretch_kind None  &&  PixelData::U8
+        // We assert the decision predicate here (pure, no IO):
+        use crate::style::TileStyle;
+        let style = TileStyle::from_query("").unwrap();
+        assert!(style.rescale.is_empty());
+        assert!(style.resolved_stretch().unwrap().is_none());
+        // The combination above + U8 → effective_compiled returns the
+        // input Arc unchanged (verified by the full-suite run, which
+        // exercises real u8 fixtures through render()).
+    }
 }
