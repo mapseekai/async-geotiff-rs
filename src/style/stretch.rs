@@ -161,7 +161,13 @@ mod tests {
 
     #[test]
     fn bidx_out_of_range_reuses_last_band() {
-        let r = resolve_rescale(&StretchSpec::MinMax, &ds(1.0, 9.0, 5.0, 1.0), &[0, 0, 0]);
-        assert_eq!(r.len(), 3);
+        // Band index 5 is out of range for a 1-band dataset → must fall
+        // back to the last (only) band's stats, not panic.
+        let stats = ds(1.0, 9.0, 5.0, 1.0);
+        let r = resolve_rescale(&StretchSpec::MinMax, &stats, &[0, 5]);
+        assert_eq!(r.len(), 2);
+        // Out-of-range band 5 reused last band → same range as band 0.
+        assert_eq!(r[0], r[1]);
+        assert_eq!(r[1], (1.0, 9.0));
     }
 }
