@@ -54,6 +54,24 @@ fn bench(c: &mut Criterion) {
         b.iter(|| black_box(sweep(t, Some(tm))))
     });
 
+    // Average kernel: 512 -> 256 downsample, ~2px footprint.
+    g.bench_function("average_downsample", |b| {
+        b.iter(|| {
+            let kernel = Resampling::Average;
+            let mut acc = 0.0;
+            let scale = SRC as f64 / DST as f64;
+            for r in 0..DST {
+                for c in 0..DST {
+                    let sc = (c as f64 + 0.5) * scale;
+                    let sr = (r as f64 + 0.5) * scale;
+                    acc += kernel.sample_average(
+                        base.view(), None, sc, sr, scale * 0.5, scale * 0.5, 0.0);
+                }
+            }
+            black_box(acc)
+        })
+    });
+
     g.finish();
 }
 
