@@ -37,6 +37,7 @@ pub fn parse_stretch_kind(
         }
         "stddev" => {
             let k = sigma.unwrap_or(2.0);
+            // `!(k > 0.0)` (not `k <= 0.0`) so NaN is also rejected.
             if !(k > 0.0) {
                 return Err(AgError::query("sigma", format!("must be > 0, got {k}")));
             }
@@ -81,5 +82,7 @@ mod tests {
         assert!(parse_stretch_kind("percent", Some((90.0, 10.0)), None).is_err());
         assert!(parse_stretch_kind("percent", Some((-1.0, 50.0)), None).is_err());
         assert!(parse_stretch_kind("stddev", None, Some(0.0)).is_err());
+        assert!(parse_stretch_kind("percent", Some((50.0, 50.0)), None).is_err()); // lo == hi
+        assert!(parse_stretch_kind("percent", Some((0.0, 100.0)), None).is_ok());  // boundary ok
     }
 }
