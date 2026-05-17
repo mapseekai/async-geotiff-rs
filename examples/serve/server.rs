@@ -88,13 +88,13 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route(
-            "/tiles/:tms/:z/:x/:ye",
+            "/tiles/{tms}/{z}/{x}/{ye}",
             get(tile_handler).options(cors_preflight),
         )
         .route("/datasets", get(datasets_handler))
         .route("/bounds", get(bounds_handler))
         .route(
-            "/data/:name",
+            "/data/{name}",
             get(data_file_handler)
                 .head(data_file_handler)
                 .options(cors_preflight),
@@ -226,7 +226,7 @@ fn parse_byte_range(h: &str, total: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-/// `GET /data/:name` serves a discovered local `*.tif` with bounded `Range`
+/// `GET /data/{name}` serves a discovered local `*.tif` with bounded `Range`
 /// support so object_store's HTTP store can do ranged reads. Only names in
 /// the startup dataset list are served.
 pub async fn data_file_handler(
@@ -364,4 +364,15 @@ fn with_cors(mut response: Response) -> Response {
     );
     headers.insert("access-control-max-age", HeaderValue::from_static("86400"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn router_builds_with_axum_08_capture_syntax() {
+        let state = AppState::new(None, None, Vec::new(), "http://127.0.0.1:0");
+        let _router = router(state);
+    }
 }
