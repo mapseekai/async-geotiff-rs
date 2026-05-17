@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use async_tiff::Tile;
 use ndarray::Array2;
@@ -49,10 +50,11 @@ fn decode_window_sync(job: DecodeWindowJob) -> AgResult<(PixelData, Option<Array
         height,
     } = job;
 
-    let registry = async_tiff::decoder::DecoderRegistry::default();
+    static DECODERS: OnceLock<async_tiff::decoder::DecoderRegistry> = OnceLock::new();
+    let registry = DECODERS.get_or_init(async_tiff::decoder::DecoderRegistry::default);
     let data_arrays: Vec<async_tiff::Array> = data_tiles
         .into_iter()
-        .map(|t| t.decode(&registry))
+        .map(|t| t.decode(registry))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| AgError::Tiff(format!("decode: {e}")))?;
     let stitched = stitch_with_info(
@@ -68,7 +70,7 @@ fn decode_window_sync(job: DecodeWindowJob) -> AgResult<(PixelData, Option<Array
         (Some(tiles), Some(info)) => {
             let mask_arrays: Vec<async_tiff::Array> = tiles
                 .into_iter()
-                .map(|t| t.decode(&registry))
+                .map(|t| t.decode(registry))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| AgError::Tiff(format!("decode mask: {e}")))?;
             Some(stitch_mask_with_info(

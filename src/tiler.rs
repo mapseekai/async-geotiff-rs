@@ -419,12 +419,19 @@ fn empty_tile(size: usize) -> AgResult<Bytes> {
     static CACHE: OnceLock<RwLock<HashMap<usize, Bytes>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
 
-    if let Some(bytes) = cache.read().unwrap().get(&size) {
+    if let Some(bytes) = cache
+        .read()
+        .map_err(|_| AgError::Tiff("empty tile cache read lock poisoned".into()))?
+        .get(&size)
+    {
         return Ok(bytes.clone());
     }
     let rgba = ndarray::Array3::<u8>::zeros((size, size, 4));
     let png = crate::render::encode::encode_png(&rgba)?;
-    cache.write().unwrap().insert(size, png.clone());
+    cache
+        .write()
+        .map_err(|_| AgError::Tiff("empty tile cache write lock poisoned".into()))?
+        .insert(size, png.clone());
     Ok(png)
 }
 

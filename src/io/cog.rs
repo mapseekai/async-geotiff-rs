@@ -20,7 +20,7 @@ use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
 use crate::io::cache::{build_window_cache, CacheConfig, WindowCache, WindowKey};
 use crate::io::decode::{decode_window, DecodeWindowJob};
-use crate::io::window::{tile_range_for_window, IfdInfo};
+use crate::io::window::{tile_range_for_window, validate_window_shape, IfdInfo};
 use crate::pixel::ImageData;
 
 #[cfg(test)]
@@ -303,6 +303,9 @@ impl CogReader {
         width: u64,
         height: u64,
     ) -> AgResult<Arc<ImageData>> {
+        validate_window_shape(width, height)?;
+        checked_window_end(col_off, width, "column")?;
+        checked_window_end(row_off, height, "row")?;
         let key = WindowKey {
             level,
             col: col_off,
@@ -353,19 +356,19 @@ impl CogReader {
 
         // I/O: ranged HTTP fetch (object_store handles coalescing). Stays async.
         let t_fetch = std::time::Instant::now();
-        let data_tiles = ifd
-            .fetch_tiles(&coords, &self.reader)
-            .await
-            .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
-        let (mask_tiles_opt, mask_info_opt) = if let Some(mask_ifd) = self.mask_ifd(level)? {
-            let tiles = mask_ifd
-                .fetch_tiles(&coords, &self.reader)
-                .await
-                .map_err(|e| AgError::Tiff(format!("fetch mask tiles: {e}")))?;
-            (Some(tiles), Some(IfdInfo::from(mask_ifd)))
-        } else {
-            (None, None)
-        };
+        let data_fetch = ifd.fetch_tiles(&coords, &self.reader);
+        let (data_tiles, mask_tiles_opt, mask_info_opt) =
+            if let Some(mask_ifd) = self.mask_ifd(level)? {
+                let mask_fetch = mask_ifd.fetch_tiles(&coords, &self.reader);
+                let (data_tiles, mask_tiles) = tokio::try_join!(data_fetch, mask_fetch)
+                    .map_err(|e| AgError::Tiff(format!("fetch tiles: {e}")))?;
+                (data_tiles, Some(mask_tiles), Some(IfdInfo::from(mask_ifd)))
+            } else {
+                let data_tiles = data_fetch
+                    .await
+                    .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
+                (data_tiles, None, None)
+            };
 
         let dur_fetch = t_fetch.elapsed();
 
@@ -414,7 +417,7 @@ impl CogReader {
 
         let level_transform = self.level_transform(level)?;
         let window_transform = level_transform.translated(col_off as f64, row_off as f64);
-        let bbox_world = transform_bbox(level_transform, col_off, row_off, width, height);
+        let bbox_world = transform_bbox(level_transform, col_off, row_off, width, height)?;
         let nodata = self
             .data_ifd(level)?
             .gdal_nodata()
@@ -461,18 +464,26 @@ impl CogReader {
 /// GeoTransform. Previously only sampled two opposite corners, which produced
 /// the wrong bbox for rotated COGs (where the world-space pixel grid is not
 /// axis-aligned).
-fn transform_bbox(transform: GeoTransform, col: i64, row: i64, w: u64, h: u64) -> Bbox {
+fn checked_window_end(offset: i64, len: u64, axis: &'static str) -> AgResult<i64> {
+    let len = i64::try_from(len)
+        .map_err(|_| AgError::Tiff(format!("{axis} window length exceeds i64")))?;
+    offset
+        .checked_add(len)
+        .ok_or_else(|| AgError::Tiff(format!("{axis} window end overflows i64")))
+}
+
+fn transform_bbox(transform: GeoTransform, col: i64, row: i64, w: u64, h: u64) -> AgResult<Bbox> {
     let c0 = col as f64;
     let r0 = row as f64;
-    let c1 = (col + w as i64) as f64;
-    let r1 = (row + h as i64) as f64;
+    let c1 = checked_window_end(col, w, "column")? as f64;
+    let r1 = checked_window_end(row, h, "row")? as f64;
     let corners = [
         transform.forward(c0, r0),
         transform.forward(c1, r0),
         transform.forward(c1, r1),
         transform.forward(c0, r1),
     ];
-    Bbox::from_corners(&corners)
+    Ok(Bbox::from_corners(&corners))
 }
 
 /// Defaults tuned for COG tile servers: keep many idle keep-alive sockets per
@@ -697,7 +708,7 @@ mod tests {
 
         // The fix: `Path::from_url_path` decodes the URL-encoded path, so
         // object_store re-encodes it exactly once for the loopback GET and
-        // the server's `/data/:name` handler sees the original filename.
+        // the server's `/data/{name}` handler sees the original filename.
         assert_eq!(
             Path::from_url_path(&path).unwrap().as_ref(),
             "data/测试-中文.tif"

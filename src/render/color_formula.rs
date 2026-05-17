@@ -52,6 +52,26 @@ pub fn parse(input: &str) -> AgResult<Vec<Op>> {
             rest.trim()
         )));
     }
+    for op in &ops {
+        match *op {
+            Op::Gamma { value, .. } if !value.is_finite() || value <= 0.0 => {
+                return Err(AgError::ColorFormula(format!(
+                    "gamma must be finite and > 0, got {value}"
+                )));
+            }
+            Op::Sigmoidal { contrast, bias, .. } if !contrast.is_finite() || !bias.is_finite() => {
+                return Err(AgError::ColorFormula(
+                    "sigmoidal parameters must be finite".into(),
+                ));
+            }
+            Op::Saturation { factor } if !factor.is_finite() => {
+                return Err(AgError::ColorFormula(format!(
+                    "saturation must be finite, got {factor}"
+                )));
+            }
+            _ => {}
+        }
+    }
     Ok(ops)
 }
 
@@ -189,6 +209,12 @@ mod tests {
     fn parse_chain() {
         let ops = parse("gamma RG 1.2 sigmoidal B 5 0.5 saturation 1.3").unwrap();
         assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn rejects_non_positive_gamma() {
+        assert!(parse("gamma RGB 0").is_err());
+        assert!(parse("gamma RGB -1").is_err());
     }
 
     #[test]

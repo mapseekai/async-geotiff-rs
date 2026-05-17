@@ -192,10 +192,13 @@ pub fn warp(
     // results and copy into `out`/`mask` after the parallel section.
     use rayon::prelude::*;
     let is_average = matches!(resampling, Resampling::Average);
+    let coord_rows: Vec<Vec<(f64, f64)>> = (0..dst_h)
+        .map(|r| row_src_coords(r, dst_h, dst_w, &col_table, &grid_src_pix))
+        .collect();
     let rows: Vec<(usize, Vec<bool>, Vec<Vec<f64>>)> = (0..dst_h)
         .into_par_iter()
         .map(|r| {
-            let coords = row_src_coords(r, dst_h, dst_w, &col_table, &grid_src_pix);
+            let coords = &coord_rows[r];
             let mut mask_row = vec![true; dst_w];
             let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
 
@@ -207,18 +210,8 @@ pub fn warp(
                 // the edge strip to bilinear (visible as tile-edge seams).
                 let r_fwd = (r + 1).min(dst_h - 1);
                 let r_bwd = r.saturating_sub(1);
-                let coords_r_fwd = row_src_coords(r_fwd, dst_h, dst_w, &col_table, &grid_src_pix);
-                let coords_r_bwd = if r_bwd == r {
-                    None
-                } else {
-                    Some(row_src_coords(
-                        r_bwd,
-                        dst_h,
-                        dst_w,
-                        &col_table,
-                        &grid_src_pix,
-                    ))
-                };
+                let coords_r_fwd = &coord_rows[r_fwd];
+                let coords_r_bwd = (r_bwd != r).then_some(&coord_rows[r_bwd]);
                 for c in 0..dst_w {
                     let (sc, sr) = coords[c];
 
@@ -238,7 +231,7 @@ pub fn warp(
                     // Row step: source displacement per one dst-row.
                     let (row_a, row_b) = if r + 1 < dst_h {
                         (coords_r_fwd[c], coords[c])
-                    } else if let Some(ref cb) = coords_r_bwd {
+                    } else if let Some(cb) = coords_r_bwd {
                         (coords[c], cb[c])
                     } else {
                         (coords[c], coords[c]) // dst_h == 1: no neighbour
@@ -416,8 +409,6 @@ fn try_subtile_affine(
     let options = fr::ResizeOptions::new()
         .resize_alg(alg)
         .crop(crop_left, crop_top, crop_w, crop_h);
-    let mut resizer = fr::Resizer::new();
-
     // Dispatch on source dtype — same fan-out as warp_affine.
     let pixels = match &src.pixels {
         PixelData::U8(a) => PixelData::U8(resize_bands(
@@ -426,7 +417,6 @@ fn try_subtile_affine(
             dst_w,
             dst_h,
             &options,
-            &mut resizer,
             |b| b.iter().copied().collect::<Vec<u8>>(),
             |bytes| bytes.to_vec(),
         )?),
@@ -436,7 +426,6 @@ fn try_subtile_affine(
             dst_w,
             dst_h,
             &options,
-            &mut resizer,
             |b| {
                 let mut buf = vec![0u8; b.len() * 2];
                 bytemuck::cast_slice_mut::<u8, u16>(&mut buf)
@@ -451,7 +440,6 @@ fn try_subtile_affine(
             dst_w,
             dst_h,
             &options,
-            &mut resizer,
             |b| {
                 let mut buf = vec![0u8; b.len() * 4];
                 bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
@@ -468,7 +456,6 @@ fn try_subtile_affine(
                 dst_w,
                 dst_h,
                 &options,
-                &mut resizer,
                 |band| {
                     let mut buf = vec![0u8; band.len() * 4];
                     bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
@@ -556,8 +543,6 @@ fn warp_affine(
         crop_w_clamped,
         crop_h_clamped,
     );
-    let mut resizer = fr::Resizer::new();
-
     let pixels = match &src.pixels {
         PixelData::U8(a) => PixelData::U8(resize_bands(
             a,
@@ -565,7 +550,6 @@ fn warp_affine(
             dst_w,
             dst_h,
             &options,
-            &mut resizer,
             |b| b.iter().copied().collect::<Vec<u8>>(),
             |bytes| bytes.to_vec(),
         )?),
@@ -575,7 +559,6 @@ fn warp_affine(
             dst_w,
             dst_h,
             &options,
-            &mut resizer,
             |b| {
                 // Native u16 → bytes
                 let mut buf = vec![0u8; b.len() * 2];
@@ -591,7 +574,6 @@ fn warp_affine(
             dst_w,
             dst_h,
             &options,
-            &mut resizer,
             |b| {
                 let mut buf = vec![0u8; b.len() * 4];
                 bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
@@ -610,7 +592,6 @@ fn warp_affine(
                 dst_w,
                 dst_h,
                 &options,
-                &mut resizer,
                 |band| {
                     let mut buf = vec![0u8; band.len() * 4];
                     bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
@@ -645,10 +626,6 @@ fn warp_affine(
 /// SIMD path on a u8 (0/255) representation. Returns `None` when `src_mask`
 /// is `None`; this is the helper that closes the "mask dropped on fast
 /// path" correctness gap between the SIMD warp and the scalar fallback.
-/// Resample an `Array2<bool>` validity mask through the same crop+resize
-/// transform as the data bands, using `fast_image_resize`'s nearest-neighbour
-/// SIMD path on a u8 (0/255) representation. Closes the "mask dropped on
-/// fast path" correctness gap between SIMD warp and the scalar fallback.
 fn resample_mask_nearest(
     src_mask: Option<&ndarray::Array2<bool>>,
     crop: (f64, f64, f64, f64),
@@ -689,7 +666,6 @@ fn resize_bands<T: bytemuck::Pod + Default + Send + Sync>(
     dst_w: usize,
     dst_h: usize,
     options: &fast_image_resize::ResizeOptions,
-    _resizer: &mut fast_image_resize::Resizer,
     to_bytes: impl Fn(&ndarray::ArrayView2<T>) -> Vec<u8> + Send + Sync,
     from_bytes: impl Fn(&[u8]) -> Vec<T> + Send + Sync,
 ) -> AgResult<Array3<T>> {

@@ -153,36 +153,47 @@ pub fn parse_embedded_stats(
     smax: Option<&[u16]>,
     bands: usize,
 ) -> Option<DatasetStats> {
-    // Pull `<Item name="X" sample="N">V</Item>` into (name, sample, value).
     fn items(xml: &str) -> Vec<(String, usize, String)> {
-        let mut v = Vec::new();
-        for chunk in xml.split("<Item").skip(1) {
-            let Some(open_end) = chunk.find('>') else {
-                continue;
-            };
-            let attrs = &chunk[..open_end];
-            let body = &chunk[open_end + 1..];
-            let Some(close) = body.find("</Item>") else {
-                continue;
-            };
-            let value = body[..close].trim().to_string();
-            let name = attr(attrs, "name");
-            let sample = attr(attrs, "sample").parse::<usize>().unwrap_or(0);
-            if !name.is_empty() {
-                v.push((name, sample, value));
+        use quick_xml::events::Event;
+
+        let mut reader = quick_xml::Reader::from_str(xml);
+        reader.config_mut().trim_text(true);
+        let mut out = Vec::new();
+        let mut current: Option<(String, usize)> = None;
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) if e.name().as_ref() == b"Item" => {
+                    let mut name = String::new();
+                    let mut sample = 0usize;
+                    for attr in e.attributes().flatten() {
+                        let Ok(value) = attr.decode_and_unescape_value(reader.decoder()) else {
+                            continue;
+                        };
+                        match attr.key.as_ref() {
+                            b"name" => name = value.into_owned(),
+                            b"sample" => sample = value.parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                    current = (!name.is_empty()).then_some((name, sample));
+                }
+                Ok(Event::Text(e)) => {
+                    if let Some((name, sample)) = current.take() {
+                        if let Ok(value) = e.decode() {
+                            out.push((name, sample, value.trim().to_string()));
+                        }
+                    }
+                }
+                Ok(Event::End(e)) if e.name().as_ref() == b"Item" => {
+                    current = None;
+                }
+                Ok(Event::Eof) => break,
+                Err(_) => break,
+                _ => {}
             }
         }
-        v
-    }
-    fn attr(attrs: &str, key: &str) -> String {
-        let pat = format!("{key}=\"");
-        let Some(start) = attrs.find(&pat) else {
-            return String::new();
-        };
-        let rest = &attrs[start + pat.len()..];
-        rest.find('"')
-            .map(|e| rest[..e].to_string())
-            .unwrap_or_default()
+        out
     }
 
     let parsed = gdal_metadata.map(items).unwrap_or_default();

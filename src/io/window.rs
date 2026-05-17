@@ -8,6 +8,91 @@ use async_tiff::tags::PlanarConfiguration;
 use async_tiff::{Array, ImageFileDirectory, TypedArray};
 use ndarray::{s, Array2, Array3};
 
+fn checked_window_end(offset: i64, len: u64, axis: &'static str) -> AgResult<i64> {
+    let len = i64::try_from(len)
+        .map_err(|_| AgError::Tiff(format!("{axis} window length exceeds i64")))?;
+    offset
+        .checked_add(len)
+        .ok_or_else(|| AgError::Tiff(format!("{axis} window end overflows i64")))
+}
+
+#[derive(Clone, Copy)]
+struct TileCopyWindow {
+    src_r0: usize,
+    src_r1: usize,
+    src_c0: usize,
+    src_c1: usize,
+    dst_r0: usize,
+    dst_r1: usize,
+    dst_c0: usize,
+    dst_c1: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TileFootprint {
+    col: i64,
+    row: i64,
+    width: i64,
+    height: i64,
+}
+
+#[derive(Clone, Copy)]
+struct RequestedWindow {
+    col: i64,
+    row: i64,
+    col_end: i64,
+    row_end: i64,
+}
+
+fn tile_copy_window(tile: TileFootprint, requested: RequestedWindow) -> Option<TileCopyWindow> {
+    let world_r0 = tile.row.max(requested.row);
+    let world_r1 = tile.row.checked_add(tile.height)?.min(requested.row_end);
+    let world_c0 = tile.col.max(requested.col);
+    let world_c1 = tile.col.checked_add(tile.width)?.min(requested.col_end);
+    if world_r1 <= world_r0 || world_c1 <= world_c0 {
+        return None;
+    }
+    Some(TileCopyWindow {
+        src_r0: (world_r0 - tile.row) as usize,
+        src_r1: (world_r1 - tile.row) as usize,
+        src_c0: (world_c0 - tile.col) as usize,
+        src_c1: (world_c1 - tile.col) as usize,
+        dst_r0: (world_r0 - requested.row) as usize,
+        dst_r1: (world_r1 - requested.row) as usize,
+        dst_c0: (world_c0 - requested.col) as usize,
+        dst_c1: (world_c1 - requested.col) as usize,
+    })
+}
+
+fn tile_footprint(tile_col: i64, tile_row: i64, tile_w: i64, tile_h: i64) -> TileFootprint {
+    TileFootprint {
+        col: tile_col,
+        row: tile_row,
+        width: tile_w,
+        height: tile_h,
+    }
+}
+
+fn requested_window(col_off: i64, row_off: i64, col_end: i64, row_end: i64) -> RequestedWindow {
+    RequestedWindow {
+        col: col_off,
+        row: row_off,
+        col_end,
+        row_end,
+    }
+}
+
+pub(crate) fn validate_window_shape(width: u64, height: u64) -> AgResult<()> {
+    if width == 0 || height == 0 {
+        return Err(AgError::Tiff("window dimensions must be non-zero".into()));
+    }
+    i64::try_from(width).map_err(|_| AgError::Tiff("window width exceeds i64".into()))?;
+    i64::try_from(height).map_err(|_| AgError::Tiff("window height exceeds i64".into()))?;
+    usize::try_from(width).map_err(|_| AgError::Tiff("window width exceeds usize".into()))?;
+    usize::try_from(height).map_err(|_| AgError::Tiff("window height exceeds usize".into()))?;
+    Ok(())
+}
+
 /// Plain-data view of the IFD attributes stitch needs. Extracted up front so
 /// `stitch_with_info` can run inside `spawn_blocking` without holding any
 /// `&ImageFileDirectory` borrow into `self`.
@@ -34,6 +119,18 @@ impl From<&ImageFileDirectory> for IfdInfo {
     }
 }
 
+impl IfdInfo {
+    fn validate(self) -> AgResult<Self> {
+        if self.tile_width == 0 || self.tile_height == 0 {
+            return Err(AgError::Tiff("IFD has zero tile dimensions".into()));
+        }
+        if self.image_width == 0 || self.image_height == 0 {
+            return Err(AgError::Tiff("IFD has zero image dimensions".into()));
+        }
+        Ok(self)
+    }
+}
+
 /// Convert pixel window to inclusive tile coordinate range
 /// (tx_min..=tx_max, ty_min..=ty_max). Returns None if the IFD lacks tile dims.
 pub fn tile_range_for_window(
@@ -43,10 +140,11 @@ pub fn tile_range_for_window(
     width: u64,
     height: u64,
 ) -> Option<((u32, u32), (u32, u32))> {
-    let tw = tile_width(ifd) as i64;
-    let th = tile_height(ifd) as i64;
-    let col_end = col_off + width as i64;
-    let row_end = row_off + height as i64;
+    validate_window_shape(width, height).ok()?;
+    let tw = i64::from(tile_width(ifd)?);
+    let th = i64::from(tile_height(ifd)?);
+    let col_end = checked_window_end(col_off, width, "column").ok()?;
+    let row_end = checked_window_end(row_off, height, "row").ok()?;
     let tx0 = (col_off.max(0) / tw) as u32;
     let ty0 = (row_off.max(0) / th) as u32;
     let tx1 = ((col_end - 1).max(0) / tw) as u32;
@@ -73,7 +171,7 @@ pub fn stitch<A: Borrow<Array>>(
     stitch_with_info(
         arrays,
         coords,
-        &IfdInfo::from(ifd),
+        &IfdInfo::from(ifd).validate()?,
         col_off,
         row_off,
         width,
@@ -94,11 +192,16 @@ pub fn stitch_with_info<A: Borrow<Array>>(
     height: u64,
 ) -> AgResult<PixelData> {
     let planar = info.planar;
+    let info = info.validate()?;
+    validate_window_shape(width, height)?;
     let bands = info.bands;
     let dst_h = height as usize;
     let dst_w = width as usize;
     let tw = info.tile_width as i64;
     let th = info.tile_height as i64;
+    let row_end = checked_window_end(row_off, height, "row")?;
+    let col_end = checked_window_end(col_off, width, "column")?;
+    let requested = requested_window(col_off, row_off, col_end, row_end);
 
     // Determine output dtype from the first decoded array. All tiles in an
     // IFD share dtype, so this is safe.
@@ -130,25 +233,23 @@ pub fn stitch_with_info<A: Borrow<Array>>(
                 let s = typed_view.shape();
                 let (a_h, a_w) = (s[1] as i64, s[2] as i64);
 
-                let world_r0 = tile_row.max(row_off);
-                let world_r1 = (tile_row + a_h).min(row_off + height as i64);
-                let world_c0 = tile_col.max(col_off);
-                let world_c1 = (tile_col + a_w).min(col_off + width as i64);
-                if world_r1 <= world_r0 || world_c1 <= world_c0 {
+                let Some(win) =
+                    tile_copy_window(tile_footprint(tile_col, tile_row, a_w, a_h), requested)
+                else {
                     continue;
-                }
-                let src_r0 = (world_r0 - tile_row) as usize;
-                let src_r1 = (world_r1 - tile_row) as usize;
-                let src_c0 = (world_c0 - tile_col) as usize;
-                let src_c1 = (world_c1 - tile_col) as usize;
-                let dst_r0 = (world_r0 - row_off) as usize;
-                let dst_r1 = (world_r1 - row_off) as usize;
-                let dst_c0 = (world_c0 - col_off) as usize;
-                let dst_c1 = (world_c1 - col_off) as usize;
+                };
                 let band_take = bands.min(s[0]);
-                let src_sub = typed_view.slice(s![..band_take, src_r0..src_r1, src_c0..src_c1]);
-                out.slice_mut(s![..band_take, dst_r0..dst_r1, dst_c0..dst_c1])
-                    .assign(&src_sub);
+                let src_sub = typed_view.slice(s![
+                    ..band_take,
+                    win.src_r0..win.src_r1,
+                    win.src_c0..win.src_c1
+                ]);
+                out.slice_mut(s![
+                    ..band_take,
+                    win.dst_r0..win.dst_r1,
+                    win.dst_c0..win.dst_c1
+                ])
+                .assign(&src_sub);
             }
             Ok(PixelData::$wrap(out))
         }};
@@ -167,7 +268,7 @@ pub fn stitch_with_info<A: Borrow<Array>>(
         | TypedArray::UInt64(_)
         | TypedArray::Int64(_)
         | TypedArray::Bool(_) => {
-            stitch_upcast_to_f32(arrays, coords, info, col_off, row_off, width, height)
+            stitch_upcast_to_f32(arrays, coords, &info, col_off, row_off, width, height)
         }
     }
 }
@@ -222,9 +323,14 @@ fn stitch_upcast_to_f32<A: Borrow<Array>>(
     width: u64,
     height: u64,
 ) -> AgResult<PixelData> {
+    let info = info.validate()?;
+    validate_window_shape(width, height)?;
     let tw = info.tile_width as i64;
     let th = info.tile_height as i64;
     let bands = info.bands;
+    let row_end = checked_window_end(row_off, height, "row")?;
+    let col_end = checked_window_end(col_off, width, "column")?;
+    let requested = requested_window(col_off, row_off, col_end, row_end);
     let mut out = Array3::<f32>::zeros((bands, height as usize, width as usize));
     let planar = info.planar;
     for ((tx, ty), arr) in coords.iter().zip(arrays.iter()) {
@@ -243,24 +349,21 @@ fn stitch_upcast_to_f32<A: Borrow<Array>>(
         };
         let s = typed_f32.shape();
         let (a_h, a_w) = (s[1] as i64, s[2] as i64);
-        let world_r0 = tile_row.max(row_off);
-        let world_r1 = (tile_row + a_h).min(row_off + height as i64);
-        let world_c0 = tile_col.max(col_off);
-        let world_c1 = (tile_col + a_w).min(col_off + width as i64);
-        if world_r1 <= world_r0 || world_c1 <= world_c0 {
+        let Some(win) = tile_copy_window(tile_footprint(tile_col, tile_row, a_w, a_h), requested)
+        else {
             continue;
-        }
-        let src_r0 = (world_r0 - tile_row) as usize;
-        let src_r1 = (world_r1 - tile_row) as usize;
-        let src_c0 = (world_c0 - tile_col) as usize;
-        let src_c1 = (world_c1 - tile_col) as usize;
-        let dst_r0 = (world_r0 - row_off) as usize;
-        let dst_r1 = (world_r1 - row_off) as usize;
-        let dst_c0 = (world_c0 - col_off) as usize;
-        let dst_c1 = (world_c1 - col_off) as usize;
+        };
         let band_take = bands.min(s[0]);
-        out.slice_mut(s![..band_take, dst_r0..dst_r1, dst_c0..dst_c1])
-            .assign(&typed_f32.slice(s![..band_take, src_r0..src_r1, src_c0..src_c1]));
+        out.slice_mut(s![
+            ..band_take,
+            win.dst_r0..win.dst_r1,
+            win.dst_c0..win.dst_c1
+        ])
+        .assign(&typed_f32.slice(s![
+            ..band_take,
+            win.src_r0..win.src_r1,
+            win.src_c0..win.src_c1
+        ]));
     }
     Ok(PixelData::F32(out))
 }
@@ -277,7 +380,7 @@ pub fn stitch_mask<A: Borrow<Array>>(
     stitch_mask_with_info(
         arrays,
         coords,
-        &IfdInfo::from(ifd),
+        &IfdInfo::from(ifd).validate()?,
         col_off,
         row_off,
         width,
@@ -295,8 +398,13 @@ pub fn stitch_mask_with_info<A: Borrow<Array>>(
     width: u64,
     height: u64,
 ) -> AgResult<Array2<bool>> {
+    let info = info.validate()?;
+    validate_window_shape(width, height)?;
     let tw = info.tile_width as i64;
     let th = info.tile_height as i64;
+    let row_end = checked_window_end(row_off, height, "row")?;
+    let col_end = checked_window_end(col_off, width, "column")?;
+    let requested = requested_window(col_off, row_off, col_end, row_end);
     let mut out = Array2::<bool>::from_elem((height as usize, width as usize), true);
     for ((tx, ty), arr) in coords.iter().zip(arrays.iter()) {
         let arr = arr.borrow();
@@ -306,24 +414,13 @@ pub fn stitch_mask_with_info<A: Borrow<Array>>(
         let shape = mask.shape();
         let (a_h, a_w) = (shape[0] as i64, shape[1] as i64);
 
-        let world_r0 = tile_row.max(row_off);
-        let world_r1 = (tile_row + a_h).min(row_off + height as i64);
-        let world_c0 = tile_col.max(col_off);
-        let world_c1 = (tile_col + a_w).min(col_off + width as i64);
-        if world_r1 <= world_r0 || world_c1 <= world_c0 {
+        let Some(win) = tile_copy_window(tile_footprint(tile_col, tile_row, a_w, a_h), requested)
+        else {
             continue;
-        }
-        let src_r0 = (world_r0 - tile_row) as usize;
-        let src_r1 = (world_r1 - tile_row) as usize;
-        let src_c0 = (world_c0 - tile_col) as usize;
-        let src_c1 = (world_c1 - tile_col) as usize;
-        let dst_r0 = (world_r0 - row_off) as usize;
-        let dst_r1 = (world_r1 - row_off) as usize;
-        let dst_c0 = (world_c0 - col_off) as usize;
-        let dst_c1 = (world_c1 - col_off) as usize;
+        };
 
-        out.slice_mut(s![dst_r0..dst_r1, dst_c0..dst_c1])
-            .assign(&mask.slice(s![src_r0..src_r1, src_c0..src_c1]));
+        out.slice_mut(s![win.dst_r0..win.dst_r1, win.dst_c0..win.dst_c1])
+            .assign(&mask.slice(s![win.src_r0..win.src_r1, win.src_c0..win.src_c1]));
     }
     Ok(out)
 }
@@ -400,16 +497,20 @@ fn band_height_width(shape: [usize; 3], planar: PlanarConfiguration) -> (usize, 
     }
 }
 
-fn tile_width(ifd: &ImageFileDirectory) -> u32 {
-    ifd.tile_width().unwrap_or_else(|| ifd.image_width())
+fn tile_width(ifd: &ImageFileDirectory) -> Option<u32> {
+    let width = ifd.tile_width().unwrap_or_else(|| ifd.image_width());
+    (width > 0).then_some(width)
 }
 
-fn tile_height(ifd: &ImageFileDirectory) -> u32 {
-    ifd.tile_height().unwrap_or_else(|| ifd.image_height())
+fn tile_height(ifd: &ImageFileDirectory) -> Option<u32> {
+    let height = ifd.tile_height().unwrap_or_else(|| ifd.image_height());
+    (height > 0).then_some(height)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{requested_window, tile_copy_window, tile_footprint, validate_window_shape};
+
     fn pure(tw: i64, th: i64, col: i64, row: i64, w: u64, h: u64) -> ((i64, i64), (i64, i64)) {
         let ce = col + w as i64;
         let re = row + h as i64;
@@ -429,5 +530,24 @@ mod tests {
     fn straddling_window_spans_multiple_tiles() {
         let r = pure(256, 256, 200, 200, 200, 200);
         assert_eq!(r, ((0, 1), (0, 1)));
+    }
+
+    #[test]
+    fn rejects_windows_that_cannot_fit_index_types() {
+        assert!(validate_window_shape(i64::MAX as u64 + 1, 1).is_err());
+        assert!(validate_window_shape(1, 0).is_err());
+    }
+
+    #[test]
+    fn shared_tile_copy_window_clips_source_and_destination() {
+        let win = tile_copy_window(
+            tile_footprint(0, 0, 256, 256),
+            requested_window(200, 200, 400, 400),
+        )
+        .unwrap();
+        assert_eq!((win.src_c0, win.src_c1), (200, 256));
+        assert_eq!((win.src_r0, win.src_r1), (200, 256));
+        assert_eq!((win.dst_c0, win.dst_c1), (0, 56));
+        assert_eq!((win.dst_r0, win.dst_r1), (0, 56));
     }
 }

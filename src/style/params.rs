@@ -171,6 +171,12 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
         && style.color_formula.is_none();
 
     let composite = if let Some(name) = &style.colormap_name {
+        if style.rescale.len() > 1 {
+            return Err(AgError::query(
+                "rescale",
+                "colormap_name accepts at most one rescale range",
+            ));
+        }
         Composite::from_definition(
             &ColourDefinition::Named(name.clone()),
             style.rescale.first().map(|r| vec![r.0]),
@@ -299,6 +305,12 @@ mod tests {
         let s = TileStyle::from_query("colormap_name=viridis&rescale=0,1000").unwrap();
         let c = compile(&s).unwrap();
         assert_eq!(c.tile_size, 256);
+    }
+
+    #[test]
+    fn named_colormap_rejects_extra_rescale_ranges() {
+        let s = TileStyle::from_query("colormap_name=viridis&rescale=0,1000&rescale=1,2").unwrap();
+        assert!(compile(&s).is_err());
     }
 
     #[test]

@@ -81,10 +81,15 @@ impl Resampling {
         let contig = view.as_slice();
         let get = |r: usize, c: usize| -> f64 {
             match contig {
-                // SAFETY: callers derive `r`/`c` from `rf`/`cf`, which are
-                // clamped to `[0, h-1]` / `[0, w-1]`, so `r*w_us + c` is
-                // always `< h*w == contig.len()`.
-                Some(s) => unsafe { *s.get_unchecked(r * w_us + c) },
+                // SAFETY: `ArrayView2::as_slice()` only returns `Some` for
+                // standard contiguous layout, so physical row stride equals
+                // logical width. Callers derive `r`/`c` from `rf`/`cf`, which
+                // are clamped to `[0, h-1]` / `[0, w-1]`, so `r*w_us + c` is
+                // always `< h*w == s.len()`.
+                Some(s) => {
+                    debug_assert!(view.is_standard_layout());
+                    unsafe { *s.get_unchecked(r * w_us + c) }
+                }
                 None => view[[r, c]],
             }
         };
@@ -200,6 +205,10 @@ impl Resampling {
 
         let contig = view.as_slice();
         let mask_contig = valid.as_ref().and_then(|m| m.as_slice());
+        debug_assert!(contig.is_none() || view.is_standard_layout());
+        debug_assert!(valid
+            .as_ref()
+            .is_none_or(|m| mask_contig.is_none() || m.is_standard_layout()));
         let mut sum = 0.0;
         let mut count = 0usize;
         for r in r_lo..=r_hi {

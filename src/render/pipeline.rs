@@ -171,7 +171,10 @@ fn try_u8_rgb_fastpath(
     // H5 fixed in the f64 path.
     let mut rgba = Array3::<u8>::from_elem((h, w, 4), 0u8);
     let stride = h * w;
-    let src_slice = src.as_slice().expect("u8 PixelData contiguous");
+    let src_standard = src.as_standard_layout();
+    let src_slice = src_standard
+        .as_slice()
+        .expect("standard-layout u8 PixelData must be contiguous");
     let r_band = &src_slice[bidx[0] * stride..][..stride];
     let g_band = &src_slice[bidx[1] * stride..][..stride];
     let b_band = &src_slice[bidx[2] * stride..][..stride];
@@ -341,9 +344,18 @@ fn render_three_band(
         // Now: one linear sweep over the contiguous RGBA byte buffer.
         let mut rgba = Array3::<u8>::zeros((h, w, 4));
         let n = h * w;
-        let r_slice = r_band.as_slice().expect("r_band contiguous");
-        let g_slice = g_band.as_slice().expect("g_band contiguous");
-        let b_slice = b_band.as_slice().expect("b_band contiguous");
+        let r_standard = r_band.as_standard_layout();
+        let g_standard = g_band.as_standard_layout();
+        let b_standard = b_band.as_standard_layout();
+        let r_slice = r_standard
+            .as_slice()
+            .expect("standard-layout r_band must be contiguous");
+        let g_slice = g_standard
+            .as_slice()
+            .expect("standard-layout g_band must be contiguous");
+        let b_slice = b_standard
+            .as_slice()
+            .expect("standard-layout b_band must be contiguous");
         let rgba_slice = rgba
             .as_slice_mut()
             .expect("freshly-allocated RGBA standard layout");

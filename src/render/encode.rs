@@ -5,7 +5,7 @@
 //! configure `image::codecs::png::PngEncoder` with `CompressionType::Fast`
 //! and `FilterType::NoFilter` — roughly 3-5× faster than the default.
 
-use crate::error::AgResult;
+use crate::error::{AgError, AgResult};
 use bytes::Bytes;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder};
@@ -17,7 +17,11 @@ pub fn encode_png(rgba: &Array3<u8>) -> AgResult<Bytes> {
         rgba.shape()[1] as u32,
         rgba.shape()[2],
     );
-    assert_eq!(c, 4, "expected RGBA channels");
+    if c != 4 {
+        return Err(AgError::UnsupportedPixel(format!(
+            "expected RGBA channels, got {c}"
+        )));
+    }
     let standard = rgba.as_standard_layout();
     let raw = standard
         .as_slice()
@@ -47,5 +51,12 @@ mod tests {
         }
         let bytes = encode_png(&arr).unwrap();
         assert!(bytes.starts_with(b"\x89PNG"));
+    }
+
+    #[test]
+    fn rejects_non_rgba_without_panicking() {
+        let arr = Array3::<u8>::zeros((4, 4, 3));
+        let err = encode_png(&arr).unwrap_err();
+        assert!(matches!(err, AgError::UnsupportedPixel(_)));
     }
 }

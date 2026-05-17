@@ -25,6 +25,30 @@ can land in any release** and are called out explicitly under a
   `object_store::path::Path::from` re-encoded the `%` (double-encoding), so
   the fetch 404'd. Now uses `Path::from_url_path` (the decoding constructor)
   so the name round-trips. ASCII names were unaffected.
+- Hardened request and file-header edge cases: invalid window dimensions,
+  overflowing window endpoints, zero tile/image dimensions, and non-RGBA PNG
+  buffers now return structured errors instead of panicking or producing
+  wrapped coordinates.
+- Updated the resampler flat-slice fast paths with explicit standard-layout
+  debug assertions and safety comments so future strided-view changes cannot
+  accidentally rely on logical-width indexing.
+- Replaced hand-rolled GDAL metadata XML scanning with `quick-xml`, and
+  reject invalid color formula parameters such as non-positive gamma values.
+- Fixed WebMercator inverse conversion to clamp out-of-extent `y` values to
+  the supported latitude range, mirroring the forward projection clamp.
+
+### Changed
+
+- Mask and data tile reads are fetched concurrently for masked COGs, decoded
+  tile registries are shared across decode jobs, and Average reprojection
+  precomputes row coordinate grids to avoid repeated per-row allocations.
+- Empty transparent tile caching now handles poisoned locks as errors instead
+  of panicking, `resize_bands` no longer carries an unused `Resizer` parameter,
+  and duplicate window-copy clipping logic is centralized.
+- `colormap_name` now rejects multiple `rescale` ranges instead of silently
+  ignoring all but the first range.
+- Removed the unused `render::rescale` module; pipeline rendering remains the
+  single implementation path for rescaling.
 
 ## [0.0.2] - 2026-05-16
 

@@ -145,6 +145,7 @@ dependencies = [
  "object_store",
  "palette",
  "proj",
+ "quick-xml",
  "raffine",
  "rayon",
  "serde",

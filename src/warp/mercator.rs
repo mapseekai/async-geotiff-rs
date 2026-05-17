@@ -23,6 +23,7 @@ use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
 /// Equatorial radius used by EPSG:3857 (spherical Mercator on WGS-84 datum).
 const R: f64 = 6_378_137.0;
+const MAX_MERCATOR_M: f64 = R * PI;
 const DEG_TO_RAD: f64 = PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / PI;
 /// `atan(sinh(π))` in degrees — the latitude that maps to y = ±R·π in
@@ -48,7 +49,7 @@ pub fn lonlat_to_mercator(pts: &mut [(f64, f64)]) {
 pub fn mercator_to_lonlat(pts: &mut [(f64, f64)]) {
     for p in pts.iter_mut() {
         let x = p.0;
-        let y = p.1;
+        let y = p.1.clamp(-MAX_MERCATOR_M, MAX_MERCATOR_M);
         p.0 = (x / R) * RAD_TO_DEG;
         p.1 = (2.0 * (y / R).exp().atan() - FRAC_PI_2) * RAD_TO_DEG;
     }
@@ -81,6 +82,14 @@ mod tests {
         lonlat_to_mercator(&mut pts);
         // y at MAX_LAT_DEG is R*π (the WebMercator "pole" cap).
         assert_relative_eq!(pts[0].1, R * PI, epsilon = 1.0);
+    }
+
+    #[test]
+    fn inverse_clamps_to_webmercator_extent() {
+        let mut pts = [(0.0, R * PI * 2.0), (0.0, -R * PI * 2.0)];
+        mercator_to_lonlat(&mut pts);
+        assert_relative_eq!(pts[0].1, MAX_LAT_DEG, epsilon = 1e-12);
+        assert_relative_eq!(pts[1].1, -MAX_LAT_DEG, epsilon = 1e-12);
     }
 
     #[test]
