@@ -235,9 +235,7 @@ impl Tiler {
                         let dur_read = t.elapsed();
                         let t = Instant::now();
                         let compiled = compile_cached(style).await?;
-                        let compiled = self
-                            .effective_compiled(style, &compiled, &src)
-                            .await?;
+                        let compiled = self.effective_compiled(style, &compiled, &src).await?;
                         let dur_compile = t.elapsed();
                         let t = Instant::now();
                         let png = self
@@ -301,9 +299,7 @@ impl Tiler {
 
         let t = Instant::now();
         let compiled = compile_cached(style).await?;
-        let compiled = self
-            .effective_compiled(style, &compiled, &warped)
-            .await?;
+        let compiled = self.effective_compiled(style, &compiled, &warped).await?;
         let dur_compile = t.elapsed();
         let t = Instant::now();
         let png = self

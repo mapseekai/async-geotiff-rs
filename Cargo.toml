@@ -10,22 +10,22 @@ description = "Async COG → XYZ tile renderer (pure Rust, no GDAL)"
 async-tiff        = "0.3"
 object_store      = { version = "0.13", features = ["http", "aws"] }
 tile-grid         = "0.6"
-proj              = { version = "0.27", optional = true }
+proj              = { version = "0.31", optional = true }
 raffine           = "0.2"
-ndarray           = { version = "0.16", features = ["rayon"] }
-fast_image_resize = { version = "5", features = ["rayon"] }
+ndarray           = { version = "0.17", features = ["rayon"] }
+fast_image_resize = { version = "6", features = ["rayon"] }
 palette           = "0.7"
 colorous          = "1"
 enterpolation     = "0.3"
 image             = { version = "0.25", default-features = false, features = ["png"] }
 bytes             = "1"
 bytemuck          = "1"
-nom               = "7"
+nom               = "8"
 bitflags          = "2"
 moka              = { version = "0.12", features = ["future"] }
 tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 rayon             = "1"
-thiserror         = "1"
+thiserror         = "2"
 serde             = { version = "1", features = ["derive"] }
 serde_urlencoded  = "0.7"
 tracing           = "0.1"
@@ -33,12 +33,12 @@ url               = "2"
 
 [dev-dependencies]
 tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "fs", "io-util"] }
-criterion         = "0.5"
+criterion         = "0.8"
 tempfile          = "3"
 approx            = "0.5"
 serde_json        = "1"
 # HTTP layer lives only in examples/serve.rs, not the library core.
-axum              = "0.7"
+axum              = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 moka              = { version = "0.12", features = ["future"] }
 

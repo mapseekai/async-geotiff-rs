@@ -108,7 +108,11 @@ pub fn band_stats_from_f64(
                 max: 1.0,
                 mean: 0.0,
                 stddev: 0.0,
-                hist: Histogram { min: 0.0, max: 1.0, counts: vec![0; bins] },
+                hist: Histogram {
+                    min: 0.0,
+                    max: 1.0,
+                    counts: vec![0; bins],
+                },
             });
             continue;
         }
@@ -153,10 +157,14 @@ pub fn parse_embedded_stats(
     fn items(xml: &str) -> Vec<(String, usize, String)> {
         let mut v = Vec::new();
         for chunk in xml.split("<Item").skip(1) {
-            let Some(open_end) = chunk.find('>') else { continue };
+            let Some(open_end) = chunk.find('>') else {
+                continue;
+            };
             let attrs = &chunk[..open_end];
             let body = &chunk[open_end + 1..];
-            let Some(close) = body.find("</Item>") else { continue };
+            let Some(close) = body.find("</Item>") else {
+                continue;
+            };
             let value = body[..close].trim().to_string();
             let name = attr(attrs, "name");
             let sample = attr(attrs, "sample").parse::<usize>().unwrap_or(0);
@@ -168,9 +176,13 @@ pub fn parse_embedded_stats(
     }
     fn attr(attrs: &str, key: &str) -> String {
         let pat = format!("{key}=\"");
-        let Some(start) = attrs.find(&pat) else { return String::new() };
+        let Some(start) = attrs.find(&pat) else {
+            return String::new();
+        };
         let rest = &attrs[start + pat.len()..];
-        rest.find('"').map(|e| rest[..e].to_string()).unwrap_or_default()
+        rest.find('"')
+            .map(|e| rest[..e].to_string())
+            .unwrap_or_default()
     }
 
     let parsed = gdal_metadata.map(items).unwrap_or_default();
@@ -183,12 +195,10 @@ pub fn parse_embedded_stats(
 
     let mut out = Vec::with_capacity(bands);
     for b in 0..bands {
-        let min = get("STATISTICS_MINIMUM", b).or_else(|| {
-            smin.and_then(|s| s.get(b)).map(|&x| x as f64)
-        })?;
-        let max = get("STATISTICS_MAXIMUM", b).or_else(|| {
-            smax.and_then(|s| s.get(b)).map(|&x| x as f64)
-        })?;
+        let min = get("STATISTICS_MINIMUM", b)
+            .or_else(|| smin.and_then(|s| s.get(b)).map(|&x| x as f64))?;
+        let max = get("STATISTICS_MAXIMUM", b)
+            .or_else(|| smax.and_then(|s| s.get(b)).map(|&x| x as f64))?;
         let mean = get("STATISTICS_MEAN", b).unwrap_or((min + max) / 2.0);
         let stddev = get("STATISTICS_STDDEV", b).unwrap_or((max - min) / 4.0);
         let hist = {
@@ -205,11 +215,24 @@ pub fn parse_embedded_stats(
                 })
                 .filter(|c: &Vec<u64>| !c.is_empty())
                 .unwrap_or_else(|| vec![1]);
-            Histogram { min: hmin, max: hmax, counts }
+            Histogram {
+                min: hmin,
+                max: hmax,
+                counts,
+            }
         };
-        out.push(BandStat { min, max, mean, stddev, hist });
+        out.push(BandStat {
+            min,
+            max,
+            mean,
+            stddev,
+            hist,
+        });
     }
-    Some(DatasetStats { bands: out, provenance: Provenance::Exact })
+    Some(DatasetStats {
+        bands: out,
+        provenance: Provenance::Exact,
+    })
 }
 
 const HIST_BINS: usize = 256;
@@ -264,7 +287,11 @@ mod tests {
     #[test]
     fn quantile_linear_interpolates() {
         // 4 bins over [0,4], 10 counts each. p=50 → midpoint = 2.0.
-        let h = Histogram { min: 0.0, max: 4.0, counts: vec![10, 10, 10, 10] };
+        let h = Histogram {
+            min: 0.0,
+            max: 4.0,
+            counts: vec![10, 10, 10, 10],
+        };
         assert!((h.quantile(50.0) - 2.0).abs() < 1e-9);
         assert!((h.quantile(0.0) - 0.0).abs() < 1e-9);
         assert!((h.quantile(100.0) - 4.0).abs() < 1e-9);
@@ -273,14 +300,22 @@ mod tests {
     #[test]
     fn quantile_skewed() {
         // Mass concentrated in first bin: p=2 stays near min.
-        let h = Histogram { min: 0.0, max: 100.0, counts: vec![98, 1, 1, 0] };
+        let h = Histogram {
+            min: 0.0,
+            max: 100.0,
+            counts: vec![98, 1, 1, 0],
+        };
         assert!(h.quantile(2.0) < 25.0);
         assert!(h.quantile(98.0) >= 25.0);
     }
 
     #[test]
     fn quantile_degenerate_returns_min() {
-        let h = Histogram { min: 5.0, max: 5.0, counts: vec![0, 0] };
+        let h = Histogram {
+            min: 5.0,
+            max: 5.0,
+            counts: vec![0, 0],
+        };
         assert_eq!(h.quantile(50.0), 5.0);
     }
 
@@ -288,8 +323,7 @@ mod tests {
     fn kernel_basic_stats_and_nodata_exclusion() {
         use ndarray::Array3;
         // 1 band, 1x4: values 0(nodata), 2, 4, 6 → over {2,4,6}.
-        let arr =
-            Array3::from_shape_vec((1, 1, 4), vec![0.0, 2.0, 4.0, 6.0]).unwrap();
+        let arr = Array3::from_shape_vec((1, 1, 4), vec![0.0, 2.0, 4.0, 6.0]).unwrap();
         let s = band_stats_from_f64(&arr, Some(0.0), 8);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].min, 2.0);
@@ -351,9 +385,8 @@ mod tests {
         use std::sync::Arc;
 
         let fs = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
-        let p = Path::from(
-            "data/SVN3-01_20250814_L2D0000203064_01_6112500050210001-FUS_3857_cog.tif",
-        );
+        let p =
+            Path::from("data/SVN3-01_20250814_L2D0000203064_01_6112500050210001-FUS_3857_cog.tif");
         let reader = crate::io::CogReader::open_with_reader(ObjectReader::new(fs, p))
             .await
             .unwrap();

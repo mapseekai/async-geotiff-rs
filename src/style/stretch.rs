@@ -33,7 +33,10 @@ pub fn parse_stretch_kind(
         "percent" => {
             let (lo, hi) = pc.unwrap_or((2.0, 98.0));
             if !(0.0..=100.0).contains(&lo) || !(0.0..=100.0).contains(&hi) || lo >= hi {
-                return Err(AgError::query("pc", format!("invalid percentile {lo},{hi}")));
+                return Err(AgError::query(
+                    "pc",
+                    format!("invalid percentile {lo},{hi}"),
+                ));
             }
             Ok(Stretch::Percent { lo, hi })
         }
@@ -59,11 +62,7 @@ pub fn parse_stretch_kind(
 /// dataset); the caller treats that as "no usable stats" and falls
 /// back to [`fallback_rescale`] instead of this panicking on a
 /// per-request path.
-pub fn resolve_rescale(
-    spec: &Stretch,
-    stats: &DatasetStats,
-    bidx: &[usize],
-) -> Vec<(f64, f64)> {
+pub fn resolve_rescale(spec: &Stretch, stats: &DatasetStats, bidx: &[usize]) -> Vec<(f64, f64)> {
     if stats.bands.is_empty() {
         return Vec::new();
     }
@@ -79,9 +78,7 @@ pub fn resolve_rescale(
                 .unwrap_or(&stats.bands[0]);
             let (lo, mut hi) = match spec {
                 Stretch::MinMax => (s.min, s.max),
-                Stretch::Percent { lo, hi } => {
-                    (s.hist.quantile(*lo), s.hist.quantile(*hi))
-                }
+                Stretch::Percent { lo, hi } => (s.hist.quantile(*lo), s.hist.quantile(*hi)),
                 Stretch::StdDev { k } => (
                     (s.mean - k * s.stddev).max(s.min),
                     (s.mean + k * s.stddev).min(s.max),
@@ -156,7 +153,10 @@ mod tests {
 
     #[test]
     fn parses_three_modes_case_insensitive() {
-        assert_eq!(parse_stretch_kind("MinMax", None, None).unwrap(), Stretch::MinMax);
+        assert_eq!(
+            parse_stretch_kind("MinMax", None, None).unwrap(),
+            Stretch::MinMax
+        );
         assert_eq!(
             parse_stretch_kind("percent", Some((1.0, 99.0)), None).unwrap(),
             Stretch::Percent { lo: 1.0, hi: 99.0 }
@@ -186,7 +186,8 @@ mod tests {
         assert!(parse_stretch_kind("percent", Some((-1.0, 50.0)), None).is_err());
         assert!(parse_stretch_kind("stddev", None, Some(0.0)).is_err());
         assert!(parse_stretch_kind("percent", Some((50.0, 50.0)), None).is_err()); // lo == hi
-        assert!(parse_stretch_kind("percent", Some((0.0, 100.0)), None).is_ok());  // boundary ok
+        assert!(parse_stretch_kind("percent", Some((0.0, 100.0)), None).is_ok());
+        // boundary ok
     }
 
     fn ds(min: f64, max: f64, mean: f64, sd: f64) -> DatasetStats {
@@ -196,7 +197,11 @@ mod tests {
                 max,
                 mean,
                 stddev: sd,
-                hist: Histogram { min, max, counts: vec![1, 1, 1, 1] },
+                hist: Histogram {
+                    min,
+                    max,
+                    counts: vec![1, 1, 1, 1],
+                },
             }],
             provenance: Provenance::Estimated,
         }
@@ -211,11 +216,19 @@ mod tests {
     #[test]
     fn stddev_clamps_to_minmax() {
         // mean 565, sd 45, k 2 → (475, 655); within [79,1896] so unchanged.
-        let r = resolve_rescale(&Stretch::StdDev { k: 2.0 }, &ds(79.0, 1896.0, 565.0, 45.0), &[0]);
+        let r = resolve_rescale(
+            &Stretch::StdDev { k: 2.0 },
+            &ds(79.0, 1896.0, 565.0, 45.0),
+            &[0],
+        );
         assert!((r[0].0 - 475.0).abs() < 1e-9);
         assert!((r[0].1 - 655.0).abs() < 1e-9);
         // Huge k → clamps to min/max.
-        let r2 = resolve_rescale(&Stretch::StdDev { k: 999.0 }, &ds(79.0, 1896.0, 565.0, 45.0), &[0]);
+        let r2 = resolve_rescale(
+            &Stretch::StdDev { k: 999.0 },
+            &ds(79.0, 1896.0, 565.0, 45.0),
+            &[0],
+        );
         assert_eq!(r2, vec![(79.0, 1896.0)]);
     }
 

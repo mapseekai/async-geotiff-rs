@@ -11,7 +11,7 @@ use nom::{
     multi::{many1, many1_count},
     number::complete::double,
     sequence::preceded,
-    IResult,
+    IResult, Parser,
 };
 
 use crate::error::{AgError, AgResult};
@@ -43,7 +43,8 @@ bitflags! {
 
 pub fn parse(input: &str) -> AgResult<Vec<Op>> {
     let s = input.replace(',', " ");
-    let (rest, ops) = many1(preceded(multispace0, op))(s.as_str())
+    let (rest, ops) = many1(preceded(multispace0, op))
+        .parse(s.as_str())
         .map_err(|e| AgError::ColorFormula(format!("parse: {e}")))?;
     if !rest.trim().is_empty() {
         return Err(AgError::ColorFormula(format!(
@@ -55,7 +56,7 @@ pub fn parse(input: &str) -> AgResult<Vec<Op>> {
 }
 
 fn op(input: &str) -> IResult<&str, Op> {
-    alt((gamma, sigmoidal, saturation))(input)
+    alt((gamma, sigmoidal, saturation)).parse(input)
 }
 
 fn gamma(input: &str) -> IResult<&str, Op> {
@@ -95,7 +96,8 @@ fn saturation(input: &str) -> IResult<&str, Op> {
 fn bands(input: &str) -> IResult<&str, Bands> {
     let (i, raw) = recognize(many1_count(nom::character::complete::satisfy(|c| {
         matches!(c, 'r' | 'g' | 'b' | 'R' | 'G' | 'B' | '1' | '2' | '3')
-    })))(input)?;
+    })))
+    .parse(input)?;
     let mut bs = Bands::empty();
     for ch in raw.chars() {
         match ch.to_ascii_lowercase() {

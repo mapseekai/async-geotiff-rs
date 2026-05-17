@@ -81,10 +81,7 @@ impl TileStyle {
         match &self.stretch_kind {
             None => {
                 if self.stretch_pc.is_some() || self.stretch_sigma.is_some() {
-                    return Err(AgError::query(
-                        "stretch",
-                        "pc/sigma given without stretch=",
-                    ));
+                    return Err(AgError::query("stretch", "pc/sigma given without stretch="));
                 }
                 Ok(None)
             }
@@ -134,8 +131,7 @@ impl TileStyle {
                 ));
             }
             "sigma" => {
-                self.stretch_sigma =
-                    Some(v.parse().map_err(|_| AgError::query("sigma", v))?)
+                self.stretch_sigma = Some(v.parse().map_err(|_| AgError::query("sigma", v))?)
             }
             _ => {} // unknown params silently ignored (titiler-compatible)
         }

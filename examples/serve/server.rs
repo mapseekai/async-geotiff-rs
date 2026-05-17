@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
+use axum::http::Method;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::http::Method;
 use axum::{routing::get, Router};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 

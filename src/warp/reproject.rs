@@ -211,7 +211,13 @@ pub fn warp(
                 let coords_r_bwd = if r_bwd == r {
                     None
                 } else {
-                    Some(row_src_coords(r_bwd, dst_h, dst_w, &col_table, &grid_src_pix))
+                    Some(row_src_coords(
+                        r_bwd,
+                        dst_h,
+                        dst_w,
+                        &col_table,
+                        &grid_src_pix,
+                    ))
                 };
                 for c in 0..dst_w {
                     let (sc, sr) = coords[c];
@@ -248,7 +254,14 @@ pub fn warp(
                     mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
                     for (b, band_view) in band_views.iter().enumerate() {
                         band_rows[b][c] = resampling.sample_average(
-                            *band_view, src_mask_view, sc, sr, rx, ry, fill);
+                            *band_view,
+                            src_mask_view,
+                            sc,
+                            sr,
+                            rx,
+                            ry,
+                            fill,
+                        );
                     }
                 }
             } else {
@@ -824,7 +837,11 @@ mod tests {
         }
         // Guard against silent degradation to fill/constant: at least one
         // interior pixel must be a genuine mid-range average.
-        let interior = vals.iter().copied().filter(|&v| v > 5.0 && v < 58.0).count();
+        let interior = vals
+            .iter()
+            .copied()
+            .filter(|&v| v > 5.0 && v < 58.0)
+            .count();
         assert!(
             interior > 0,
             "expected interior averaged values; got none (averaging may be broken)"
@@ -853,7 +870,11 @@ mod tests {
         }
         // Guard against silent degradation to fill/constant: at least one
         // interior pixel must be a genuine mid-range average.
-        let interior = vals.iter().copied().filter(|&v| v > 5.0 && v < 58.0).count();
+        let interior = vals
+            .iter()
+            .copied()
+            .filter(|&v| v > 5.0 && v < 58.0)
+            .count();
         assert!(
             interior > 0,
             "expected interior averaged values; got none (averaging may be broken)"

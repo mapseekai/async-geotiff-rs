@@ -14,8 +14,9 @@
 //! not measured here.
 
 use async_geotiff::warp::Resampling;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use ndarray::Array2;
+use std::hint::black_box;
 
 const SRC: usize = 512;
 const DST: usize = 256;
@@ -53,9 +54,7 @@ fn bench(c: &mut Criterion) {
     // Transposed view -> as_slice() is None -> strided fallback (old path).
     let t = base.t();
     let tm = mask.t();
-    g.bench_function("strided_fallback", |b| {
-        b.iter(|| black_box(sweep(t, None)))
-    });
+    g.bench_function("strided_fallback", |b| b.iter(|| black_box(sweep(t, None))));
     g.bench_function("strided_fallback_masked", |b| {
         b.iter(|| black_box(sweep(t, Some(tm))))
     });
@@ -71,8 +70,7 @@ fn bench(c: &mut Criterion) {
                 for c in 0..DST {
                     let sc = (c as f64 + 0.5) * scale;
                     let sr = (r as f64 + 0.5) * scale;
-                    acc += kernel.sample_average(
-                        view, None, sc, sr, scale * 0.5, scale * 0.5, 0.0);
+                    acc += kernel.sample_average(view, None, sc, sr, scale * 0.5, scale * 0.5, 0.0);
                 }
             }
             black_box(acc)
@@ -89,8 +87,8 @@ fn bench(c: &mut Criterion) {
                 for c in 0..DST {
                     let sc = (c as f64 + 0.5) * scale;
                     let sr = (r as f64 + 0.5) * scale;
-                    acc += kernel.sample_average(
-                        view, Some(m), sc, sr, scale * 0.5, scale * 0.5, 0.0);
+                    acc +=
+                        kernel.sample_average(view, Some(m), sc, sr, scale * 0.5, scale * 0.5, 0.0);
                 }
             }
             black_box(acc)

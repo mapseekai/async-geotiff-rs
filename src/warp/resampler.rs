@@ -275,21 +275,27 @@ mod tests {
         let a = ndarray::Array2::from_elem((4, 4), 10.0);
         let mut m = ndarray::Array2::from_elem((4, 4), true);
         m[[0, 0]] = false; // one invalid pixel, value still 10 elsewhere
-        let v = Resampling::Average.sample_average(
-            a.view(), Some(m.view()), 1.5, 1.5, 1.5, 1.5, -1.0);
+        let v =
+            Resampling::Average.sample_average(a.view(), Some(m.view()), 1.5, 1.5, 1.5, 1.5, -1.0);
         assert_relative_eq!(v, 10.0); // mean of valid pixels (all 10)
 
         let none_valid = ndarray::Array2::from_elem((4, 4), false);
         let f = Resampling::Average.sample_average(
-            a.view(), Some(none_valid.view()), 1.5, 1.5, 1.5, 1.5, -7.0);
+            a.view(),
+            Some(none_valid.view()),
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            -7.0,
+        );
         assert_eq!(f, -7.0); // all invalid => fill
     }
 
     #[test]
     fn average_nan_coords_return_fill() {
         let a = ndarray::Array2::from_elem((4, 4), 5.0);
-        let v = Resampling::Average.sample_average(
-            a.view(), None, f64::NAN, 2.0, 2.0, 2.0, -9.0);
+        let v = Resampling::Average.sample_average(a.view(), None, f64::NAN, 2.0, 2.0, 2.0, -9.0);
         assert_eq!(v, -9.0);
     }
 
