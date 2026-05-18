@@ -32,6 +32,8 @@ serde_urlencoded  = "0.7"
 tracing           = "0.1"
 url               = "2"
 quick-xml         = "0.39"
+stac              = { version = "0.17", optional = true }
+stac-client       = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "fs", "io-util"] }
@@ -51,14 +53,6 @@ webp    = ["image/webp"]
 jpeg    = ["image/jpeg"]
 mosaic  = []
 stac    = ["mosaic", "dep:stac", "dep:stac-client"]
-
-[dependencies.stac]
-version = "0.17"
-optional = true
-
-[dependencies.stac-client]
-version = "0.3"
-optional = true
 
 [profile.release]
 opt-level = 3
