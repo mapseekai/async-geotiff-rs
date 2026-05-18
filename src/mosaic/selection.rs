@@ -69,6 +69,9 @@ impl Reducer {
             PixelSelection::Highest => self.feed_extreme(arr, m, true),
             PixelSelection::Lowest => self.feed_extreme(arr, m, false),
             PixelSelection::Mean | PixelSelection::Median => {
+                if let Some((first, _)) = self.stack.first() {
+                    debug_assert_eq!(arr.dim(), first.dim(), "mosaic assets must be homogeneous (same shape)");
+                }
                 self.stack.push((arr, m));
                 Ok(())
             }
@@ -158,7 +161,7 @@ impl Reducer {
                 let acc = self
                     .acc
                     .ok_or_else(|| AgError::Mosaic("no assets fed".into()))?;
-                (acc, self.acc_mask.unwrap())
+                (acc, self.acc_mask.expect("invariant: acc_mask is set whenever acc is set"))
             }
             PixelSelection::Mean | PixelSelection::Median => {
                 if self.stack.is_empty() {
@@ -202,10 +205,16 @@ fn aggregate_stack(
                     }
                 }
                 out[[b, y, x]] = if mean {
-                    buf.iter().sum::<f64>() / buf.len() as f64
+                    let finite: Vec<f64> =
+                        buf.iter().copied().filter(|v| v.is_finite()).collect();
+                    if finite.is_empty() {
+                        0.0
+                    } else {
+                        finite.iter().sum::<f64>() / finite.len() as f64
+                    }
                 } else {
+                    buf.sort_by(f64::total_cmp);
                     let mid = buf.len() / 2;
-                    buf.sort_by(|a, c| a.partial_cmp(c).unwrap());
                     if buf.len() % 2 == 1 {
                         buf[mid]
                     } else {
@@ -286,5 +295,26 @@ mod tests {
     fn finish_with_no_assets_is_error() {
         let r = Reducer::new(PixelSelection::First);
         assert!(r.finish().is_err());
+    }
+
+    #[test]
+    fn median_and_mean_are_nan_safe() {
+        // NaN samples with mask=true must not panic; median uses total order,
+        // mean ignores non-finite samples.
+        let mut md = Reducer::new(PixelSelection::Median);
+        md.feed(&img(&[1.0], &[true])).unwrap();
+        md.feed(&img(&[f64::NAN], &[true])).unwrap();
+        md.feed(&img(&[3.0], &[true])).unwrap();
+        let v = md.finish().unwrap().pixels.to_f64()[[0, 0, 0]];
+        // total_cmp orders NaN last → sorted [1.0, 3.0, NaN], len=3, mid=1 → 3.0
+        assert!(v.is_finite()); // no panic
+        assert_eq!(v, 3.0);
+
+        let mut me = Reducer::new(PixelSelection::Mean);
+        me.feed(&img(&[2.0], &[true])).unwrap();
+        me.feed(&img(&[f64::NAN], &[true])).unwrap();
+        me.feed(&img(&[4.0], &[true])).unwrap();
+        // NaN filtered out: mean of [2.0, 4.0] = 3.0
+        assert_eq!(me.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 3.0);
     }
 }
