@@ -9,7 +9,7 @@ pub(crate) mod source;
 #[cfg(feature = "stac")]
 pub(crate) mod stac;
 
-pub use mosaicjson::MosaicJsonSource;
+pub use mosaicjson::{MosaicDataType, MosaicJson, MosaicJsonSource};
 pub use selection::PixelSelection;
 pub use source::{AssetRef, MosaicSource};
 #[cfg(feature = "stac")]
