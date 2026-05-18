@@ -1,7 +1,6 @@
 //! Top-level orchestrator: HTTP request → tile bytes.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::sync::Semaphore;
@@ -137,63 +136,36 @@ impl Tiler {
         Ok(Arc::new(next))
     }
 
-    pub async fn tile(
+    /// Read + warp the source COG onto the destination tile grid. Returns
+    /// `None` when the tile is fully outside the COG or outside the
+    /// projection's valid domain (caller renders a transparent tile).
+    /// This is the per-asset primitive the mosaic layer reuses.
+    pub async fn warp_tile(
         &self,
         tms_kind: TmsKind,
         z: u8,
         x: u32,
         y: u32,
         style: &TileStyle,
-    ) -> AgResult<Bytes> {
-        let t_req = Instant::now();
+    ) -> AgResult<Option<ImageData>> {
         let tms = Tms::new(tms_kind)?;
         let dst_bbox = tms.tile_bbox(z, x, y)?;
         let dst_crs = tms.crs();
 
-        tracing::debug!(
-            ?dst_crs,
-            src_crs = %self.reader.src_crs(),
-            ?dst_bbox,
-            "tile request"
-        );
-
-        // 1. Project dst_bbox into the source CRS so we know which pixel window to read.
-        //    Bbox projection is 4 points — sub-microsecond when the cached
-        //    Projector hits or when the (4326, 3857) direct-formula fast
-        //    path triggers — so we run it synchronously on the async worker
-        //    instead of paying ~10-50 us in spawn_blocking task scheduling.
         let bbox_in_src = if self.reader.src_crs() == &dst_crs {
             dst_bbox
         } else {
             match Self::reproject_bbox_sync(&dst_bbox, &dst_crs, self.reader.src_crs()) {
                 Ok(b) => b,
-                // Tile lies outside the projection's valid domain → blank.
-                Err(AgError::ProjectionDomain(_)) => return empty_tile(style.tilesize as usize),
+                Err(AgError::ProjectionDomain(_)) => return Ok(None),
                 Err(e) => return Err(e),
             }
         };
 
-        // 2. Pick overview in source CRS units. Each overview has its own transform.
         let target_gsd =
             bbox_in_src.width().abs().max(bbox_in_src.height().abs()) / f64::from(style.tilesize);
         let level = self.reader.pick_overview(target_gsd);
 
-        tracing::debug!(?bbox_in_src, target_gsd, level, "picked overview");
-
-        // 3. Pixel window in source-pixel space.
-        //    Pad by 1 px on every side so the bilinear resampler always has
-        //    valid neighbours at tile edges — otherwise adjacent XYZ tiles
-        //    show white seams where samples fall just outside the read buffer.
-        //
-        //    Skip the halo when the read is "aligned": same CRS AND the
-        //    requested resolution matches this overview's native resolution
-        //    (scale ≈ 1). In that case the dst→src map is an integer
-        //    translation with unit scale — no fractional sampling, so the
-        //    resampler never reaches outside the window and the halo is pure
-        //    waste. Mirrors rio-tiler's `_requested_tile_aligned_with_
-        //    internal_tile` optimisation (reader.py:453-459); we use the
-        //    resolution-match condition because it is the actual cause of
-        //    edge-resampling artifacts, not internal-tile-grid alignment.
         let level_tr = self.reader.level_transform(level)?;
         let (rc, rr, rw, rh) = level_tr
             .window_for_bbox(&bbox_in_src)
@@ -202,16 +174,9 @@ impl Tiler {
         let level_gsd = self.reader.level_gsd(level).unwrap_or(target_gsd);
         let res_matches = level_gsd > 0.0 && ((target_gsd - level_gsd).abs() / level_gsd) < 0.01;
         let aligned = same_crs && res_matches;
-        let dur_setup = t_req.elapsed();
-
-        // -- L2 passthrough --
-        // When the requested tile maps EXACTLY onto an integer-aligned
-        // ts×ts source-pixel window (same CRS, native resolution, no
-        // sub-pixel offset, fully inside the IFD), the warp would be a
-        // no-op identity crop. Skip it entirely and feed the windowed read
-        // straight to render — this is the big payoff of rio-tiler's
-        // aligned-read insight: zero resample, zero PROJ, one read.
         let ts = style.tilesize as usize;
+
+        // L2 passthrough: exact integer-aligned ts×ts window → skip warp.
         if same_crs && res_matches {
             if let Some((pc, pr)) = Self::passthrough_window(&level_tr, &dst_bbox, ts) {
                 if let Ok((iw, ih)) = self.reader.level_dimensions(level) {
@@ -220,70 +185,32 @@ impl Tiler {
                         && (pc as u64 + ts as u64) <= iw as u64
                         && (pr as u64 + ts as u64) <= ih as u64;
                     if in_bounds {
-                        tracing::debug!(
-                            pc,
-                            pr,
-                            ts,
-                            level,
-                            "L2 passthrough — skipping warp entirely"
-                        );
-                        let t = Instant::now();
                         let src: Arc<ImageData> = self
                             .reader
                             .read_window(level, pc, pr, ts as u64, ts as u64)
                             .await?;
-                        let dur_read = t.elapsed();
-                        let t = Instant::now();
-                        let compiled = compile_cached(style).await?;
-                        let compiled = self.effective_compiled(style, &compiled, &src).await?;
-                        let dur_compile = t.elapsed();
-                        let t = Instant::now();
-                        let png = self
-                            .run_tile_cpu("render", move || render(&src, &compiled))
-                            .await?;
-                        let dur_render = t.elapsed();
-                        tracing::debug!(
-                            ?dur_setup,
-                            ?dur_read,
-                            ?dur_compile,
-                            ?dur_render,
-                            total = ?t_req.elapsed(),
-                            "tile timing (L2 passthrough)"
-                        );
-                        return Ok(png);
+                        return Ok(Some((*src).clone()));
                     }
                 }
             }
         }
+
         let raw = if aligned {
-            tracing::debug!(target_gsd, level_gsd, "aligned read — skipping halo");
             (rc, rr, rw, rh)
         } else {
             (rc - 1, rr - 1, rw + 2, rh + 2)
         };
         let (col, row, w, h) = self.clamp_window(level, raw.0, raw.1, raw.2, raw.3)?;
         if w == 0 || h == 0 {
-            let level_dims = self.reader.level_dimensions(level).ok();
-            tracing::warn!(
-                ?bbox_in_src, raw_window = ?raw, level, ?level_dims,
-                "tile entirely outside COG; returning transparent"
-            );
-            return empty_tile(style.tilesize as usize);
+            return Ok(None);
         }
-        tracing::debug!(col, row, w, h, "read window (clamped)");
-        let t = Instant::now();
         let src: Arc<ImageData> = self.reader.read_window(level, col, row, w, h).await?;
-        let dur_read = t.elapsed();
 
-        // 4. Project the read window into the exact destination tile grid. This is
-        // still needed for same-CRS reads because the requested COG window may not
-        // be the same size or placement as the output XYZ tile.
         let resampling = if src.crs == dst_crs {
             style.resampling
         } else {
             style.reproject
         };
-        let t = Instant::now();
         let warped: ImageData = match self
             .run_tile_cpu("warp", move || {
                 warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
@@ -291,31 +218,28 @@ impl Tiler {
             .await
         {
             Ok(w) => w,
-            // Grid point outside the projection's valid domain → blank.
-            Err(AgError::ProjectionDomain(_)) => return empty_tile(style.tilesize as usize),
+            Err(AgError::ProjectionDomain(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let dur_warp = t.elapsed();
+        Ok(Some(warped))
+    }
 
-        let t = Instant::now();
+    pub async fn tile(
+        &self,
+        tms_kind: TmsKind,
+        z: u8,
+        x: u32,
+        y: u32,
+        style: &TileStyle,
+    ) -> AgResult<Bytes> {
+        let warped = match self.warp_tile(tms_kind, z, x, y, style).await? {
+            Some(img) => img,
+            None => return empty_tile(style.tilesize as usize),
+        };
         let compiled = compile_cached(style).await?;
         let compiled = self.effective_compiled(style, &compiled, &warped).await?;
-        let dur_compile = t.elapsed();
-        let t = Instant::now();
-        let png = self
-            .run_tile_cpu("render", move || render(&warped, &compiled))
-            .await?;
-        let dur_render = t.elapsed();
-        tracing::debug!(
-            ?dur_setup,
-            ?dur_read,
-            ?dur_warp,
-            ?dur_compile,
-            ?dur_render,
-            total = ?t_req.elapsed(),
-            "tile timing (warp path)"
-        );
-        Ok(png)
+        let img = warped;
+        self.run_tile_cpu("render", move || render(&img, &compiled)).await
     }
 
     async fn run_tile_cpu<T, F>(&self, label: &'static str, f: F) -> AgResult<T>
