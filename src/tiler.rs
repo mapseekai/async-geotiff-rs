@@ -336,7 +336,7 @@ impl Tiler {
 /// so encode once and memoize: out-of-bounds / out-of-domain tiles are
 /// common (whole viewport at COG edges), and PNG deflate on the async
 /// worker would otherwise stall the reactor under load.
-fn empty_tile(size: usize) -> AgResult<Bytes> {
+pub(crate) fn empty_tile(size: usize) -> AgResult<Bytes> {
     use std::collections::HashMap;
     use std::sync::{OnceLock, RwLock};
 

@@ -168,6 +168,7 @@ dependencies = [
  "criterion",
  "enterpolation",
  "fast_image_resize",
+ "futures",
  "image",
  "moka",
  "ndarray",
