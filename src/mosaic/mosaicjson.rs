@@ -11,7 +11,9 @@ use crate::mosaic::quadkey::{lookup, QkLookup};
 use crate::mosaic::source::{AssetRef, MosaicSource};
 use crate::tms::TmsKind;
 
+// MosaicJson mirrors the on-disk MosaicJSON schema; mosaicjson/maxzoom are parsed for fidelity but not yet used in lookup logic.
 /// MosaicJSON 0.0.x subset we consume. Unknown fields ignored.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MosaicJson {
     pub mosaicjson: String,
