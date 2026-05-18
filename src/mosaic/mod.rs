@@ -2,6 +2,7 @@
 //! `docs/superpowers/specs/2026-05-18-mosaic-design.md`.
 
 pub mod mosaicjson;
+mod reader_pool;
 pub mod quadkey;
 pub mod selection;
 pub mod source;
