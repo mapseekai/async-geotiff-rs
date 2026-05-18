@@ -33,7 +33,6 @@ serde_urlencoded  = "0.7"
 tracing           = "0.1"
 url               = "2"
 quick-xml         = "0.39"
-stac              = { version = "0.17", optional = true }
 stac-client       = { version = "0.3", optional = true }
 futures = { version = "0.3.32", optional = true }
 
@@ -54,7 +53,7 @@ proj    = ["dep:proj"]
 webp    = ["image/webp"]
 jpeg    = ["image/jpeg"]
 mosaic  = ["dep:futures"]
-stac    = ["mosaic", "dep:stac", "dep:stac-client"]
+stac    = ["mosaic", "dep:stac-client"]
 
 [profile.release]
 opt-level = 3
