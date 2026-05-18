@@ -70,6 +70,10 @@ strip = false
 [[example]]
 name = "serve"
 
+[[example]]
+name = "mosaic_source"
+required-features = ["mosaic"]
+
 [[bench]]
 name = "resampler_bench"
 harness = false
