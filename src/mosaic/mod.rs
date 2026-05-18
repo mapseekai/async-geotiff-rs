@@ -6,10 +6,14 @@ mod reader_pool;
 pub mod quadkey;
 pub mod selection;
 pub mod source;
+#[cfg(feature = "stac")]
+pub mod stac;
 
 pub use mosaicjson::MosaicJsonSource;
 pub use selection::PixelSelection;
 pub use source::{AssetRef, MosaicSource};
+#[cfg(feature = "stac")]
+pub use stac::StacSource;
 
 use bytes::Bytes;
 
