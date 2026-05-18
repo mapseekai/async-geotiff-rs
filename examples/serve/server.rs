@@ -12,9 +12,10 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use async_geotiff::error::{AgError, AgResult};
 use async_geotiff::io::CogReader;
+use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
 use async_geotiff::style::TileStyle;
 use async_geotiff::tiler::Tiler;
-use async_geotiff::tms::TmsKind;
+use async_geotiff::tms::TileMatrixSet;
 
 const MAX_DATA_RESPONSE_BYTES: u64 = 32 << 20;
 
@@ -31,6 +32,9 @@ pub struct AppState {
     pub default_tiler: Option<Arc<Tiler>>,
     pub data_dir: Option<PathBuf>,
     pub datasets: Arc<Vec<String>>,
+    /// Optional MosaicJSON-backed mosaic, served at `/mosaic/tiles/...`.
+    /// Loaded once at startup from `ASYNC_GEOTIFF_MOSAIC` (file path).
+    pub mosaic: Option<Arc<MosaicTiler<MosaicJsonSource>>>,
     http_base: String,
     tilers: moka::future::Cache<String, Arc<Tiler>>,
 }
@@ -46,9 +50,16 @@ impl AppState {
             default_tiler,
             data_dir,
             datasets: Arc::new(datasets),
+            mosaic: None,
             http_base: http_base.into(),
             tilers: moka::future::Cache::new(64),
         }
+    }
+
+    /// Attach a MosaicJSON-backed mosaic, exposed at `/mosaic/tiles/...`.
+    pub fn with_mosaic(mut self, mosaic: Arc<MosaicTiler<MosaicJsonSource>>) -> Self {
+        self.mosaic = Some(mosaic);
+        self
     }
 
     /// Resolve the `Tiler` for an optional `?dataset=` selector.
@@ -91,6 +102,10 @@ pub fn router(state: AppState) -> Router {
             "/tiles/{tms}/{z}/{x}/{ye}",
             get(tile_handler).options(cors_preflight),
         )
+        .route(
+            "/mosaic/tiles/{tms}/{z}/{x}/{ye}",
+            get(mosaic_tile_handler).options(cors_preflight),
+        )
         .route("/datasets", get(datasets_handler))
         .route("/bounds", get(bounds_handler))
         .route(
@@ -116,7 +131,7 @@ pub async fn tile_handler(
         Err(_) => return with_cors((StatusCode::BAD_REQUEST, "bad y").into_response()),
     };
 
-    let tms_kind = match tms.parse::<TmsKind>() {
+    let tile_matrix_set = match tms.parse::<TileMatrixSet>() {
         Ok(k) => k,
         Err(_) => {
             return with_cors(
@@ -144,7 +159,89 @@ pub async fn tile_handler(
         Err(e) => return error_response(e),
     };
 
-    match tiler.tile(tms_kind, z, x, y, &style).await {
+    match tiler.tile(tile_matrix_set, z, x, y, &style).await {
+        Ok(bytes) => with_cors(([("content-type", "image/png")], bytes).into_response()),
+        Err(e) => error_response(e),
+    }
+}
+
+fn parse_pixel_selection(s: &str) -> Option<PixelSelection> {
+    match s {
+        "first" => Some(PixelSelection::First),
+        "highest" => Some(PixelSelection::Highest),
+        "lowest" => Some(PixelSelection::Lowest),
+        "mean" => Some(PixelSelection::Mean),
+        "median" => Some(PixelSelection::Median),
+        _ => None,
+    }
+}
+
+/// `GET /mosaic/tiles/{tms}/{z}/{x}/{y}.png?pixel_selection=first&...`
+/// Serves the startup-loaded MosaicJSON mosaic. Styling query params are
+/// the same as `/tiles`; `pixel_selection` picks the reducer (default
+/// `first`).
+pub async fn mosaic_tile_handler(
+    State(state): State<AppState>,
+    Path((tms, z, x, ye)): Path<(String, u8, u32, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let Some(mosaic) = state.mosaic.clone() else {
+        return with_cors(
+            (
+                StatusCode::NOT_FOUND,
+                "no mosaic loaded; set ASYNC_GEOTIFF_MOSAIC to a MosaicJSON path",
+            )
+                .into_response(),
+        );
+    };
+
+    let (y_str, ext) = ye.split_once('.').unwrap_or((ye.as_str(), "png"));
+    if ext != "png" {
+        return with_cors((StatusCode::UNPROCESSABLE_ENTITY, "unsupported format").into_response());
+    }
+    let y: u32 = match y_str.parse() {
+        Ok(v) => v,
+        Err(_) => return with_cors((StatusCode::BAD_REQUEST, "bad y").into_response()),
+    };
+
+    let tile_matrix_set = match tms.parse::<TileMatrixSet>() {
+        Ok(k) => k,
+        Err(_) => {
+            return with_cors(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("unknown TMS: {tms}"),
+                )
+                    .into_response(),
+            )
+        }
+    };
+
+    let selection = match params.iter().find(|(k, _)| k == "pixel_selection") {
+        Some((_, v)) => match parse_pixel_selection(v) {
+            Some(s) => s,
+            None => {
+                return with_cors(
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("unknown pixel_selection: {v} (first|highest|lowest|mean|median)"),
+                    )
+                        .into_response(),
+                )
+            }
+        },
+        None => PixelSelection::First,
+    };
+
+    let style = match TileStyle::from_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+        Ok(s) => s,
+        Err(e) => return with_cors((StatusCode::BAD_REQUEST, e.to_string()).into_response()),
+    };
+
+    match mosaic
+        .tile(tile_matrix_set, z, x, y, selection, &style)
+        .await
+    {
         Ok(bytes) => with_cors(([("content-type", "image/png")], bytes).into_response()),
         Err(e) => error_response(e),
     }

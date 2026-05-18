@@ -88,10 +88,20 @@ impl GeoTransform {
         let inv = self.inverse()?;
         let (c0, r0) = inv.forward(bbox.xmin, bbox.ymax);
         let (c1, r1) = inv.forward(bbox.xmax, bbox.ymin);
-        let col_off = c0.floor() as i64;
-        let row_off = r0.floor() as i64;
-        let width = (c1 - c0).abs().ceil() as u64;
-        let height = (r1 - r0).abs().ceil() as u64;
+        // Integer pixel cover of the projected footprint is
+        // [floor(min), ceil(max)). Using ceil(max-min) (the raw span)
+        // undercounts by 1 px whenever both endpoints are fractional —
+        // the normal post-reprojection case — leaving the tile's
+        // right/bottom edge unread → transparent seams between tiles,
+        // amplified at coarse overviews by the upsample factor.
+        let cmin = c0.min(c1);
+        let cmax = c0.max(c1);
+        let rmin = r0.min(r1);
+        let rmax = r0.max(r1);
+        let col_off = cmin.floor() as i64;
+        let row_off = rmin.floor() as i64;
+        let width = (cmax.ceil() - cmin.floor()) as u64;
+        let height = (rmax.ceil() - rmin.floor()) as u64;
         Some((col_off, row_off, width, height))
     }
 }

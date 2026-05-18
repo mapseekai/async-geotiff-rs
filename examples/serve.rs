@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_geotiff::crs::Crs;
 use async_geotiff::io::CogReader;
+use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler};
 use async_geotiff::tiler::Tiler;
 use async_geotiff::warp::Projector;
 use axum::{response::Html, routing::get};
@@ -73,7 +74,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = bind_addr()?;
     let http_base = local_http_base(bind_addr);
     let viewer_html = Arc::new(maplibre_viewer_html(view));
-    let state = server::AppState::new(default_tiler, Some(data_dir), datasets, http_base.clone());
+    // Optional mosaic: ASYNC_GEOTIFF_MOSAIC=<path to a MosaicJSON file>.
+    let mut state =
+        server::AppState::new(default_tiler, Some(data_dir), datasets, http_base.clone());
+    let mut mosaic_loaded = false;
+    if let Ok(path) = std::env::var("ASYNC_GEOTIFF_MOSAIC") {
+        let json = std::fs::read_to_string(&path)?;
+        let source = MosaicJsonSource::from_str(&json)?;
+        state = state.with_mosaic(Arc::new(MosaicTiler::new(source)));
+        mosaic_loaded = true;
+        println!("Mosaic loaded from {path}");
+    }
     let app = server::router(state)
         .route(
             "/",
@@ -110,6 +121,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("OpenLayers viewer: {http_base}/openlayers");
     println!("Leaflet viewer: {http_base}/leaflet");
     println!("Tile endpoint: {http_base}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png");
+    if mosaic_loaded {
+        println!(
+            "Mosaic endpoint: {http_base}/mosaic/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?pixel_selection=first"
+        );
+    } else {
+        println!("Mosaic endpoint: disabled (set ASYNC_GEOTIFF_MOSAIC=<mosaic.json> to enable)");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }

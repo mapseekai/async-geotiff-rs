@@ -9,13 +9,19 @@ use async_geotiff::bounds::Bbox;
 use async_geotiff::error::AgResult;
 use async_geotiff::mosaic::{AssetRef, MosaicSource, MosaicTiler, PixelSelection};
 use async_geotiff::style::TileStyle;
-use async_geotiff::tms::TmsKind;
+use async_geotiff::tms::TileMatrixSet;
 
 struct UrlList(Vec<AssetRef>);
 
 #[async_trait::async_trait]
 impl MosaicSource for UrlList {
-    async fn assets_for_tile(&self, _tms: async_geotiff::tms::TmsKind, _z: u8, _x: u32, _y: u32) -> AgResult<Vec<AssetRef>> {
+    async fn assets_for_tile(
+        &self,
+        _tile_matrix_set: TileMatrixSet,
+        _z: u8,
+        _x: u32,
+        _y: u32,
+    ) -> AgResult<Vec<AssetRef>> {
         // Real code would filter by tile bbox intersection here.
         Ok(self.0.clone())
     }
@@ -30,7 +36,14 @@ async fn main() -> AgResult<()> {
     let mosaic = MosaicTiler::new(source);
     let style = TileStyle::from_query("")?;
     match mosaic
-        .tile(TmsKind::WebMercatorQuad, 4, 8, 8, PixelSelection::First, &style)
+        .tile(
+            TileMatrixSet::WebMercatorQuad,
+            4,
+            8,
+            8,
+            PixelSelection::First,
+            &style,
+        )
         .await
     {
         Ok(png) => println!("rendered {} bytes", png.len()),

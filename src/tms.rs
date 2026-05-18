@@ -4,13 +4,14 @@ use crate::error::{AgError, AgResult};
 use std::str::FromStr;
 use tile_grid::{tms as registry, Tms as InnerTms, Xyz};
 
+/// Supported OGC TileMatrixSet identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TmsKind {
+pub enum TileMatrixSet {
     WebMercatorQuad,
     WorldCrs84Quad,
 }
 
-impl TmsKind {
+impl TileMatrixSet {
     pub fn name(self) -> &'static str {
         match self {
             Self::WebMercatorQuad => "WebMercatorQuad",
@@ -34,7 +35,7 @@ impl TmsKind {
     }
 }
 
-impl FromStr for TmsKind {
+impl FromStr for TileMatrixSet {
     type Err = AgError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -43,24 +44,27 @@ impl FromStr for TmsKind {
 }
 
 pub struct Tms {
-    kind: TmsKind,
+    tile_matrix_set: TileMatrixSet,
     inner: InnerTms,
 }
 
 impl Tms {
-    pub fn new(kind: TmsKind) -> AgResult<Self> {
+    pub fn new(tile_matrix_set: TileMatrixSet) -> AgResult<Self> {
         let inner = registry()
-            .lookup(kind.name())
-            .map_err(|e| AgError::UnknownTms(format!("{}: {}", kind.name(), e)))?;
-        Ok(Self { kind, inner })
+            .lookup(tile_matrix_set.name())
+            .map_err(|e| AgError::UnknownTms(format!("{}: {}", tile_matrix_set.name(), e)))?;
+        Ok(Self {
+            tile_matrix_set,
+            inner,
+        })
     }
 
-    pub fn kind(&self) -> TmsKind {
-        self.kind
+    pub fn tile_matrix_set(&self) -> TileMatrixSet {
+        self.tile_matrix_set
     }
 
     pub fn crs(&self) -> Crs {
-        self.kind.crs()
+        self.tile_matrix_set.crs()
     }
 
     /// Bbox of (z, x, y) in the TMS CRS. `y` is XYZ-slippy convention.
@@ -99,12 +103,12 @@ mod tests {
 
     #[test]
     fn unknown_tms_errors() {
-        assert!("foo".parse::<TmsKind>().is_err());
+        assert!("foo".parse::<TileMatrixSet>().is_err());
     }
 
     #[test]
     fn webmercatorquad_tile_0_0_0_is_full_world() {
-        let tms = Tms::new(TmsKind::WebMercatorQuad).unwrap();
+        let tms = Tms::new(TileMatrixSet::WebMercatorQuad).unwrap();
         let bb = tms.tile_bbox(0, 0, 0).unwrap();
         assert_relative_eq!(bb.xmin, -20037508.342789244, epsilon = 1e-3);
         assert_relative_eq!(bb.xmax, 20037508.342789244, epsilon = 1e-3);
@@ -112,13 +116,13 @@ mod tests {
 
     #[test]
     fn out_of_range_y_errors() {
-        let tms = Tms::new(TmsKind::WebMercatorQuad).unwrap();
+        let tms = Tms::new(TileMatrixSet::WebMercatorQuad).unwrap();
         assert!(tms.tile_bbox(0, 0, 1).is_err());
     }
 
     #[test]
     fn resolution_decreases_with_zoom() {
-        let tms = Tms::new(TmsKind::WebMercatorQuad).unwrap();
+        let tms = Tms::new(TileMatrixSet::WebMercatorQuad).unwrap();
         let r0 = tms.resolution(0).unwrap();
         let r10 = tms.resolution(10).unwrap();
         assert!(r0 > r10);

@@ -39,12 +39,12 @@ mod tests {
     #[tokio::test]
     async fn open_failure_is_mosaic_error() {
         let pool = ReaderPool::new(8);
-        let result = pool
-            .get_or_open("http://127.0.0.1:1/nope.tif")
-            .await;
+        let result = pool.get_or_open("http://127.0.0.1:1/nope.tif").await;
         match result {
             Err(AgError::Mosaic(_)) => {}
-            Err(other) => panic!("expected AgError::Mosaic, got a different error variant: {other}"),
+            Err(other) => {
+                panic!("expected AgError::Mosaic, got a different error variant: {other}")
+            }
             Ok(_) => panic!("expected error opening unreachable URL, but got Ok"),
         }
     }

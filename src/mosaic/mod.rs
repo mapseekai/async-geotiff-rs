@@ -2,8 +2,8 @@
 //! `docs/superpowers/specs/2026-05-18-mosaic-design.md`.
 
 pub(crate) mod mosaicjson;
-mod reader_pool;
 pub(crate) mod quadkey;
+mod reader_pool;
 pub(crate) mod selection;
 pub(crate) mod source;
 #[cfg(feature = "stac")]
@@ -23,7 +23,7 @@ use crate::render::pipeline::render;
 use crate::style::params::compile_cached;
 use crate::style::TileStyle;
 use crate::tiler::Tiler;
-use crate::tms::TmsKind;
+use crate::tms::TileMatrixSet;
 
 use reader_pool::ReaderPool;
 use selection::Reducer;
@@ -80,14 +80,17 @@ impl<S: MosaicSource> MosaicTiler<S> {
     /// (rescale/colormap/color_formula/tilesize) once on the composite.
     pub async fn tile(
         &self,
-        tms: TmsKind,
+        tile_matrix_set: TileMatrixSet,
         z: u8,
         x: u32,
         y: u32,
         selection: PixelSelection,
         style: &TileStyle,
     ) -> AgResult<Bytes> {
-        let assets = self.source.assets_for_tile(tms, z, x, y).await?;
+        let assets = self
+            .source
+            .assets_for_tile(tile_matrix_set, z, x, y)
+            .await?;
         if assets.is_empty() {
             return crate::tiler::empty_tile(style.tilesize as usize);
         }
@@ -101,7 +104,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
                 async move {
                     let reader = self.pool.get_or_open(&url).await?;
                     let tiler = Tiler::new(reader);
-                    let img = tiler.warp_tile(tms, z, x, y, style).await?;
+                    let img = tiler.warp_tile(tile_matrix_set, z, x, y, style).await?;
                     Ok::<Option<ImageData>, AgError>(img)
                 }
             });
@@ -153,7 +156,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MosaicSource for OneLocal {
-        async fn assets_for_tile(&self, _tms: TmsKind, _z: u8, _x: u32, _y: u32) -> AgResult<Vec<AssetRef>> {
+        async fn assets_for_tile(
+            &self,
+            _tile_matrix_set: TileMatrixSet,
+            _z: u8,
+            _x: u32,
+            _y: u32,
+        ) -> AgResult<Vec<AssetRef>> {
             Ok(vec![AssetRef {
                 url: self.abspath.clone(),
                 bbox: Bbox::new(-180.0, -90.0, 180.0, 90.0),
@@ -172,25 +181,32 @@ mod tests {
 
         let fs = LocalFileSystem::new();
         let os_path = OsPath::from_filesystem_path(&tif).unwrap();
-        let reader = CogReader::open_with_reader(ObjectReader::new(
-            std::sync::Arc::new(fs),
-            os_path,
-        ))
-        .await
-        .unwrap();
+        let reader =
+            CogReader::open_with_reader(ObjectReader::new(std::sync::Arc::new(fs), os_path))
+                .await
+                .unwrap();
         let tiler = Tiler::new(std::sync::Arc::new(reader));
         let style = TileStyle::from_query("").unwrap();
         let bounds = tiler.wgs84_bounds().unwrap();
 
         let (z, x, y) = (8u8, 128u32, 128u32);
-        let single = tiler.tile(TmsKind::WebMercatorQuad, z, x, y, &style).await;
+        let single = tiler
+            .tile(TileMatrixSet::WebMercatorQuad, z, x, y, &style)
+            .await;
 
         let src = OneLocal {
             abspath: tif.to_string_lossy().into_owned(),
         };
         let m = MosaicTiler::new(src);
         let mosaic = m
-            .tile(TmsKind::WebMercatorQuad, z, x, y, PixelSelection::First, &style)
+            .tile(
+                TileMatrixSet::WebMercatorQuad,
+                z,
+                x,
+                y,
+                PixelSelection::First,
+                &style,
+            )
             .await;
 
         let _ = bounds;

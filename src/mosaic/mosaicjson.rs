@@ -9,7 +9,7 @@ use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::mosaic::quadkey::{lookup, QkLookup};
 use crate::mosaic::source::{AssetRef, MosaicSource};
-use crate::tms::TmsKind;
+use crate::tms::TileMatrixSet;
 
 // MosaicJson mirrors the on-disk MosaicJSON schema; mosaicjson/maxzoom are parsed for fidelity but not yet used in lookup logic.
 /// MosaicJSON 0.0.x subset we consume. Unknown fields ignored.
@@ -66,7 +66,20 @@ impl MosaicJsonSource {
 
 #[async_trait::async_trait]
 impl MosaicSource for MosaicJsonSource {
-    async fn assets_for_tile(&self, _tms: TmsKind, z: u8, x: u32, y: u32) -> AgResult<Vec<AssetRef>> {
+    async fn assets_for_tile(
+        &self,
+        tile_matrix_set: TileMatrixSet,
+        z: u8,
+        x: u32,
+        y: u32,
+    ) -> AgResult<Vec<AssetRef>> {
+        if tile_matrix_set != TileMatrixSet::WebMercatorQuad {
+            return Err(AgError::query(
+                "tms",
+                "MosaicJSON quadkey indexes only support WebMercatorQuad",
+            ));
+        }
+
         let mut urls: Vec<String> = Vec::new();
         match lookup(z, x, y, self.quadkey_zoom) {
             QkLookup::Exact(key) => {
@@ -129,7 +142,10 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-        let got = s.assets_for_tile(TmsKind::WebMercatorQuad, 7, tx, ty).await.unwrap();
+        let got = s
+            .assets_for_tile(TileMatrixSet::WebMercatorQuad, 7, tx, ty)
+            .await
+            .unwrap();
         let urls: Vec<_> = got.iter().map(|a| a.url.as_str()).collect();
         assert_eq!(urls, vec!["https://x/a.tif", "https://x/b.tif"]);
     }
@@ -138,5 +154,15 @@ mod tests {
     fn empty_tiles_is_error() {
         let bad = r#"{"mosaicjson":"0.0.3","minzoom":1,"maxzoom":2,"tiles":{}}"#;
         assert!(MosaicJsonSource::from_str(bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_non_webmercator_tile_matrix_set() {
+        let s = MosaicJsonSource::from_str(DOC).unwrap();
+        let err = s
+            .assets_for_tile(TileMatrixSet::WorldCrs84Quad, 7, 0, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgError::Query { name, .. } if name == "tms"));
     }
 }

@@ -137,6 +137,23 @@
         <select id="dataset" name="dataset"></select>
       </div>
       <div class="field">
+        <label for="mode">Source</label>
+        <select id="mode" name="mode">
+          <option value="single">single dataset</option>
+          <option value="mosaic">mosaic</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="pixel_selection">Pixel sel</label>
+        <select id="pixel_selection" name="pixel_selection">
+          <option value="first">first</option>
+          <option value="highest">highest</option>
+          <option value="lowest">lowest</option>
+          <option value="mean">mean</option>
+          <option value="median">median</option>
+        </select>
+      </div>
+      <div class="field">
         <label for="colormap">Colormap</label>
         <select id="colormap" name="colormap_name">
           <option value="">greys</option>
@@ -206,12 +223,23 @@
     <script>
       const DEFAULT_TILE_ORIGIN = "http://127.0.0.1:8080";
       const TILE_PATH = "/tiles/WebMercatorQuad/{z}/{x}/{y}.png";
+      const MOSAIC_PATH = "/mosaic/tiles/WebMercatorQuad/{z}/{x}/{y}.png";
+
+      function isMosaic() {
+        return controls.mode && controls.mode.value === "mosaic";
+      }
+
+      function tilePath() {
+        return isMosaic() ? MOSAIC_PATH : TILE_PATH;
+      }
       const SERVER_DEFAULT_CENTER = "__ASYNC_GEOTIFF_DEFAULT_CENTER__";
       const SERVER_DEFAULT_ZOOM = "__ASYNC_GEOTIFF_DEFAULT_ZOOM__";
       const pageParams = new URLSearchParams(window.location.search);
 
       const controls = {
         dataset: document.getElementById("dataset"),
+        mode: document.getElementById("mode"),
+        pixelSelection: document.getElementById("pixel_selection"),
         colormap: document.getElementById("colormap"),
         stretch: document.getElementById("stretch"),
         stretchArg: document.getElementById("stretchArg"),
@@ -223,6 +251,8 @@
         status: document.getElementById("status")
       };
 
+      controls.mode.value = pageParams.get("mode") ?? "single";
+      controls.pixelSelection.value = pageParams.get("pixel_selection") ?? "first";
       controls.colormap.value = pageParams.get("colormap_name") ?? "";
       controls.stretch.value =
         pageParams.get("stretch") ??
@@ -281,7 +311,12 @@
 
       function tileParams() {
         const params = new URLSearchParams();
-        if (controls.dataset && controls.dataset.value) {
+        params.set("mode", isMosaic() ? "mosaic" : "single");
+        if (isMosaic()) {
+          // Mosaic ignores ?dataset=; it uses the server's startup-loaded
+          // MosaicJSON. Pixel-selection picks the reducer.
+          params.set("pixel_selection", controls.pixelSelection.value);
+        } else if (controls.dataset && controls.dataset.value) {
           params.set("dataset", controls.dataset.value);
         }
         appendRepeated(params, "bidx", controls.bidx.value, ",");
@@ -320,7 +355,7 @@
       function tileUrl() {
         const params = tileParams();
         params.set("_v", String(styleVersion));
-        return `${tileOrigin()}${TILE_PATH}?${params.toString()}`;
+        return `${tileOrigin()}${tilePath()}?${params.toString()}`;
       }
 
       function syncStatus() {

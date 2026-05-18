@@ -76,7 +76,11 @@ impl Reducer {
             PixelSelection::Lowest => self.feed_extreme(arr, m, false),
             PixelSelection::Mean | PixelSelection::Median => {
                 if let Some((first, _)) = self.stack.first() {
-                    debug_assert_eq!(arr.dim(), first.dim(), "mosaic assets must be homogeneous (same shape)");
+                    debug_assert_eq!(
+                        arr.dim(),
+                        first.dim(),
+                        "mosaic assets must be homogeneous (same shape)"
+                    );
                 }
                 self.stack.push((arr, m));
                 Ok(())
@@ -109,12 +113,7 @@ impl Reducer {
         Ok(())
     }
 
-    fn feed_extreme(
-        &mut self,
-        arr: Array3<f64>,
-        m: Array2<bool>,
-        want_high: bool,
-    ) -> AgResult<()> {
+    fn feed_extreme(&mut self, arr: Array3<f64>, m: Array2<bool>, want_high: bool) -> AgResult<()> {
         match (&mut self.acc, &mut self.acc_mask) {
             (None, _) => {
                 self.acc = Some(arr);
@@ -167,7 +166,11 @@ impl Reducer {
                 let acc = self
                     .acc
                     .ok_or_else(|| AgError::Mosaic("no assets fed".into()))?;
-                (acc, self.acc_mask.expect("invariant: acc_mask is set whenever acc is set"))
+                (
+                    acc,
+                    self.acc_mask
+                        .expect("invariant: acc_mask is set whenever acc is set"),
+                )
             }
             PixelSelection::Mean | PixelSelection::Median => {
                 if self.stack.is_empty() {
@@ -211,8 +214,7 @@ fn aggregate_stack(
                     }
                 }
                 out[[b, y, x]] = if mean {
-                    let finite: Vec<f64> =
-                        buf.iter().copied().filter(|v| v.is_finite()).collect();
+                    let finite: Vec<f64> = buf.iter().copied().filter(|v| v.is_finite()).collect();
                     if finite.is_empty() {
                         0.0
                     } else {

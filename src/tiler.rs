@@ -15,7 +15,7 @@ use crate::render::pipeline::{render, CompiledTileStyle};
 use crate::style::params::compile_cached;
 use crate::style::stretch::{fallback_rescale, resolve_rescale, Stretch};
 use crate::style::TileStyle;
-use crate::tms::{Tms, TmsKind};
+use crate::tms::{TileMatrixSet, Tms};
 use crate::warp;
 use tokio::sync::OnceCell;
 
@@ -142,13 +142,13 @@ impl Tiler {
     /// This is the per-asset primitive the mosaic layer reuses.
     pub async fn warp_tile(
         &self,
-        tms_kind: TmsKind,
+        tile_matrix_set: TileMatrixSet,
         z: u8,
         x: u32,
         y: u32,
         style: &TileStyle,
     ) -> AgResult<Option<ImageData>> {
-        let tms = Tms::new(tms_kind)?;
+        let tms = Tms::new(tile_matrix_set)?;
         let dst_bbox = tms.tile_bbox(z, x, y)?;
         let dst_crs = tms.crs();
 
@@ -226,20 +226,21 @@ impl Tiler {
 
     pub async fn tile(
         &self,
-        tms_kind: TmsKind,
+        tile_matrix_set: TileMatrixSet,
         z: u8,
         x: u32,
         y: u32,
         style: &TileStyle,
     ) -> AgResult<Bytes> {
-        let warped = match self.warp_tile(tms_kind, z, x, y, style).await? {
+        let warped = match self.warp_tile(tile_matrix_set, z, x, y, style).await? {
             Some(img) => img,
             None => return empty_tile(style.tilesize as usize),
         };
         let compiled = compile_cached(style).await?;
         let compiled = self.effective_compiled(style, &compiled, &warped).await?;
         let img = warped;
-        self.run_tile_cpu("render", move || render(&img, &compiled)).await
+        self.run_tile_cpu("render", move || render(&img, &compiled))
+            .await
     }
 
     async fn run_tile_cpu<T, F>(&self, label: &'static str, f: F) -> AgResult<T>

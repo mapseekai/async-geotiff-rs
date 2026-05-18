@@ -68,9 +68,14 @@ strip = false
 
 [[example]]
 name = "serve"
+required-features = ["mosaic"]
 
 [[example]]
 name = "mosaic_source"
+required-features = ["mosaic"]
+
+[[example]]
+name = "mosaic_json"
 required-features = ["mosaic"]
 
 [[bench]]
