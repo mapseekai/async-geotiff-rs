@@ -35,7 +35,7 @@ url               = "2"
 quick-xml         = "0.39"
 stac              = { version = "0.17", optional = true }
 stac-client       = { version = "0.3", optional = true }
-futures = "0.3.32"
+futures = { version = "0.3.32", optional = true }
 
 [dev-dependencies]
 tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "fs", "io-util"] }
@@ -53,7 +53,7 @@ default = ["proj", "mosaic"]
 proj    = ["dep:proj"]
 webp    = ["image/webp"]
 jpeg    = ["image/jpeg"]
-mosaic  = []
+mosaic  = ["dep:futures"]
 stac    = ["mosaic", "dep:stac", "dep:stac-client"]
 
 [profile.release]
