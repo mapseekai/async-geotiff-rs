@@ -40,6 +40,9 @@ pub enum AgError {
     #[error("async-tiff: {0}")]
     Tiff(String),
 
+    #[error("mosaic: {0}")]
+    Mosaic(String),
+
     #[error("encode: {0}")]
     Encode(#[from] image::ImageError),
 }

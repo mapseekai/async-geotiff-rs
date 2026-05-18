@@ -8,6 +8,7 @@ description = "Async COG → XYZ tile renderer (pure Rust, no GDAL)"
 
 [dependencies]
 async-tiff        = "0.3"
+async-trait       = "0.1"
 object_store      = { version = "0.13", features = ["http", "aws"] }
 tile-grid         = "0.6"
 proj              = { version = "0.31", optional = true }
@@ -44,10 +45,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 moka              = { version = "0.12", features = ["future"] }
 
 [features]
-default = ["proj"]
+default = ["proj", "mosaic"]
 proj    = ["dep:proj"]
 webp    = ["image/webp"]
 jpeg    = ["image/jpeg"]
+mosaic  = []
+stac    = ["mosaic", "dep:stac", "dep:stac-client"]
+
+[dependencies.stac]
+version = "0.17"
+optional = true
+
+[dependencies.stac-client]
+version = "0.3"
+optional = true
 
 [profile.release]
 opt-level = 3

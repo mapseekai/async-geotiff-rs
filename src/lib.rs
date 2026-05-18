@@ -7,6 +7,8 @@ pub mod bounds;
 pub mod crs;
 pub mod error;
 pub mod io;
+#[cfg(feature = "mosaic")]
+pub mod mosaic;
 pub mod pixel;
 pub mod render;
 pub mod style;
