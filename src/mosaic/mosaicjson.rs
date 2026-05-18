@@ -9,6 +9,7 @@ use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::mosaic::quadkey::{lookup, QkLookup};
 use crate::mosaic::source::{AssetRef, MosaicSource};
+use crate::tms::TmsKind;
 
 /// MosaicJSON 0.0.x subset we consume. Unknown fields ignored.
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +28,10 @@ fn world_bounds() -> [f64; 4] {
     [-180.0, -90.0, 180.0, 90.0]
 }
 
+/// A [`MosaicSource`] backed by a cogeo-mosaic MosaicJSON quadkey index.
+///
+/// MosaicJSON quadkey indices are defined in the WebMercatorQuad tile matrix;
+/// using this source with another TMS is not meaningful.
 pub struct MosaicJsonSource {
     doc: MosaicJson,
     quadkey_zoom: u8,
@@ -59,7 +64,7 @@ impl MosaicJsonSource {
 
 #[async_trait::async_trait]
 impl MosaicSource for MosaicJsonSource {
-    async fn assets_for_tile(&self, z: u8, x: u32, y: u32) -> AgResult<Vec<AssetRef>> {
+    async fn assets_for_tile(&self, _tms: TmsKind, z: u8, x: u32, y: u32) -> AgResult<Vec<AssetRef>> {
         let mut urls: Vec<String> = Vec::new();
         match lookup(z, x, y, self.quadkey_zoom) {
             QkLookup::Exact(key) => {
@@ -122,7 +127,7 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-        let got = s.assets_for_tile(7, tx, ty).await.unwrap();
+        let got = s.assets_for_tile(TmsKind::WebMercatorQuad, 7, tx, ty).await.unwrap();
         let urls: Vec<_> = got.iter().map(|a| a.url.as_str()).collect();
         assert_eq!(urls, vec!["https://x/a.tif", "https://x/b.tif"]);
     }

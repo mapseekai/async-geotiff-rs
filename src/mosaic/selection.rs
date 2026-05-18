@@ -5,12 +5,18 @@ use ndarray::{Array2, Array3};
 use crate::error::{AgError, AgResult};
 use crate::pixel::{ImageData, PixelData};
 
+/// Strategy for combining overlapping pixels from multiple mosaic assets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelSelection {
+    /// First valid pixel by paint order wins; short-circuits once tile is fully covered.
     First,
+    /// Per-pixel maximum on band 0; short-circuits once tile is fully covered.
     Highest,
+    /// Per-pixel minimum on band 0; short-circuits once tile is fully covered.
     Lowest,
+    /// Per-pixel mean over all valid asset samples; all assets are read (no short-circuit).
     Mean,
+    /// Per-pixel median over all valid asset samples; all assets are read (no short-circuit).
     Median,
 }
 

@@ -62,10 +62,10 @@ impl StacSource {
 
 #[async_trait::async_trait]
 impl MosaicSource for StacSource {
-    async fn assets_for_tile(&self, z: u8, x: u32, y: u32) -> AgResult<Vec<AssetRef>> {
-        // 1. Compute tile bbox in Web Mercator (EPSG:3857), then convert to
+    async fn assets_for_tile(&self, tms: TmsKind, z: u8, x: u32, y: u32) -> AgResult<Vec<AssetRef>> {
+        // 1. Compute tile bbox in the requested TMS, then convert to
         //    WGS84 (EPSG:4326) for the STAC bbox filter.
-        let tms = Tms::new(TmsKind::WebMercatorQuad)?;
+        let tms = Tms::new(tms)?;
         let tb = tms.tile_bbox(z, x, y)?;
 
         // Four corners of the tile in EPSG:3857.

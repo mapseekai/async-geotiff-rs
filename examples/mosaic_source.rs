@@ -15,7 +15,7 @@ struct UrlList(Vec<AssetRef>);
 
 #[async_trait::async_trait]
 impl MosaicSource for UrlList {
-    async fn assets_for_tile(&self, _z: u8, _x: u32, _y: u32) -> AgResult<Vec<AssetRef>> {
+    async fn assets_for_tile(&self, _tms: async_geotiff::tms::TmsKind, _z: u8, _x: u32, _y: u32) -> AgResult<Vec<AssetRef>> {
         // Real code would filter by tile bbox intersection here.
         Ok(self.0.clone())
     }

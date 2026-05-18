@@ -1,13 +1,13 @@
 //! Multi-source pixel-level mosaic. See
 //! `docs/superpowers/specs/2026-05-18-mosaic-design.md`.
 
-pub mod mosaicjson;
+pub(crate) mod mosaicjson;
 mod reader_pool;
-pub mod quadkey;
-pub mod selection;
-pub mod source;
+pub(crate) mod quadkey;
+pub(crate) mod selection;
+pub(crate) mod source;
 #[cfg(feature = "stac")]
-pub mod stac;
+pub(crate) mod stac;
 
 pub use mosaicjson::MosaicJsonSource;
 pub use selection::PixelSelection;
@@ -28,6 +28,12 @@ use crate::tms::TmsKind;
 use reader_pool::ReaderPool;
 use selection::Reducer;
 
+/// Tuning knobs for [`MosaicTiler`].
+///
+/// `chunk_size` is the effective concurrency bound for per-asset reads/warps;
+/// each asset is processed via an independent `Tiler`, so the per-`Tiler`
+/// blocking semaphore does not bound the mosaic path — keep `chunk_size`
+/// modest under load.
 #[derive(Clone, Copy, Debug)]
 pub struct MosaicConfig {
     /// Assets fetched+warped in parallel per chunk; `is_done` is checked
@@ -46,6 +52,7 @@ impl Default for MosaicConfig {
     }
 }
 
+/// Renders mosaicked map tiles from multiple COG assets via a [`MosaicSource`].
 pub struct MosaicTiler<S: MosaicSource> {
     source: S,
     pool: ReaderPool,
@@ -53,10 +60,12 @@ pub struct MosaicTiler<S: MosaicSource> {
 }
 
 impl<S: MosaicSource> MosaicTiler<S> {
+    /// Create a new `MosaicTiler` with default [`MosaicConfig`].
     pub fn new(source: S) -> Self {
         Self::with_config(source, MosaicConfig::default())
     }
 
+    /// Create a `MosaicTiler` with explicit tuning parameters.
     pub fn with_config(source: S, cfg: MosaicConfig) -> Self {
         Self {
             pool: ReaderPool::new(cfg.reader_capacity),
@@ -78,7 +87,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
         selection: PixelSelection,
         style: &TileStyle,
     ) -> AgResult<Bytes> {
-        let assets = self.source.assets_for_tile(z, x, y).await?;
+        let assets = self.source.assets_for_tile(tms, z, x, y).await?;
         if assets.is_empty() {
             return crate::tiler::empty_tile(style.tilesize as usize);
         }
@@ -144,7 +153,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MosaicSource for OneLocal {
-        async fn assets_for_tile(&self, _z: u8, _x: u32, _y: u32) -> AgResult<Vec<AssetRef>> {
+        async fn assets_for_tile(&self, _tms: TmsKind, _z: u8, _x: u32, _y: u32) -> AgResult<Vec<AssetRef>> {
             Ok(vec![AssetRef {
                 url: self.abspath.clone(),
                 bbox: Bbox::new(-180.0, -90.0, 180.0, 90.0),
