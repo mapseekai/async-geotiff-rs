@@ -104,6 +104,25 @@ unified to F64 at the read/warp seam.
   libtiff-dev clang` on Debian/Ubuntu).
   Build without it via `cargo build --no-default-features`.
 
+## Issue Tracking
+
+Obsidian vault for problem tracking: `~/知识库/async-geotiff-rs/`
+
+**Folders:**
+- `Open/` — active issues under investigation
+- `Resolved-Pending/` — fixes awaiting validation
+- `Resolved/` — archived issues with solutions
+- `Deferred/` — not currently prioritized
+
+**Quick commands:**
+```bash
+obsidian vault="async-geotiff-rs" read path="async-geotiff-rs 问题汇总.md"
+obsidian vault="async-geotiff-rs" search query="memory"
+obsidian vault="async-geotiff-rs" search query="performance"
+```
+
+See `CHANGELOG.md` (English) or `~/知识库/async-geotiff-rs/CHANGELOG-CN.md` (中文) for version history.
+
 ## Architecture
 
 ```
