@@ -13,6 +13,18 @@ can land in any release** and are called out explicitly under a
 
 ### Added
 
+- Multi-source **mosaic** rendering (feature `mosaic`, on by default). A
+  `MosaicSource` trait + `AssetRef` define the asset-discovery extension point;
+  `MosaicJsonSource` resolves tiles against a MosaicJSON document via quadkey
+  lookup (preserving the document's metadata for crate consumers). A URL-keyed
+  `CogReader` pool shares open readers across assets, and `MosaicTiler`
+  orchestrates chunked parallel reads, pixel-selection reduction, and
+  early-exit once a tile is fully covered. Mosaic tiling is explicit about its
+  tile matrix.
+- Pixel-selection reducer for mosaics with five NaN-safe strategies:
+  `first`, `highest`, `lowest`, `mean`, and `median`.
+- `StacSource` for STAC-API-backed asset discovery, behind feature `stac`
+  (which implies `mosaic`).
 - `Resampling::Average` box-mean kernel: a same-CRS box filter and a
   cross-CRS path that uses the warp Jacobian footprint, matching GDAL/titiler
   `average` (antialiased downsample, nearest on upsample). Selectable from all
@@ -49,6 +61,8 @@ can land in any release** and are called out explicitly under a
   ignoring all but the first range.
 - Removed the unused `render::rescale` module; pipeline rendering remains the
   single implementation path for rescaling.
+- Extracted a `warp_tile` (read + warp) step out of the single-source tiler so
+  the mosaic path can reuse it; single-source behavior is unchanged.
 
 ## [0.0.2] - 2026-05-16
 
