@@ -1,4 +1,5 @@
 pub mod color_formula;
+pub mod expression;
 pub mod colormap;
 pub mod colour;
 pub mod composite;
