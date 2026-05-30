@@ -144,7 +144,7 @@ fn try_u8_rgb_fastpath(
         PixelData::U8(a) => a,
         _ => return None,
     };
-    if !style.formula.is_empty() {
+    if !style.formula.is_empty() || !style.expression.is_empty() {
         return None;
     }
     let bands = src.shape()[0];
@@ -482,7 +482,16 @@ fn eval_expression_band(
     let mut valid = Array2::<bool>::from_elem((h, w), true);
     let mut pixel_bands: Vec<f64> = vec![0.0; bands];
 
-    let is_nan_nodata = nodata.map(|nd| nd.is_nan()).unwrap_or(false);
+    // Unique referenced band indices (0-based), computed once.
+    let refs: Vec<usize> = {
+        let mut v: Vec<usize> = rpn.iter().filter_map(|t| match t {
+            crate::render::expression::Token::Band(i) => Some(*i),
+            _ => None,
+        }).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
 
     for row in 0..h {
         for col in 0..w {
@@ -491,24 +500,11 @@ fn eval_expression_band(
                 pixel_bands[b] = src[[b, row, col]];
             }
 
-            // Check nodata in any band referenced by the expression.
-            let mut nd_hit = false;
-            if let Some(nd) = nodata {
-                for &b in rpn.iter().filter_map(|t| match t {
-                    Token::Band(i) => Some(i),
-                    _ => None,
-                }) {
-                    let v = pixel_bands[b];
-                    if is_nan_nodata && v.is_nan() || !is_nan_nodata && (v - nd).abs() < 1e-9 {
-                        nd_hit = true;
-                        break;
-                    }
-                }
-            }
+            let ok = !crate::render::expression::referenced_nodata_hit(&pixel_bands, &refs, nodata);
 
             let value = eval_rpn(rpn, &pixel_bands);
             result[[row, col]] = value;
-            valid[[row, col]] = !nd_hit && value.is_finite();
+            valid[[row, col]] = ok && value.is_finite();
         }
     }
 
@@ -553,6 +549,27 @@ mod tests {
         let (_band, valid) =
             eval_expression_band(&src.view(), &rpn, Some(-9999.0), 1, 2).unwrap();
         assert!(!valid[[0, 0]], "nodata in referenced band → invalid");
+        assert!(valid[[0, 1]]);
+    }
+
+    #[test]
+    fn eval_expression_band_unreferenced_nodata_does_not_invalidate() {
+        use crate::render::expression::parse_expression;
+        // 2 bands; expression uses only b1; b2 has the nodata sentinel → pixel stays valid.
+        let src = ndarray::Array3::from_shape_vec((2, 1, 1), vec![0.5, -9999.0]).unwrap();
+        let rpn = parse_expression("b1").unwrap();
+        let (_band, valid) = eval_expression_band(&src.view(), &rpn, Some(-9999.0), 1, 1).unwrap();
+        assert!(valid[[0, 0]], "unreferenced-band nodata must not invalidate");
+    }
+
+    #[test]
+    fn eval_expression_band_nan_nodata_masks_referenced() {
+        use crate::render::expression::parse_expression;
+        // 1 band, 1x2; NaN nodata. pixel0 = NaN (referenced) → invalid; pixel1 = 0.5 → valid.
+        let src = ndarray::Array3::from_shape_vec((1, 1, 2), vec![f64::NAN, 0.5]).unwrap();
+        let rpn = parse_expression("b1").unwrap();
+        let (_band, valid) = eval_expression_band(&src.view(), &rpn, Some(f64::NAN), 1, 2).unwrap();
+        assert!(!valid[[0, 0]], "NaN nodata in referenced band → invalid");
         assert!(valid[[0, 1]]);
     }
 
