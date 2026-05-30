@@ -246,6 +246,10 @@ impl Resampling {
     /// valid value; returns the most frequent (ties → lowest value). Sub-pixel
     /// footprint degrades to Nearest (categorical data must not interpolate).
     /// Empty/all-invalid box returns `fill`.
+    ///
+    /// Pixel selection uses center-membership: only source pixels whose centers
+    /// lie within `[sc-rx, sc+rx] × [sr-ry, sr+ry]` are counted — unlike
+    /// `sample_average`, which includes partially-covered edge pixels.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn sample_mode(
@@ -273,6 +277,13 @@ impl Resampling {
         let c_hi = ((sc + rx).floor() as i64).clamp(0, w as i64 - 1) as usize;
         let r_lo = ((sr - ry).ceil().max(0.0)) as usize;
         let r_hi = ((sr + ry).floor() as i64).clamp(0, h as i64 - 1) as usize;
+
+        // Anisotropic footprints (one thin axis) can reverse a center-membership
+        // bound, leaving an empty box. Fall back to Nearest rather than emit a
+        // spurious nodata hole.
+        if c_lo > c_hi || r_lo > r_hi {
+            return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
+        }
 
         // Categorical rasters have few distinct classes → a small Vec of
         // (value, count) is cheaper than hashing f64 (which isn't Hash/Eq).
@@ -426,5 +437,17 @@ mod tests {
         let none_valid = ndarray::Array2::from_elem((2, 2), false);
         let v = Resampling::Mode.sample_mode(a.view(), Some(none_valid.view()), 0.5, 0.5, 1.0, 1.0, -7.0);
         assert_eq!(v, -7.0);
+    }
+
+    #[test]
+    fn mode_anisotropic_thin_axis_does_not_hole() {
+        // rx wide, ry thin (<0.5): the thin-axis center-membership bound would
+        // reverse to an empty box; must fall back to Nearest, not return fill.
+        let a = ndarray::array![[3.0, 3.0, 7.0], [3.0, 7.0, 7.0]];
+        let v = Resampling::Mode.sample_mode(a.view(), None, 1.0, 0.5, 1.0, 0.3, -1.0);
+        assert_ne!(v, -1.0, "anisotropic footprint must not produce a fill hole");
+        // Nearest at (1.0, 0.5) rounds to a real cell value (3 or 7), never fill.
+        let n = Resampling::Nearest.sample_masked(a.view(), None, 1.0, 0.5, -1.0);
+        assert_eq!(v, n);
     }
 }
