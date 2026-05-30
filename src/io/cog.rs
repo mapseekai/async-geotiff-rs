@@ -63,6 +63,8 @@ pub struct CogReader {
     /// Associated/UnassociatedAlpha. Mirrors rio-tiler's
     /// "alpha band > nodata > none" mask priority.
     alpha_bands: Vec<Option<usize>>,
+    /// Per-band `(scale, offset)` from GDAL metadata (identity where absent).
+    band_scale_offset: Vec<(f64, f64)>,
     /// Decoded-window cache. Keyed by `(level, col, row, w, h)`; value is a
     /// shared `Arc<ImageData>` so cache hits clone a pointer, not a buffer.
     window_cache: WindowCache,
@@ -170,6 +172,12 @@ impl CogReader {
             .iter()
             .map(|&idx| tiff.ifds().get(idx).and_then(alpha_band_index))
             .collect();
+        let band_scale_offset = {
+            let ifd = tiff.ifds().get(data_ifds[0]);
+            let bands = ifd.map(|i| i.samples_per_pixel() as usize).unwrap_or(0);
+            let md = ifd.and_then(|i| i.gdal_metadata());
+            crate::io::scale_offset::parse_scale_offset(md, bands)
+        };
         Ok(Self {
             tiff,
             reader,
@@ -178,6 +186,7 @@ impl CogReader {
             data_ifds,
             mask_ifds,
             alpha_bands,
+            band_scale_offset,
             window_cache: build_window_cache(config.cache),
             decode_semaphore: Arc::new(Semaphore::new(config.decode_task_limit())),
         })
@@ -475,6 +484,12 @@ impl CogReader {
         })
     }
 
+    /// Per-band `(scale, offset)` from GDAL metadata; identity `(1.0, 0.0)`
+    /// where absent. Apply as `physical = raw * scale + offset` when unscaling.
+    pub fn band_scale_offset(&self) -> &[(f64, f64)] {
+        &self.band_scale_offset
+    }
+
     pub(crate) fn data_ifd(&self, level: usize) -> AgResult<&ImageFileDirectory> {
         let idx = self.data_ifd_index(level)?;
         self.tiff
@@ -672,6 +687,27 @@ fn alpha_band_index(ifd: &ImageFileDirectory) -> Option<usize> {
         )
         .then_some(base + i)
     })
+}
+
+#[cfg(test)]
+mod scale_offset_reader_tests {
+    #[tokio::test]
+    async fn band_scale_offset_defaults_to_identity() {
+        use crate::io::{CogReader, ObjectReader};
+        use object_store::local::LocalFileSystem;
+        use std::sync::Arc;
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+        let r = CogReader::open_with_reader(ObjectReader::new(
+            fs,
+            object_store::path::Path::from("data/cog_uint8_rgb_nodata.tif"),
+        ))
+        .await
+        .unwrap();
+        // RGB fixture without SCALE/OFFSET metadata → identity per band.
+        let so = r.band_scale_offset();
+        assert!(so.iter().all(|&(s, o)| s == 1.0 && o == 0.0));
+        assert_eq!(so.len(), 3);
+    }
 }
 
 #[cfg(test)]

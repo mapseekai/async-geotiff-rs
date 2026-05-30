@@ -4,7 +4,6 @@
 //! `<Item name="OFFSET" sample="0">0</Item>`. Bands without metadata default
 //! to identity `(1.0, 0.0)`.
 
-#[allow(dead_code)]
 fn items(xml: &str) -> Vec<(String, usize, String)> {
     use quick_xml::events::Event;
 
@@ -49,7 +48,6 @@ fn items(xml: &str) -> Vec<(String, usize, String)> {
 }
 
 /// Returns `bands` entries of `(scale, offset)`, identity where absent.
-#[allow(dead_code)]
 pub fn parse_scale_offset(gdal_metadata: Option<&str>, bands: usize) -> Vec<(f64, f64)> {
     let parsed = gdal_metadata.map(items).unwrap_or_default();
     let get = |name: &str, b: usize| -> Option<f64> {
