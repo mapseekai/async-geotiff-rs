@@ -11,6 +11,21 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-05-31
+
+### Added
+
+- `CogReader::point(x, y, coord_crs, bidx)` — sample the full-resolution pixel
+  value(s) at a coordinate (titiler `/point` equivalent as a library method).
+  Returns `Option<PointValue { values: Vec<f64>, valid: bool }>`. The input
+  coordinate is given in `coord_crs` (pass `Crs::epsg(4326)` for lon/lat) and
+  reprojected to the dataset's source CRS. `bidx` is a 1-indexed band selection
+  (empty = all bands, in order); values are raw decoded samples (no scale/
+  offset). `valid` is `false` when the pixel is masked or any returned band hits
+  nodata (NaN-aware). Returns `Ok(None)` for coordinates outside the dataset
+  extent or the projection's valid domain; `Err(AgError::query)` for a band
+  index that is 0 or exceeds the band count.
+
 ## [0.0.5] - 2026-05-30
 
 ### Added
