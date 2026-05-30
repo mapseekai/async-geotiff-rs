@@ -11,6 +11,17 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-05-30
+
+### Added
+
+- `unscale` style flag: applies per-band GDAL `SCALE`/`OFFSET` metadata (TIFF tag 42112) as `physical = raw * scale + offset` before rendering. Auto-stretch bounds are unscaled to match, so `unscale=true` renders correct colors without an explicit `rescale` (#4).
+- `Resampling::Mode` (`?resampling=mode` / `?reproject=mode`): majority resampling for categorical/classification rasters. Downsample-only (degrades to nearest on upsample); ties resolve to the lowest value (#5).
+
+### Known limitations
+
+- `unscale` applies the single GDAL nodata sentinel through band 0's scale/offset. For multi-band COGs whose bands carry *different* scale/offset affines and rely on a value-based nodata sentinel, interior nodata in bands 1+ may not mask correctly. Single-affine and mask-IFD/alpha datasets are unaffected.
+
 ## [0.0.3] - 2026-05-30
 
 ### Added
