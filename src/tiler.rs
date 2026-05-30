@@ -99,8 +99,11 @@ impl Tiler {
         // meaningless for an index like NDVI). Explicit `rescale` already
         // returned above and wins.
         if style.expression.is_some() {
+            // Match render's nodata source (`style.nodata.or(image.nodata)`) so
+            // the stretch is computed over the same pixel set that renders.
+            let nodata = compiled.nodata.or(image.nodata);
             let (lo, hi) =
-                expression_rescale(image, &compiled.expression).unwrap_or((-1.0, 1.0));
+                expression_rescale(image, &compiled.expression, nodata).unwrap_or((-1.0, 1.0));
             let mut next = (**compiled).clone();
             next.rescale = vec![(lo, hi)];
             next.composite.vmin = Some(vec![lo]);
@@ -364,12 +367,12 @@ impl Tiler {
 fn expression_rescale(
     image: &ImageData,
     rpn: &[crate::render::expression::Token],
+    nodata: Option<f64>,
 ) -> Option<(f64, f64)> {
     use crate::render::expression::{eval_rpn, referenced_nodata_hit, Token};
     let src = image.pixels.to_f64();
     let bands = src.shape()[0];
     let (h, w) = (src.shape()[1], src.shape()[2]);
-    let nodata = image.nodata;
     let refs: Vec<usize> = {
         let mut v: Vec<usize> = rpn
             .iter()
@@ -597,7 +600,7 @@ mod tests {
             bbox: crate::bounds::Bbox::new(0.0,0.0,2.0,1.0),
         };
         let rpn = parse_expression("(b2-b1)/(b2+b1)").unwrap();
-        assert!(expression_rescale(&img, &rpn).is_none());
+        assert!(expression_rescale(&img, &rpn, None).is_none());
     }
 
     #[test]
@@ -624,7 +627,7 @@ mod tests {
             bbox: crate::bounds::Bbox::new(0.0, 0.0, 3.0, 1.0),
         };
         let rpn = parse_expression("(b2-b1)/(b2+b1)").unwrap();
-        let (lo, hi) = expression_rescale(&img, &rpn).expect("finite range");
+        let (lo, hi) = expression_rescale(&img, &rpn, None).expect("finite range");
         assert!((lo - 0.0).abs() < 1e-9, "lo={lo}");
         assert!((hi - 0.5).abs() < 1e-9, "hi={hi}");
         assert!(hi < 1.0, "range must be NDVI units, not DN");
