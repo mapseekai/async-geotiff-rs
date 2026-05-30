@@ -8,13 +8,14 @@
 //! Validity mask is applied as a single `Zip` over the alpha channel.
 
 use bytes::Bytes;
-use ndarray::{s, Array2, Array3, Axis, Zip};
+use ndarray::{ArrayView3, s, Array2, Array3, Axis, Zip};
 
 use crate::error::{AgError, AgResult};
 use crate::pixel::ImageData;
 use crate::render::color_formula::Op;
 use crate::render::composite::{Composite, HandleGet};
 use crate::render::encode::encode_png;
+use crate::render::expression::{eval_rpn, max_band_ref, Token};
 use crate::warp::resampler::Resampling;
 
 // `tile_size` and `resampling` on CompiledTileStyle are kept for callers
@@ -27,6 +28,8 @@ pub struct CompiledTileStyle {
     pub composite: Composite,
     pub rescale: Vec<(f64, f64)>,
     pub formula: Vec<Op>,
+    /// RPN tokens from a band-math `expression=` param. Empty when not used.
+    pub expression: Vec<crate::render::expression::Token>,
     pub bidx: Vec<usize>, // 0-indexed after compile
     pub nodata: Option<f64>,
     pub tile_size: u32,
@@ -435,6 +438,73 @@ fn unit_to_u8(value: f64) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+/// Evaluate a band-math RPN expression over every pixel in `src` (shape C×H×W).
+///
+/// Returns `(result_band, valid_mask)`:
+/// - `result_band`: `Array2<f64>` of shape `(h, w)` with the expression value per pixel.
+/// - `valid_mask`: `Array2<bool>` of shape `(h, w)`; `false` where the result is
+///   non-finite (NaN / ±Inf) or any referenced band pixel equals `nodata`.
+///
+/// Errors if the expression references a band index that exceeds the number of
+/// source bands in `src` (a `AgError::Query`).
+pub fn eval_expression_band(
+    src: &ArrayView3<f64>,
+    rpn: &[Token],
+    nodata: Option<f64>,
+    h: usize,
+    w: usize,
+) -> AgResult<(Array2<f64>, Array2<bool>)> {
+    let bands = src.shape()[0];
+    if let Some(max_idx) = max_band_ref(rpn) {
+        if max_idx >= bands {
+            return Err(AgError::query(
+                "expression",
+                format!(
+                    "expression references b{} but source has only {} band(s)",
+                    max_idx + 1,
+                    bands
+                ),
+            ));
+        }
+    }
+
+    let mut result = Array2::<f64>::zeros((h, w));
+    let mut valid = Array2::<bool>::from_elem((h, w), true);
+    let mut pixel_bands: Vec<f64> = vec![0.0; bands];
+
+    let is_nan_nodata = nodata.map(|nd| nd.is_nan()).unwrap_or(false);
+
+    for row in 0..h {
+        for col in 0..w {
+            // Gather all band values for this pixel.
+            for b in 0..bands {
+                pixel_bands[b] = src[[b, row, col]];
+            }
+
+            // Check nodata in any band referenced by the expression.
+            let mut nd_hit = false;
+            if let Some(nd) = nodata {
+                for &b in rpn.iter().filter_map(|t| match t {
+                    Token::Band(i) => Some(i),
+                    _ => None,
+                }) {
+                    let v = pixel_bands[b];
+                    if is_nan_nodata && v.is_nan() || !is_nan_nodata && (v - nd).abs() < 1e-9 {
+                        nd_hit = true;
+                        break;
+                    }
+                }
+            }
+
+            let value = eval_rpn(rpn, &pixel_bands);
+            result[[row, col]] = value;
+            valid[[row, col]] = !nd_hit && value.is_finite();
+        }
+    }
+
+    Ok((result, valid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +539,7 @@ mod tests {
             composite: comp,
             rescale: vec![],
             formula: vec![],
+            expression: vec![],
             bidx: vec![],
             nodata: None,
             tile_size: 16,
@@ -502,6 +573,7 @@ mod tests {
             composite: comp,
             rescale: vec![],
             formula: vec![],
+            expression: vec![],
             bidx: vec![],
             nodata: None,
             tile_size: 8,
@@ -534,6 +606,7 @@ mod tests {
             composite: comp,
             rescale: vec![(0.0, 100.0)],
             formula: vec![],
+            expression: vec![],
             bidx: vec![],
             nodata: None,
             tile_size: 2,
@@ -567,6 +640,7 @@ mod tests {
             composite: comp,
             rescale: vec![],
             formula: vec![],
+            expression: vec![],
             bidx: vec![1],
             nodata: None,
             tile_size: 1,
@@ -597,6 +671,7 @@ mod tests {
             composite: comp,
             rescale: vec![(0.0, 255.0), (0.0, 255.0), (0.0, 255.0)],
             formula: vec![],
+            expression: vec![],
             bidx: vec![],
             nodata: None,
             tile_size: 1,
@@ -630,6 +705,7 @@ mod tests {
             composite: comp,
             rescale: vec![],
             formula: vec![],
+            expression: vec![],
             bidx: vec![],
             nodata: None,
             tile_size: 1,

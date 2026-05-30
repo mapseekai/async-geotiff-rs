@@ -26,6 +26,8 @@ pub struct TileStyle {
     /// Mutually exclusive with `colormap_name`.
     pub colormap: Option<String>,
     pub color_formula: Option<String>,
+    /// Band-math expression, e.g. "(b5-b4)/(b5+b4)". Mutually exclusive with bidx/color_formula.
+    pub expression: Option<String>,
     pub resampling: Resampling,
     pub reproject: Resampling,
     pub tilesize: u32,
@@ -44,6 +46,7 @@ impl Default for TileStyle {
             colormap_name: None,
             colormap: None,
             color_formula: None,
+            expression: None,
             resampling: Resampling::Nearest,
             reproject: Resampling::Nearest,
             tilesize: 256,
@@ -121,6 +124,7 @@ impl TileStyle {
             "colormap_name" => self.colormap_name = Some(v.to_owned()),
             "colormap" => self.colormap = Some(v.to_owned()),
             "color_formula" => self.color_formula = Some(v.to_owned()),
+            "expression" => self.expression = Some(v.to_owned()),
             "resampling" => {
                 self.resampling =
                     Resampling::parse(v).ok_or_else(|| AgError::query("resampling", v))?
@@ -182,11 +186,34 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
         return Err(AgError::query("bidx", format!("{bad} is not 1-indexed")));
     }
 
+    // expression mutual-exclusion guards
+    if style.expression.is_some() {
+        if !style.bidx.is_empty() {
+            return Err(AgError::query(
+                "expression",
+                "expression and bidx are mutually exclusive",
+            ));
+        }
+        if style.color_formula.as_deref().is_some_and(|s| !s.is_empty()) {
+            return Err(AgError::query(
+                "expression",
+                "expression and color_formula are mutually exclusive",
+            ));
+        }
+        if style.rescale.len() > 1 {
+            return Err(AgError::query(
+                "expression",
+                "expression accepts at most one rescale range",
+            ));
+        }
+    }
+
     let auto_rgb = style.bidx.is_empty()
         && style.rescale.is_empty()
         && style.colormap_name.is_none()
         && style.colormap.is_none()
-        && style.color_formula.is_none();
+        && style.color_formula.is_none()
+        && style.expression.is_none();
 
     let composite = if let Some(cm) = &style.colormap {
         // Inline JSON colormap → reuse the existing ColourDefinition machinery.
@@ -232,10 +259,16 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
         _ => vec![],
     };
 
+    let expression = match &style.expression {
+        Some(s) => crate::render::expression::parse_expression(s)?,
+        None => Vec::new(),
+    };
+
     Ok(CompiledTileStyle {
         composite,
         rescale: style.rescale.clone(),
         formula,
+        expression,
         bidx: style.bidx.iter().map(|b| *b as usize - 1).collect(),
         nodata: style.nodata,
         tile_size: style.tilesize,
@@ -375,6 +408,75 @@ mod tests {
         let s = TileStyle::from_query("unscale=true").unwrap();
         assert!(s.unscale);
         assert!(!TileStyle::default().unscale);
+    }
+
+    #[test]
+    fn expression_compiles_to_rpn() {
+        let s = TileStyle {
+            expression: Some("(b2-b1)/(b2+b1)".into()),
+            ..TileStyle::default()
+        };
+        let c = compile(&s).unwrap();
+        assert!(!c.expression.is_empty(), "expression RPN should be populated");
+    }
+
+    #[test]
+    fn expression_and_bidx_are_mutually_exclusive() {
+        let s = TileStyle {
+            expression: Some("b1".into()),
+            bidx: vec![1],
+            ..TileStyle::default()
+        };
+        assert!(compile(&s).is_err());
+    }
+
+    #[test]
+    fn expression_and_color_formula_are_mutually_exclusive() {
+        let s = TileStyle {
+            expression: Some("b1".into()),
+            color_formula: Some("gamma rgb 1.2".into()),
+            ..TileStyle::default()
+        };
+        assert!(compile(&s).is_err());
+    }
+
+    #[test]
+    fn invalid_expression_is_query_error() {
+        let s = TileStyle {
+            expression: Some("b1+".into()),
+            ..TileStyle::default()
+        };
+        assert!(matches!(compile(&s), Err(AgError::Query { .. })));
+    }
+
+    #[test]
+    fn expression_parsed_from_query() {
+        let s = TileStyle::from_query("expression=b1%2Bb2").unwrap();
+        assert_eq!(s.expression.as_deref(), Some("b1+b2"));
+    }
+
+    #[test]
+    fn expression_rejects_multiple_rescale_ranges() {
+        let s = TileStyle {
+            expression: Some("(b2-b1)/(b2+b1)".into()),
+            rescale: vec![(0.0, 1.0), (0.0, 1.0), (0.0, 1.0)],
+            ..TileStyle::default()
+        };
+        assert!(matches!(compile(&s), Err(AgError::Query { .. })));
+    }
+
+    #[test]
+    fn expression_only_style_is_single_band_gradient() {
+        use crate::render::composite::CompositeKind;
+        // No colormap, no rescale → expression band uses the default greys gradient,
+        // NOT an RGB composite.
+        let s = TileStyle {
+            expression: Some("(b2-b1)/(b2+b1)".into()),
+            ..TileStyle::default()
+        };
+        let c = compile(&s).unwrap();
+        assert_eq!(c.composite.kind, CompositeKind::Gradient);
+        assert!(!c.auto_rgb);
     }
 
     #[test]
