@@ -9,11 +9,12 @@ use crate::render::colour::Colour;
 use crate::render::composite::ColourDefinition;
 
 /// Route titiler `colormap=` JSON to a `ColourDefinition` by top-level shape.
-pub fn parse_colormap_param(s: &str) -> AgResult<ColourDefinition> {
+pub(crate) fn parse_colormap_param(s: &str) -> AgResult<ColourDefinition> {
     let head = s.trim_start().chars().next();
     match head {
         Some('{') => {
             // Discrete: { "<int>": [r,g,b,a], ... }
+            // Duplicate keys: last value wins (BTreeMap dedupe, matches titiler).
             let map: std::collections::BTreeMap<String, Colour> = serde_json::from_str(s)
                 .map_err(|e| AgError::query("colormap", format!("discrete colormap: {e}")))?;
             let mut pairs = Vec::with_capacity(map.len());
@@ -36,6 +37,12 @@ pub fn parse_colormap_param(s: &str) -> AgResult<ColourDefinition> {
                 return Err(AgError::query(
                     "colormap",
                     "gradient colormap needs at least 2 stops",
+                ));
+            }
+            if breaks.iter().any(|(p, _)| !p.is_finite()) {
+                return Err(AgError::query(
+                    "colormap",
+                    "gradient stop positions must be finite",
                 ));
             }
             Ok(ColourDefinition::ColoursAndBreaks(breaks))
@@ -105,6 +112,13 @@ mod tests {
     #[test]
     fn empty_discrete_is_query_error() {
         let err = parse_colormap_param("{}").unwrap_err();
+        assert!(matches!(err, AgError::Query { .. }));
+    }
+
+    #[test]
+    fn non_finite_gradient_position_is_query_error() {
+        // JSON `null` deserialises to f64::NAN for the stop position.
+        let err = parse_colormap_param(r#"[[null,[255,0,0,255]],[1.0,[0,0,255,255]]]"#).unwrap_err();
         assert!(matches!(err, AgError::Query { .. }));
     }
 }

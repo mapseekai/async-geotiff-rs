@@ -11,7 +11,7 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
-## [0.0.3]
+## [0.0.3] - 2026-05-30
 
 ### Added
 

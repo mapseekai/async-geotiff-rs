@@ -186,6 +186,9 @@ impl CogReader {
     /// Open a COG from an existing object store and key, building the
     /// `ObjectReader` internally. Lets callers wire any `object_store`
     /// backend (S3/MinIO, GCS, local, …) without naming `ObjectReader`.
+    ///
+    /// `key` must be a **decoded** object key (e.g. `"data/my file.tif"`),
+    /// not a URL-encoded string — it is passed verbatim to `Path::from`.
     pub async fn open_object_store(
         store: Arc<dyn ObjectStore>,
         key: &str,
