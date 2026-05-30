@@ -11,6 +11,18 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-05-30
+
+### Added
+
+- Band-math `expression` style param (e.g. `expression=(b5-b4)/(b5+b4)`): an arithmetic evaluator (`+ - * /`, parentheses, unary minus, decimal literals, 1-indexed `b<N>`) computes a synthetic single band that is then rescaled and colormapped. Division-by-zero / non-finite results and nodata in any referenced band render transparent. Mutually exclusive with `bidx` and `color_formula`; accepts at most one `rescale` range (#1).
+- Typed `Index` spectral-index sugar (`Ndvi`, `Ndwi`, `Ndbi`, `Evi`, `Savi`) lowering to expression strings via `Index::to_expression()`.
+- When `expression` is set without an explicit `rescale`, the stretch is derived from the computed index's own value range (not the source bands' raw statistics). Pass e.g. `rescale=-1,1` for a fixed normalized-index range.
+
+### Known limitations
+
+- Expression output is single-band; comma-separated multi-band expressions and functions (`sqrt`/`abs`/…) are not supported in this release. Numbers are plain decimals — scientific notation (`1e3`) is not accepted.
+
 ## [0.0.4] - 2026-05-30
 
 ### Added
