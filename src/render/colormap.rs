@@ -16,7 +16,7 @@ const BUILTINS: &[(&str, &colorous::Gradient)] = &[
     ("greys", &colorous::GREYS),
 ];
 
-/// Matplotlib `terrain` stops: deep blue → cyan → green → tan → brown → white.
+/// Matplotlib `terrain` stops: deep blue → cyan → green → sand → brown → white.
 /// Not part of the `colorous` set, so built from explicit stops.
 const TERRAIN_STOPS: &[(f64, [f64; 4])] = &[
     (0.00, [0.2, 0.2, 0.6, 1.0]),
@@ -122,6 +122,9 @@ mod tests {
 
     #[test]
     fn terrain_is_case_insensitive() {
-        assert!(builtin_lut("Terrain").is_ok());
+        assert_eq!(
+            builtin_lut("Terrain").unwrap(),
+            builtin_lut("terrain").unwrap()
+        );
     }
 }
