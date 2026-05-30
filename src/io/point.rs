@@ -266,6 +266,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn point_reprojects_lonlat_onto_non_4326_dataset() {
+        // Fixture is EPSG:3857; querying in lon/lat (4326) forces the
+        // reprojection branch in `coord_to_pixel` (Projector::new + convert),
+        // unlike the 4326 fixture where the equal-CRS short-circuit fires.
+        use async_tiff::reader::ObjectReader;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path;
+        let fs = std::sync::Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+        let r = CogReader::open_with_reader(ObjectReader::new(
+            fs,
+            Path::from("data/output_3857_cog.tif"),
+        ))
+        .await
+        .unwrap();
+        assert_ne!(r.src_crs(), &Crs::epsg(4326), "fixture should be non-4326");
+        let [w, s, e, n] = r.wgs84_bounds().unwrap();
+        let (lon, lat) = ((w + e) / 2.0, (s + n) / 2.0);
+        let pv = r
+            .point(lon, lat, &Crs::epsg(4326), &[])
+            .await
+            .unwrap()
+            .expect("center lon/lat should reproject to an interior pixel");
+        assert!(!pv.values.is_empty());
+    }
+
+    #[tokio::test]
     async fn point_outside_extent_is_none() {
         let r = rgb_reader().await;
         let [_w, _s, _e, n] = r.wgs84_bounds().unwrap();
