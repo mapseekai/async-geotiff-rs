@@ -79,13 +79,13 @@ impl CogReader {
         Self::open_http_with_options(url, default_client_options()).await
     }
 
-    /// Like [`open_http`] but lets the caller override [`ClientOptions`]
+    /// Like [`Self::open_http`] but lets the caller override [`ClientOptions`]
     /// (e.g. timeouts, proxy, custom headers).
     pub async fn open_http_with_options(url: &str, options: ClientOptions) -> AgResult<Self> {
         Self::open_http_with_cache(url, options, CacheConfig::default()).await
     }
 
-    /// Like [`open_http_with_options`] but also lets the caller size the
+    /// Like [`Self::open_http_with_options`] but also lets the caller size the
     /// decoded-window cache.
     pub async fn open_http_with_cache(
         url: &str,
@@ -103,7 +103,7 @@ impl CogReader {
         .await
     }
 
-    /// Like [`open_http_with_cache`] but lets callers configure both cache
+    /// Like [`Self::open_http_with_cache`] but lets callers configure both cache
     /// capacity and CPU decode concurrency.
     pub async fn open_http_with_config(
         url: &str,
@@ -193,7 +193,7 @@ impl CogReader {
         Self::open_object_store_with_config(store, key, ReaderConfig::default()).await
     }
 
-    /// Like [`open_object_store`] but lets the caller size the decoded-window
+    /// Like [`Self::open_object_store`] but lets the caller size the decoded-window
     /// cache.
     pub async fn open_object_store_with_cache(
         store: Arc<dyn ObjectStore>,
@@ -211,7 +211,7 @@ impl CogReader {
         .await
     }
 
-    /// Like [`open_object_store`] but lets callers configure cache capacity
+    /// Like [`Self::open_object_store`] but lets callers configure cache capacity
     /// and CPU decode concurrency.
     pub async fn open_object_store_with_config(
         store: Arc<dyn ObjectStore>,
