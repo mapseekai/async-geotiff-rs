@@ -22,6 +22,11 @@ pub enum Resampling {
     /// degrades to nearest-neighbour when upsampling (same behaviour as
     /// GDAL / titiler `resampling=average`).
     Average,
+    /// Majority (most-frequent) value over the source footprint a destination
+    /// pixel covers — for categorical/classification rasters. Downsample-only:
+    /// a sub-pixel footprint degrades to Nearest (never interpolates). Ties
+    /// resolve to the lowest value. Matches GDAL/titiler `resampling=mode`.
+    Mode,
 }
 
 impl Resampling {
@@ -33,6 +38,7 @@ impl Resampling {
             "cubic_spline" | "mitchell" => Some(Self::CubicSpline),
             "lanczos" | "lanczos3" => Some(Self::Lanczos),
             "average" => Some(Self::Average),
+            "mode" => Some(Self::Mode),
             _ => None,
         }
     }
@@ -99,7 +105,7 @@ impl Resampling {
         // not the mask reads. Kept strided to avoid complexity for no gain.
 
         match self {
-            Self::Nearest => {
+            Self::Nearest | Self::Mode => {
                 let c = cf.round().clamp(0.0, (w - 1) as f64) as usize;
                 let r = rf.round().clamp(0.0, (h - 1) as f64) as usize;
                 if let Some(m) = valid {
@@ -235,6 +241,71 @@ impl Resampling {
             sum / count as f64
         }
     }
+
+    /// Majority value over the source footprint `[sc±rx, sr±ry]`. Counts each
+    /// valid value; returns the most frequent (ties → lowest value). Sub-pixel
+    /// footprint degrades to Nearest (categorical data must not interpolate).
+    /// Empty/all-invalid box returns `fill`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_mode(
+        self,
+        view: ArrayView2<f64>,
+        valid: Option<ArrayView2<bool>>,
+        sc: f64,
+        sr: f64,
+        rx: f64,
+        ry: f64,
+        fill: f64,
+    ) -> f64 {
+        let (h, w) = (view.shape()[0], view.shape()[1]);
+        if w == 0 || h == 0 {
+            return fill;
+        }
+        if !sc.is_finite() || !sr.is_finite() {
+            return fill;
+        }
+        // Sub-pixel footprint => nearest (NOT bilinear — no interpolation).
+        if rx < 0.5 && ry < 0.5 {
+            return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
+        }
+        let c_lo = ((sc - rx).ceil().max(0.0)) as usize;
+        let c_hi = ((sc + rx).floor() as i64).clamp(0, w as i64 - 1) as usize;
+        let r_lo = ((sr - ry).ceil().max(0.0)) as usize;
+        let r_hi = ((sr + ry).floor() as i64).clamp(0, h as i64 - 1) as usize;
+
+        // Categorical rasters have few distinct classes → a small Vec of
+        // (value, count) is cheaper than hashing f64 (which isn't Hash/Eq).
+        let mut tally: Vec<(f64, u32)> = Vec::new();
+        for r in r_lo..=r_hi {
+            for c in c_lo..=c_hi {
+                let ok = match valid {
+                    Some(m) => m[[r, c]],
+                    None => true,
+                };
+                if !ok {
+                    continue;
+                }
+                let val = view[[r, c]];
+                if let Some(e) = tally.iter_mut().find(|(v, _)| *v == val) {
+                    e.1 += 1;
+                } else {
+                    tally.push((val, 1));
+                }
+            }
+        }
+        tally
+            .into_iter()
+            .reduce(|best, cur| {
+                if cur.1 > best.1 || (cur.1 == best.1 && cur.0 < best.0) {
+                    cur
+                } else {
+                    best
+                }
+            })
+            .map(|(v, _)| v)
+            .unwrap_or(fill)
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +385,46 @@ mod tests {
         let avg = Resampling::Average.sample_average(a.view(), None, 0.5, 0.0, 0.3, 0.3, 0.0);
         let bil = Resampling::Bilinear.sample_masked(a.view(), None, 0.5, 0.0, 0.0);
         assert_eq!(avg, bil); // sub-1px footprint delegates to bilinear
+    }
+
+    #[test]
+    fn parse_mode() {
+        assert_eq!(Resampling::parse("mode"), Some(Resampling::Mode));
+    }
+
+    #[test]
+    fn mode_box_majority() {
+        let a = ndarray::array![
+            [5.0, 5.0, 1.0, 1.0],
+            [5.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0]
+        ];
+        // footprint over top-left 2x2 (values 5,5,5,1) → majority 5
+        let v = Resampling::Mode.sample_mode(a.view(), None, 0.5, 0.5, 1.0, 1.0, -1.0);
+        assert_eq!(v, 5.0);
+    }
+
+    #[test]
+    fn mode_subpixel_uses_nearest_not_bilinear() {
+        let a = ndarray::array![[0.0, 10.0], [0.0, 10.0]];
+        let m = Resampling::Mode.sample_mode(a.view(), None, 0.5, 0.0, 0.3, 0.3, -1.0);
+        let n = Resampling::Nearest.sample_masked(a.view(), None, 0.5, 0.0, -1.0);
+        assert_eq!(m, n);
+    }
+
+    #[test]
+    fn mode_ties_pick_lowest_value() {
+        let a = ndarray::array![[1.0, 2.0], [2.0, 1.0]];
+        let v = Resampling::Mode.sample_mode(a.view(), None, 0.5, 0.5, 1.0, 1.0, -1.0);
+        assert_eq!(v, 1.0);
+    }
+
+    #[test]
+    fn mode_all_invalid_returns_fill() {
+        let a = ndarray::Array2::from_elem((2, 2), 5.0);
+        let none_valid = ndarray::Array2::from_elem((2, 2), false);
+        let v = Resampling::Mode.sample_mode(a.view(), Some(none_valid.view()), 0.5, 0.5, 1.0, 1.0, -7.0);
+        assert_eq!(v, -7.0);
     }
 }

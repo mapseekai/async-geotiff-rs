@@ -405,6 +405,7 @@ fn try_subtile_affine(
         Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
         Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
         Resampling::Average => fr::ResizeAlg::Convolution(fr::FilterType::Box),
+        Resampling::Mode => fr::ResizeAlg::Nearest, // mode bypasses fr (wired in B2)
     };
     let options = fr::ResizeOptions::new()
         .resize_alg(alg)
@@ -536,6 +537,7 @@ fn warp_affine(
         Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
         Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
         Resampling::Average => fr::ResizeAlg::Convolution(fr::FilterType::Box),
+        Resampling::Mode => fr::ResizeAlg::Nearest, // mode bypasses fr (wired in B2)
     };
     let options = fr::ResizeOptions::new().resize_alg(alg).crop(
         crop_left,
