@@ -142,6 +142,33 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Common spectral indices. Band numbers are 1-indexed (as in `b<N>`).
+/// Lowers to an arithmetic expression string evaluated by the same engine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Index {
+    Ndvi { nir: u32, red: u32 },
+    Ndwi { green: u32, nir: u32 },
+    Ndbi { swir: u32, nir: u32 },
+    Evi { nir: u32, red: u32, blue: u32 },
+    Savi { nir: u32, red: u32, l: f64 },
+}
+
+impl Index {
+    pub fn to_expression(&self) -> String {
+        match *self {
+            Index::Ndvi { nir, red } => format!("(b{nir}-b{red})/(b{nir}+b{red})"),
+            Index::Ndwi { green, nir } => format!("(b{green}-b{nir})/(b{green}+b{nir})"),
+            Index::Ndbi { swir, nir } => format!("(b{swir}-b{nir})/(b{swir}+b{nir})"),
+            Index::Evi { nir, red, blue } => {
+                format!("2.5*(b{nir}-b{red})/(b{nir}+6*b{red}-7.5*b{blue}+1)")
+            }
+            Index::Savi { nir, red, l } => {
+                format!("(1+{l})*(b{nir}-b{red})/(b{nir}+b{red}+{l})")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
