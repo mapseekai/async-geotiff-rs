@@ -173,7 +173,7 @@ impl CogReader {
             .map(|&idx| tiff.ifds().get(idx).and_then(alpha_band_index))
             .collect();
         let band_scale_offset = {
-            let ifd = tiff.ifds().get(data_ifds[0]);
+            let ifd = data_ifds.first().and_then(|&idx| tiff.ifds().get(idx));
             let bands = ifd.map(|i| i.samples_per_pixel() as usize).unwrap_or(0);
             let md = ifd.and_then(|i| i.gdal_metadata());
             crate::io::scale_offset::parse_scale_offset(md, bands)
