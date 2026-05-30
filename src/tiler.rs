@@ -94,6 +94,20 @@ impl Tiler {
         if !style.rescale.is_empty() {
             return Ok(Arc::clone(compiled));
         }
+        // Band-math expression: stretch from the synthetic index's own value
+        // range, NOT dataset_stats (which are per-source-band raw DN and
+        // meaningless for an index like NDVI). Explicit `rescale` already
+        // returned above and wins.
+        if style.expression.is_some() {
+            let (lo, hi) =
+                expression_rescale(image, &compiled.expression).unwrap_or((-1.0, 1.0));
+            let mut next = (**compiled).clone();
+            next.rescale = vec![(lo, hi)];
+            next.composite.vmin = Some(vec![lo]);
+            next.composite.vmax = Some(vec![hi]);
+            next.auto_rgb = false;
+            return Ok(std::sync::Arc::new(next));
+        }
         let spec: Stretch = match style.resolved_stretch()? {
             Some(s) => s,
             None => {
@@ -343,6 +357,56 @@ impl Tiler {
     }
 }
 
+/// Finite-value (min, max) of the synthetic band an `expression` produces over
+/// `image`. Returns `None` if no pixel yields a finite value (e.g. all-nodata
+/// tile) — caller falls back to a default range. Nodata in a referenced band
+/// or a non-finite result skips that pixel (same masking as render).
+fn expression_rescale(
+    image: &ImageData,
+    rpn: &[crate::render::expression::Token],
+) -> Option<(f64, f64)> {
+    use crate::render::expression::{eval_rpn, referenced_nodata_hit, Token};
+    let src = image.pixels.to_f64();
+    let bands = src.shape()[0];
+    let (h, w) = (src.shape()[1], src.shape()[2]);
+    let nodata = image.nodata;
+    let refs: Vec<usize> = {
+        let mut v: Vec<usize> = rpn
+            .iter()
+            .filter_map(|t| match t {
+                Token::Band(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let mut px = vec![0.0f64; bands];
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for r in 0..h {
+        for c in 0..w {
+            for b in 0..bands {
+                px[b] = src[[b, r, c]];
+            }
+            if referenced_nodata_hit(&px, &refs, nodata) {
+                continue;
+            }
+            let v = eval_rpn(rpn, &px);
+            if v.is_finite() {
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+        }
+    }
+    if lo.is_finite() && hi.is_finite() {
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
 /// Apply per-band `physical = raw * scale + offset`, returning a new F64
 /// `ImageData`. Bands beyond `scale_offset.len()` use identity.
 fn unscale_image(img: &ImageData, scale_offset: &[(f64, f64)]) -> ImageData {
@@ -419,7 +483,7 @@ pub(crate) fn empty_tile(size: usize) -> AgResult<Bytes> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tiler, TilerConfig, unscale_image, unscale_ranges};
+    use super::{Tiler, TilerConfig, expression_rescale, unscale_image, unscale_ranges};
     use crate::bounds::{Bbox, GeoTransform};
 
     #[test]
@@ -517,6 +581,36 @@ mod tests {
         let out = unscale_ranges(&ranges, &bidx, &so);
         assert_eq!(out[0], (0.0 * 0.01 + 5.0, 1000.0 * 0.01 + 5.0));
         assert_eq!(out[1], (10.0 * 2.0, 20.0 * 2.0));
+    }
+
+    #[test]
+    fn expression_rescale_uses_synthetic_band_range_not_band_stats() {
+        use crate::pixel::{ImageData, PixelData};
+        use crate::render::expression::parse_expression;
+        // 2 bands, 1x3. NDVI=(b2-b1)/(b2+b1):
+        //   px0: b1=1000,b2=3000 → 2000/4000 = 0.5
+        //   px1: b1=2000,b2=2000 → 0/4000 = 0.0
+        //   px2: b1=0,b2=0       → 0/0 = NaN (skipped)
+        let pixels = PixelData::F64(
+            ndarray::Array3::from_shape_vec(
+                (2, 1, 3),
+                vec![1000.0, 2000.0, 0.0, 3000.0, 2000.0, 0.0],
+            )
+            .unwrap(),
+        ); // (2,1,3): band0=b1=[1000,2000,0], band1=b2=[3000,2000,0]
+        let img = ImageData {
+            pixels,
+            mask: None,
+            crs: crate::crs::Crs::epsg(3857),
+            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
+            nodata: None,
+            bbox: crate::bounds::Bbox::new(0.0, 0.0, 3.0, 1.0),
+        };
+        let rpn = parse_expression("(b2-b1)/(b2+b1)").unwrap();
+        let (lo, hi) = expression_rescale(&img, &rpn).expect("finite range");
+        assert!((lo - 0.0).abs() < 1e-9, "lo={lo}");
+        assert!((hi - 0.5).abs() < 1e-9, "hi={hi}");
+        assert!(hi < 1.0, "range must be NDVI units, not DN");
     }
 
     #[test]
