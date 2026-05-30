@@ -16,7 +16,25 @@ const BUILTINS: &[(&str, &colorous::Gradient)] = &[
     ("greys", &colorous::GREYS),
 ];
 
+/// Matplotlib `terrain` stops: deep blue → cyan → green → tan → brown → white.
+/// Not part of the `colorous` set, so built from explicit stops.
+const TERRAIN_STOPS: &[(f64, [f64; 4])] = &[
+    (0.00, [0.2, 0.2, 0.6, 1.0]),
+    (0.15, [0.0, 0.6, 1.0, 1.0]),
+    (0.25, [0.0, 0.8, 0.4, 1.0]),
+    (0.50, [1.0, 1.0, 0.6, 1.0]),
+    (0.75, [0.5, 0.36, 0.33, 1.0]),
+    (1.00, [1.0, 1.0, 1.0, 1.0]),
+];
+
 pub fn builtin_lut(name: &str) -> AgResult<Lut> {
+    if name.eq_ignore_ascii_case("terrain") {
+        let stops: Vec<(f64, Colour)> = TERRAIN_STOPS
+            .iter()
+            .map(|(p, c)| (*p, Colour::Seq(*c)))
+            .collect();
+        return lut_from_stops(&stops);
+    }
     let g = BUILTINS
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -88,5 +106,22 @@ mod tests {
         let mid = lut[127];
         assert!(mid[0] > 100 && mid[0] < 160);
         assert!(mid[2] > 100 && mid[2] < 160);
+    }
+
+    #[test]
+    fn terrain_low_is_blue_high_is_white() {
+        let lut = builtin_lut("terrain").unwrap();
+        let [r0, g0, b0, a0] = lut[0];
+        // Low end is deep blue-ish: blue channel dominant, opaque.
+        assert!(b0 > 120 && b0 > r0 && b0 > g0, "low={:?}", [r0, g0, b0]);
+        assert_eq!(a0, 255);
+        // High end is near-white.
+        let [r255, g255, b255, _] = lut[255];
+        assert!(r255 > 240 && g255 > 240 && b255 > 240, "high={:?}", [r255, g255, b255]);
+    }
+
+    #[test]
+    fn terrain_is_case_insensitive() {
+        assert!(builtin_lut("Terrain").is_ok());
     }
 }
