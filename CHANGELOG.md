@@ -11,6 +11,8 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.0.3]
+
 ### Added
 
 - Multi-source **mosaic** rendering (feature `mosaic`, on by default). A
@@ -29,6 +31,9 @@ can land in any release** and are called out explicitly under a
   cross-CRS path that uses the warp Jacobian footprint, matching GDAL/titiler
   `average` (antialiased downsample, nearest on upsample). Selectable from all
   three viewers and via `?resampling=average` / `?reproject=average`.
+- Re-export `ObjectReader` and the `object_store` crate from `async_geotiff::io`, plus `CogReader::open_object_store{,_with_cache,_with_config}` — open a COG from an existing `Arc<dyn ObjectStore>` (S3/MinIO, GCS, local) without depending on `async-tiff` directly.
+- `terrain` builtin colormap (matplotlib stops: deep blue → cyan → green → sand → brown → white), in addition to the `colorous` set.
+- Inline `colormap=` JSON on `TileStyle`: discrete value maps (`{"1":[r,g,b,a]}`) and gradient breaks (`[[v,[r,g,b,a]]]`), routed by JSON shape and reusing the existing `ColourDefinition` machinery. Mutually exclusive with `colormap_name`; empty/degenerate maps return HTTP 400.
 
 ### Fixed
 
@@ -63,6 +68,7 @@ can land in any release** and are called out explicitly under a
   single implementation path for rescaling.
 - Extracted a `warp_tile` (read + warp) step out of the single-source tiler so
   the mosaic path can reuse it; single-source behavior is unchanged.
+- **⚠️ BREAKING** `TileStyle` is now `#[non_exhaustive]`; construct it with `..TileStyle::default()` (external crates can no longer use a bare struct literal).
 
 ## [0.0.2] - 2026-05-16
 
