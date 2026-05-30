@@ -55,6 +55,16 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
     }
 
     let src = image.pixels.to_f64();
+
+    // Expression path: evaluate band-math RPN per-pixel → synthetic single band.
+    if !style.expression.is_empty() {
+        let nodata = style.nodata.or(image.nodata);
+        let (band, valid) = eval_expression_band(&src.view(), &style.expression, nodata, h, w)?;
+        let valid_opt = if valid.iter().all(|&b| b) { None } else { Some(valid) };
+        let rgba = render_single_band(&band, valid_opt.as_ref(), style);
+        return encode_png(&rgba);
+    }
+
     let bidx: Vec<usize> = if style.bidx.is_empty() {
         match (auto_rgb, style.composite.bands) {
             (true, _) => vec![0, 1, 2],
@@ -447,7 +457,7 @@ fn unit_to_u8(value: f64) -> u8 {
 ///
 /// Errors if the expression references a band index that exceeds the number of
 /// source bands in `src` (a `AgError::Query`).
-pub fn eval_expression_band(
+fn eval_expression_band(
     src: &ArrayView3<f64>,
     rpn: &[Token],
     nodata: Option<f64>,
@@ -512,6 +522,39 @@ mod tests {
     use crate::crs::Crs;
     use crate::pixel::PixelData;
     use crate::render::composite::{ColourDefinition, Composite};
+
+    #[test]
+    fn eval_expression_band_ndvi_and_masks_nonfinite() {
+        use crate::render::expression::parse_expression;
+        // 2 bands, 1x2. NDVI=(b2-b1)/(b2+b1). pixel0: b1=0.1,b2=0.5→0.6667 valid.
+        // pixel1: b1=0,b2=0 → 0/0 NaN → invalid.
+        let src = ndarray::Array3::from_shape_vec((2, 1, 2), vec![0.1, 0.0, 0.5, 0.0]).unwrap();
+        let rpn = parse_expression("(b2-b1)/(b2+b1)").unwrap();
+        let (band, valid) = eval_expression_band(&src.view(), &rpn, None, 1, 2).unwrap();
+        assert!((band[[0, 0]] - 0.6666667).abs() < 1e-5);
+        assert!(valid[[0, 0]]);
+        assert!(!valid[[0, 1]], "0/0 must be masked invalid");
+    }
+
+    #[test]
+    fn eval_expression_band_rejects_out_of_range_band() {
+        use crate::render::expression::parse_expression;
+        let src = ndarray::Array3::from_shape_vec((1, 1, 1), vec![1.0]).unwrap();
+        let rpn = parse_expression("b5").unwrap();
+        assert!(eval_expression_band(&src.view(), &rpn, None, 1, 1).is_err());
+    }
+
+    #[test]
+    fn eval_expression_band_masks_nodata_in_referenced_band() {
+        use crate::render::expression::parse_expression;
+        let src =
+            ndarray::Array3::from_shape_vec((2, 1, 2), vec![-9999.0, 0.2, 0.4, 0.6]).unwrap();
+        let rpn = parse_expression("b1+b2").unwrap();
+        let (_band, valid) =
+            eval_expression_band(&src.view(), &rpn, Some(-9999.0), 1, 2).unwrap();
+        assert!(!valid[[0, 0]], "nodata in referenced band → invalid");
+        assert!(valid[[0, 1]]);
+    }
 
     #[test]
     fn render_single_band_gradient_to_png() {

@@ -30,7 +30,6 @@ pub fn parse_expression(input: &str) -> AgResult<Vec<Token>> {
 }
 
 /// Highest 0-indexed band referenced, or None if no band refs.
-#[allow(dead_code)] // used by CompiledTileStyle in 0.0.5-B1
 pub fn max_band_ref(rpn: &[Token]) -> Option<usize> {
     rpn.iter().filter_map(|t| match t { Token::Band(i) => Some(*i), _ => None }).max()
 }
@@ -38,7 +37,6 @@ pub fn max_band_ref(rpn: &[Token]) -> Option<usize> {
 /// Evaluate RPN given per-pixel band values (`bands[i]` = value of source band i+1).
 /// Caller must validate `max_band_ref < bands.len()` once before the pixel loop;
 /// an out-of-range band defensively yields NaN (never panics).
-#[allow(dead_code)] // used by CompiledTileStyle in 0.0.5-B1
 pub fn eval_rpn(rpn: &[Token], bands: &[f64]) -> f64 {
     let mut stack: Vec<f64> = Vec::with_capacity(8);
     for t in rpn {
