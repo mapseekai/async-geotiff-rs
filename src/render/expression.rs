@@ -6,7 +6,6 @@ use crate::error::{AgError, AgResult};
 
 /// RPN token. `Band(i)` is 0-indexed (source `b1` → `Band(0)`).
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // used by CompiledTileStyle in 0.0.5-B1
 pub enum Token {
     Num(f64),
     Band(usize),
@@ -17,7 +16,6 @@ pub enum Token {
     Neg,
 }
 
-#[allow(dead_code)] // used by CompiledTileStyle in 0.0.5-B1
 pub fn parse_expression(input: &str) -> AgResult<Vec<Token>> {
     let toks = lex(input)?;
     let mut p = Parser { toks: &toks, pos: 0, out: Vec::new() };
