@@ -183,6 +183,45 @@ impl CogReader {
         })
     }
 
+    /// Open a COG from an existing object store and key, building the
+    /// `ObjectReader` internally. Lets callers wire any `object_store`
+    /// backend (S3/MinIO, GCS, local, …) without naming `ObjectReader`.
+    pub async fn open_object_store(
+        store: Arc<dyn ObjectStore>,
+        key: &str,
+    ) -> AgResult<Self> {
+        Self::open_object_store_with_config(store, key, ReaderConfig::default()).await
+    }
+
+    /// Like [`open_object_store`] but lets the caller size the decoded-window
+    /// cache.
+    pub async fn open_object_store_with_cache(
+        store: Arc<dyn ObjectStore>,
+        key: &str,
+        cache: CacheConfig,
+    ) -> AgResult<Self> {
+        Self::open_object_store_with_config(
+            store,
+            key,
+            ReaderConfig {
+                cache,
+                ..ReaderConfig::default()
+            },
+        )
+        .await
+    }
+
+    /// Like [`open_object_store`] but lets callers configure cache capacity
+    /// and CPU decode concurrency.
+    pub async fn open_object_store_with_config(
+        store: Arc<dyn ObjectStore>,
+        key: &str,
+        config: ReaderConfig,
+    ) -> AgResult<Self> {
+        let reader = ObjectReader::new(store, Path::from(key));
+        Self::open_with_reader_and_config(reader, config).await
+    }
+
     pub fn src_crs(&self) -> &Crs {
         &self.src_crs
     }
@@ -630,6 +669,38 @@ fn alpha_band_index(ifd: &ImageFileDirectory) -> Option<usize> {
         )
         .then_some(base + i)
     })
+}
+
+#[cfg(test)]
+mod open_object_store_tests {
+    use crate::io::{CogReader, ObjectReader};
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn open_object_store_matches_open_with_reader() {
+        let fs = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+        let key = "data/cog_uint8_rgb_nodata.tif";
+
+        // New convenience path.
+        let via_helper = CogReader::open_object_store(fs.clone(), key)
+            .await
+            .expect("open_object_store");
+
+        // Old explicit path (must still produce an equivalent reader).
+        let reader = ObjectReader::new(fs, object_store::path::Path::from(key));
+        let via_reader = CogReader::open_with_reader(reader)
+            .await
+            .expect("open_with_reader");
+
+        // GeoTransform does not impl PartialEq (wraps raffine::Affine);
+        // compare wgs84_bounds() which returns [f64; 4] and does.
+        assert_eq!(
+            via_helper.wgs84_bounds().unwrap(),
+            via_reader.wgs84_bounds().unwrap()
+        );
+        assert_eq!(via_helper.src_crs(), via_reader.src_crs());
+    }
 }
 
 #[cfg(test)]
