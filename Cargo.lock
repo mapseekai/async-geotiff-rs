@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "async-geotiff"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "approx",
  "async-tiff",
