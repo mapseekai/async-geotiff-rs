@@ -15,7 +15,7 @@ use crate::pixel::ImageData;
 use crate::render::color_formula::Op;
 use crate::render::composite::{Composite, HandleGet};
 use crate::render::encode::encode_png;
-use crate::render::expression::{eval_rpn, max_band_ref, Token};
+use crate::render::expression::{eval_rpn_with, max_band_ref, Token};
 use crate::warp::resampler::Resampling;
 
 // `tile_size` and `resampling` on CompiledTileStyle are kept for callers
@@ -481,6 +481,7 @@ fn eval_expression_band(
     let mut result = Array2::<f64>::zeros((h, w));
     let mut valid = Array2::<bool>::from_elem((h, w), true);
     let mut pixel_bands: Vec<f64> = vec![0.0; bands];
+    let mut stack: Vec<f64> = Vec::with_capacity(rpn.len().max(8));
 
     // Unique referenced band indices (0-based), computed once.
     let refs: Vec<usize> = {
@@ -502,7 +503,7 @@ fn eval_expression_band(
 
             let ok = !crate::render::expression::referenced_nodata_hit(&pixel_bands, &refs, nodata);
 
-            let value = eval_rpn(rpn, &pixel_bands);
+            let value = eval_rpn_with(rpn, &pixel_bands, &mut stack);
             result[[row, col]] = value;
             valid[[row, col]] = ok && value.is_finite();
         }

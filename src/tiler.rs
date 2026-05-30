@@ -369,7 +369,7 @@ fn expression_rescale(
     rpn: &[crate::render::expression::Token],
     nodata: Option<f64>,
 ) -> Option<(f64, f64)> {
-    use crate::render::expression::{eval_rpn, referenced_nodata_hit, Token};
+    use crate::render::expression::{eval_rpn_with, referenced_nodata_hit, Token};
     let src = image.pixels.to_f64();
     let bands = src.shape()[0];
     let (h, w) = (src.shape()[1], src.shape()[2]);
@@ -386,6 +386,7 @@ fn expression_rescale(
         v
     };
     let mut px = vec![0.0f64; bands];
+    let mut stack: Vec<f64> = Vec::with_capacity(rpn.len().max(8));
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for r in 0..h {
@@ -396,7 +397,7 @@ fn expression_rescale(
             if referenced_nodata_hit(&px, &refs, nodata) {
                 continue;
             }
-            let v = eval_rpn(rpn, &px);
+            let v = eval_rpn_with(rpn, &px, &mut stack);
             if v.is_finite() {
                 lo = lo.min(v);
                 hi = hi.max(v);

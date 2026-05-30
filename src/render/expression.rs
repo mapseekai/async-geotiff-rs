@@ -18,7 +18,7 @@ pub enum Token {
 
 pub fn parse_expression(input: &str) -> AgResult<Vec<Token>> {
     let toks = lex(input)?;
-    let mut p = Parser { toks: &toks, pos: 0, out: Vec::new() };
+    let mut p = Parser { toks: &toks, pos: 0, out: Vec::new(), depth: 0 };
     p.expr()?;
     if p.pos != p.toks.len() {
         return Err(AgError::query("expression", "unexpected trailing input"));
@@ -34,11 +34,10 @@ pub fn max_band_ref(rpn: &[Token]) -> Option<usize> {
     rpn.iter().filter_map(|t| match t { Token::Band(i) => Some(*i), _ => None }).max()
 }
 
-/// Evaluate RPN given per-pixel band values (`bands[i]` = value of source band i+1).
-/// Caller must validate `max_band_ref < bands.len()` once before the pixel loop;
-/// an out-of-range band defensively yields NaN (never panics).
-pub fn eval_rpn(rpn: &[Token], bands: &[f64]) -> f64 {
-    let mut stack: Vec<f64> = Vec::with_capacity(8);
+/// Like [`eval_rpn`] but reuses a caller-provided scratch stack to avoid a
+/// per-call heap allocation in hot per-pixel loops. `stack` is cleared on entry.
+pub(crate) fn eval_rpn_with(rpn: &[Token], bands: &[f64], stack: &mut Vec<f64>) -> f64 {
+    stack.clear();
     for t in rpn {
         match t {
             Token::Num(n) => stack.push(*n),
@@ -58,6 +57,14 @@ pub fn eval_rpn(rpn: &[Token], bands: &[f64]) -> f64 {
         }
     }
     stack.pop().unwrap_or(f64::NAN)
+}
+
+/// Evaluate RPN given per-pixel band values (`bands[i]` = value of source band i+1).
+/// Caller must validate `max_band_ref < bands.len()` once before the pixel loop;
+/// an out-of-range band defensively yields NaN (never panics).
+pub fn eval_rpn(rpn: &[Token], bands: &[f64]) -> f64 {
+    let mut stack = Vec::with_capacity(8);
+    eval_rpn_with(rpn, bands, &mut stack)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,7 +108,7 @@ fn lex(s: &str) -> AgResult<Vec<Lexeme>> {
     Ok(out)
 }
 
-struct Parser<'a> { toks: &'a [Lexeme], pos: usize, out: Vec<Token> }
+struct Parser<'a> { toks: &'a [Lexeme], pos: usize, out: Vec<Token>, depth: usize }
 
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<&Lexeme> { self.toks.get(self.pos) }
@@ -122,6 +129,15 @@ impl<'a> Parser<'a> {
         Ok(())
     }
     fn factor(&mut self) -> AgResult<()> {
+        self.depth += 1;
+        if self.depth > 128 {
+            return Err(AgError::query("expression", "expression nesting too deep"));
+        }
+        let r = self.factor_inner();
+        self.depth -= 1;
+        r
+    }
+    fn factor_inner(&mut self) -> AgResult<()> {
         match self.peek() {
             Some(Lexeme::Num(n)) => { let n = *n; self.out.push(Token::Num(n)); self.pos += 1; Ok(()) }
             Some(Lexeme::Band(i)) => { let i = *i; self.out.push(Token::Band(i)); self.pos += 1; Ok(()) }
@@ -156,6 +172,7 @@ pub(crate) fn referenced_nodata_hit(px: &[f64], refs: &[usize], nodata: Option<f
 
 /// Common spectral indices. Band numbers are 1-indexed (as in `b<N>`).
 /// Lowers to an arithmetic expression string evaluated by the same engine.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Index {
     Ndvi { nir: u32, red: u32 },
@@ -283,6 +300,12 @@ mod tests {
         let mut bands = vec![0.0; 5];
         bands[4] = 0.5; bands[3] = 0.1;
         assert!((eval_rpn(&t, &bands) - 0.6666667).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rejects_deeply_nested() {
+        let deep = format!("{}b1{}", "(".repeat(500), ")".repeat(500));
+        assert!(matches!(parse_expression(&deep), Err(AgError::Query { .. })));
     }
 
     #[test]
