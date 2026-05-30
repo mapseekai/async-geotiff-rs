@@ -91,7 +91,7 @@ pub fn warp(
             && y0 >= -WARP_EDGE_EPS
             && x1 <= sw + WARP_EDGE_EPS
             && y1 <= sh + WARP_EDGE_EPS;
-        if fully_in_bounds {
+        if fully_in_bounds && !matches!(resampling, Resampling::Mode) {
             return warp_affine(
                 src,
                 dst_crs,
@@ -132,18 +132,20 @@ pub fn warp(
     // CropBox derived from the grid corners. We accept the path when the
     // max residual at the interior grid samples is below 0.5 src pixels —
     // i.e. sub-pixel error, invisible after resampling.
-    if let Some(out) = try_subtile_affine(
-        src,
-        dst_crs,
-        dst_bbox,
-        dst_w,
-        dst_h,
-        resampling,
-        dst_transform,
-        &grid_src_pix,
-        WARP_GRID_SIZE,
-    )? {
-        return Ok(out);
+    if !matches!(resampling, Resampling::Mode) {
+        if let Some(out) = try_subtile_affine(
+            src,
+            dst_crs,
+            dst_bbox,
+            dst_w,
+            dst_h,
+            resampling,
+            dst_transform,
+            &grid_src_pix,
+            WARP_GRID_SIZE,
+        )? {
+            return Ok(out);
+        }
     }
 
     // -- Scalar fallback (cross-CRS, not approximable by single rectangle) --
@@ -192,6 +194,7 @@ pub fn warp(
     // results and copy into `out`/`mask` after the parallel section.
     use rayon::prelude::*;
     let is_average = matches!(resampling, Resampling::Average);
+    let is_mode = matches!(resampling, Resampling::Mode);
     let coord_rows: Vec<Vec<(f64, f64)>> = (0..dst_h)
         .map(|r| row_src_coords(r, dst_h, dst_w, &col_table, &grid_src_pix))
         .collect();
@@ -202,7 +205,7 @@ pub fn warp(
             let mut mask_row = vec![true; dst_w];
             let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
 
-            if is_average {
+            if is_average || is_mode {
                 // Footprint Jacobian by finite difference of source coords.
                 // Forward difference where a forward neighbour exists,
                 // backward difference at the trailing row/column — a clamped
@@ -246,15 +249,19 @@ pub fn warp(
 
                     mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
                     for (b, band_view) in band_views.iter().enumerate() {
-                        band_rows[b][c] = resampling.sample_average(
-                            *band_view,
-                            src_mask_view,
-                            sc,
-                            sr,
-                            rx,
-                            ry,
-                            fill,
-                        );
+                        band_rows[b][c] = if is_mode {
+                            resampling.sample_mode(*band_view, src_mask_view, sc, sr, rx, ry, fill)
+                        } else {
+                            resampling.sample_average(
+                                *band_view,
+                                src_mask_view,
+                                sc,
+                                sr,
+                                rx,
+                                ry,
+                                fill,
+                            )
+                        };
                     }
                 }
             } else {
@@ -405,7 +412,7 @@ fn try_subtile_affine(
         Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
         Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
         Resampling::Average => fr::ResizeAlg::Convolution(fr::FilterType::Box),
-        Resampling::Mode => fr::ResizeAlg::Nearest, // mode bypasses fr (wired in B2)
+        Resampling::Mode => fr::ResizeAlg::Nearest, // unreachable: Mode bypasses fr (routed to scalar majority path)
     };
     let options = fr::ResizeOptions::new()
         .resize_alg(alg)
@@ -537,7 +544,7 @@ fn warp_affine(
         Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
         Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
         Resampling::Average => fr::ResizeAlg::Convolution(fr::FilterType::Box),
-        Resampling::Mode => fr::ResizeAlg::Nearest, // mode bypasses fr (wired in B2)
+        Resampling::Mode => fr::ResizeAlg::Nearest, // unreachable: Mode bypasses fr (routed to scalar majority path)
     };
     let options = fr::ResizeOptions::new().resize_alg(alg).crop(
         crop_left,
@@ -826,6 +833,33 @@ mod tests {
         );
         assert_eq!(out.pixels.height(), 4);
         assert_eq!(out.pixels.width(), 4);
+    }
+
+    #[test]
+    fn mode_downsample_preserves_class_not_mean() {
+        // 4x4 single band: left half class 1, right half class 9.
+        let a = ndarray::Array3::from_shape_fn((1, 4, 4), |(_, _, c)| if c < 2 { 1.0 } else { 9.0 });
+        let src = ImageData {
+            pixels: PixelData::F64(a),
+            mask: None,
+            crs: Crs::epsg(3857),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 4.0, 0.0, -1.0]),
+            nodata: None,
+            bbox: Bbox::new(0.0, 0.0, 4.0, 4.0),
+        };
+        // Downsample 4x4 → 2x2, same CRS. Each output pixel covers a pure
+        // 2x2 block (all class 1 or all class 9) → mean (5.0) must NEVER appear.
+        let out = warp(&src, &Crs::epsg(3857), src.bbox, 2, 2, Resampling::Mode).unwrap();
+        // Path oracle: scalar fallback returns F64; fr fast-paths cast F64→F32.
+        // This assertion fails if Mode silently takes an fr fast-path (F32).
+        assert!(
+            matches!(out.pixels, PixelData::F64(_)),
+            "expected scalar majority path (F64) but Mode took an fr fast-path (F32)"
+        );
+        let f = out.pixels.to_f64();
+        for v in f.iter() {
+            assert!(*v == 1.0 || *v == 9.0, "mode produced a non-class value {v}");
+        }
     }
 
     #[test]
