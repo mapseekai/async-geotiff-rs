@@ -138,6 +138,22 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Returns true if any REFERENCED band (`refs`, 0-indexed) holds the nodata
+/// sentinel at this pixel. `refs` should be the deduped band indices the
+/// expression uses. Matches the nodata semantics used across the render and
+/// auto-stretch paths so they never diverge.
+pub(crate) fn referenced_nodata_hit(px: &[f64], refs: &[usize], nodata: Option<f64>) -> bool {
+    let Some(nd) = nodata else { return false; };
+    let nd_is_nan = nd.is_nan();
+    for &b in refs {
+        let Some(&x) = px.get(b) else { continue; };
+        if (nd_is_nan && x.is_nan()) || (!nd_is_nan && (x - nd).abs() < 1e-9) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Common spectral indices. Band numbers are 1-indexed (as in `b<N>`).
 /// Lowers to an arithmetic expression string evaluated by the same engine.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -170,6 +186,19 @@ mod tests {
     use super::*;
 
     fn rpn(s: &str) -> Vec<Token> { parse_expression(s).unwrap() }
+
+    #[test]
+    fn referenced_nodata_hit_only_checks_refs() {
+        // px = [valid, nodata]; refs={0} → no hit; refs={1} → hit.
+        let px = [0.5, -9999.0];
+        assert!(!referenced_nodata_hit(&px, &[0], Some(-9999.0)));
+        assert!(referenced_nodata_hit(&px, &[1], Some(-9999.0)));
+        // NaN nodata
+        let px2 = [f64::NAN, 0.2];
+        assert!(referenced_nodata_hit(&px2, &[0], Some(f64::NAN)));
+        // no nodata configured → never hits
+        assert!(!referenced_nodata_hit(&px, &[1], None));
+    }
 
     #[test]
     fn ndvi_value() {

@@ -584,6 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn expression_rescale_all_nonfinite_returns_none() {
+        use crate::pixel::{ImageData, PixelData};
+        use crate::render::expression::parse_expression;
+        // every pixel 0/0 → NaN → no finite value → None.
+        let pixels = PixelData::F64(ndarray::Array3::from_shape_vec((2,1,2), vec![0.0,0.0, 0.0,0.0]).unwrap());
+        let img = ImageData {
+            pixels, mask: None,
+            crs: crate::crs::Crs::epsg(3857),
+            transform: crate::bounds::GeoTransform::from_gdal(&[0.0,1.0,0.0,0.0,0.0,-1.0]),
+            nodata: None,
+            bbox: crate::bounds::Bbox::new(0.0,0.0,2.0,1.0),
+        };
+        let rpn = parse_expression("(b2-b1)/(b2+b1)").unwrap();
+        assert!(expression_rescale(&img, &rpn).is_none());
+    }
+
+    #[test]
     fn expression_rescale_uses_synthetic_band_range_not_band_stats() {
         use crate::pixel::{ImageData, PixelData};
         use crate::render::expression::parse_expression;
