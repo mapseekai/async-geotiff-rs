@@ -266,24 +266,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn point_validity_flag_is_consistent() {
+    async fn point_outside_extent_is_none() {
+        let r = rgb_reader().await;
+        let [_w, _s, _e, n] = r.wgs84_bounds().unwrap();
+        // A latitude well north of the dataset's northern edge (clamped ≤ 90).
+        let lat = (n + 5.0).min(89.9);
+        let pv = r.point(0.0, lat, &Crs::epsg(4326), &[]).await.unwrap();
+        assert!(pv.is_none(), "point north of the extent must be None");
+    }
+
+    #[tokio::test]
+    async fn point_validity_flag_is_consistent_and_masks_nodata() {
         let r = rgb_reader().await;
         let [w, s, e, n] = r.wgs84_bounds().unwrap();
-        // Sample a 5x5 interior grid; every returned PointValue must have 3
-        // values and a well-formed `valid` flag. Exercises valid and (likely)
-        // nodata pixels without hardcoding a pixel location.
+        // Sample a 20x20 grid over the dataset. Every returned PointValue must
+        // have 3 values. The fixture has nodata around its SW corner, so at
+        // least one returned point must be invalid — this strictly exercises
+        // the nodata→invalid masking path (a regression that always returned
+        // valid=true would fail here).
         let mut saw_any = false;
-        for i in 0..5 {
-            for j in 0..5 {
-                let lon = w + (e - w) * (i as f64 + 0.5) / 5.0;
-                let lat = s + (n - s) * (j as f64 + 0.5) / 5.0;
+        let mut saw_invalid = false;
+        for i in 0..20 {
+            for j in 0..20 {
+                let lon = w + (e - w) * (i as f64 + 0.5) / 20.0;
+                let lat = s + (n - s) * (j as f64 + 0.5) / 20.0;
                 if let Some(pv) = r.point(lon, lat, &Crs::epsg(4326), &[]).await.unwrap() {
                     saw_any = true;
                     assert_eq!(pv.values.len(), 3);
-                    let _ = pv.valid;
+                    if !pv.valid {
+                        saw_invalid = true;
+                    }
                 }
             }
         }
         assert!(saw_any, "at least one interior grid point should be inside");
+        assert!(
+            saw_invalid,
+            "fixture has nodata; at least one grid point must be masked invalid"
+        );
     }
 }
