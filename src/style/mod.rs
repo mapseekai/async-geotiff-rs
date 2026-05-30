@@ -1,3 +1,4 @@
+mod colormap_param;
 pub mod params;
 pub mod stretch;
 
