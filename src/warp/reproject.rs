@@ -862,6 +862,97 @@ mod tests {
         }
     }
 
+    /// Regression guard: cross-CRS `Resampling::Mode` must route through the
+    /// scalar majority path, NOT through `try_subtile_affine` + fr.
+    ///
+    /// Control-flow reasoning:
+    ///   - src EPSG:4326, dst EPSG:3857 → same-CRS fast path skipped.
+    ///   - The dst bbox is the same in-bounds geometry used by
+    ///     `average_cross_crs_downsample_within_source_range`: the grid fits
+    ///     entirely within the 8×8 source image, so `try_subtile_affine`
+    ///     *would* return `Some(...)` for other resamplers (e.g. Average).
+    ///   - The bypass at `if !matches!(resampling, Resampling::Mode)` (line 135)
+    ///     prevents `try_subtile_affine` from running, routing Mode to the
+    ///     scalar majority loop instead.
+    ///
+    /// Path oracle: scalar returns `PixelData::F64`; `try_subtile_affine`
+    /// converts F64→F32 and returns `PixelData::F32`. If the bypass were
+    /// removed, Mode would take the fr/Nearest path and return F32 — the
+    /// `matches!(PixelData::F64(_))` assertion would fail immediately.
+    ///
+    /// Value oracle: for a source with only class values 1 and 9, the scalar
+    /// majority sampler must never produce inter-class values. If Mode
+    /// incorrectly went through fr's continuous Nearest filter, bilinear
+    /// blending at the class boundary could produce values strictly between 1
+    /// and 9 — the per-pixel assertion would catch that.
+    #[test]
+    fn mode_cross_crs_preserves_class() {
+        // 16×8 single-band categorical source in EPSG:4326:
+        //   left 8 columns (lon 0–4°) = class 1
+        //   right 8 columns (lon 4–8°) = class 9
+        // Warped cross-CRS to EPSG:3857 at 4×4 resolution.
+        //
+        // The dst bbox is the proper EPSG:3857 rectangle for lon 1–7°, lat 1–7°
+        // (a strict subset of the source), so every grid corner projects back
+        // inside the 16×8 source pixel space and `try_subtile_affine` *would*
+        // return Some(…) for other resamplers — but Mode bypasses it.
+        //
+        // lon 1° in EPSG:3857 ≈    111 319 m
+        // lon 7° in EPSG:3857 ≈    779 236 m
+        // lat 1° in EPSG:3857 ≈    111 325 m
+        // lat 7° in EPSG:3857 ≈    781 863 m
+        let arr = Array3::<f64>::from_shape_fn((1, 8, 16), |(_, _, x)| {
+            if x < 8 { 1.0 } else { 9.0 }
+        });
+        let src = ImageData {
+            pixels: PixelData::F64(arr),
+            mask: None,
+            // lon 0–8°, lat 0–8° in EPSG:4326.
+            // GeoTransform: origin at top-left (lon=0, lat=8), 0.5° per pixel.
+            bbox: Bbox::new(0.0, 0.0, 8.0, 8.0),
+            crs: Crs::epsg(4326),
+            transform: GeoTransform::from_gdal(&[0.0, 0.5, 0.0, 8.0, 0.0, -1.0]),
+            nodata: None,
+        };
+        // Dst bbox in EPSG:3857 covering lon 1–7°, lat 1–7° — fully inside src.
+        let dst_bbox = Bbox::new(111_319.0, 111_325.0, 779_236.0, 781_863.0);
+        let fill = src.nodata.unwrap_or(0.0); // 0.0
+        let out = warp(&src, &Crs::epsg(3857), dst_bbox, 4, 4, Resampling::Mode).unwrap();
+
+        assert_eq!(out.pixels.height(), 4);
+        assert_eq!(out.pixels.width(), 4);
+
+        // ── Path oracle ──────────────────────────────────────────────────────
+        // Scalar majority path returns F64; try_subtile_affine returns F32.
+        // This trips the moment the bypass is removed (Mode silently takes fr).
+        assert!(
+            matches!(out.pixels, PixelData::F64(_)),
+            "expected scalar majority path (F64) but Mode took the fr fast-path (F32); \
+             the `if !matches!(resampling, Resampling::Mode)` bypass may be missing"
+        );
+
+        // ── Value oracle ─────────────────────────────────────────────────────
+        // Every non-fill output pixel must be exactly one of the two class
+        // values. An fr/Nearest path could blend across the class boundary and
+        // produce values strictly between 1.0 and 9.0.
+        let vals: Vec<f64> = out.pixels.as_f64().iter().copied().collect();
+        for &v in vals.iter() {
+            if v == fill {
+                continue; // edge/nodata fill is acceptable
+            }
+            assert!(
+                v == 1.0 || v == 9.0,
+                "mode produced inter-class value {v} (expected only 1.0 or 9.0)"
+            );
+        }
+
+        // Guard: both classes must appear in the output (not all fill).
+        let has_class1 = vals.contains(&1.0);
+        let has_class9 = vals.contains(&9.0);
+        assert!(has_class1, "class 1 absent from Mode cross-CRS output");
+        assert!(has_class9, "class 9 absent from Mode cross-CRS output");
+    }
+
     #[test]
     fn average_cross_crs_downsample_within_source_range() {
         let arr = Array3::<f64>::from_shape_fn((1, 8, 8), |(_, y, x)| (y * 8 + x) as f64);
