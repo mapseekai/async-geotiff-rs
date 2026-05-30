@@ -128,6 +128,11 @@ impl Tiler {
             None => fallback_rescale(&image.pixels, image.nodata, &bidx),
         };
 
+        let ranges = if style.unscale {
+            unscale_ranges(&ranges, &bidx, self.reader.band_scale_offset())
+        } else {
+            ranges
+        };
         let mut next = (**compiled).clone();
         next.rescale = ranges.clone();
         next.composite.vmin = Some(ranges.iter().map(|r| r.0).collect());
@@ -236,6 +241,11 @@ impl Tiler {
             Some(img) => img,
             None => return empty_tile(style.tilesize as usize),
         };
+        let warped = if style.unscale {
+            unscale_image(&warped, self.reader.band_scale_offset())
+        } else {
+            warped
+        };
         let compiled = compile_cached(style).await?;
         let compiled = self.effective_compiled(style, &compiled, &warped).await?;
         let img = warped;
@@ -333,6 +343,46 @@ impl Tiler {
     }
 }
 
+/// Apply per-band `physical = raw * scale + offset`, returning a new F64
+/// `ImageData`. `nodata` is left as-is (the sentinel is compared pre-unscale
+/// at decode, not a physical value). Bands beyond `scale_offset.len()` use identity.
+fn unscale_image(img: &ImageData, scale_offset: &[(f64, f64)]) -> ImageData {
+    use ndarray::Axis;
+    let mut data = img.pixels.to_f64();
+    for (b, mut band) in data.axis_iter_mut(Axis(0)).enumerate() {
+        let (scale, offset) = scale_offset.get(b).copied().unwrap_or((1.0, 0.0));
+        if scale != 1.0 || offset != 0.0 {
+            band.mapv_inplace(|v| v * scale + offset);
+        }
+    }
+    ImageData {
+        pixels: PixelData::F64(data),
+        mask: img.mask.clone(),
+        crs: img.crs.clone(),
+        transform: img.transform,
+        nodata: img.nodata,
+        bbox: img.bbox,
+    }
+}
+
+/// Apply per-source-band scale/offset to auto-stretch ranges so they match
+/// unscaled pixels. `bidx[i]` is the source band index for `ranges[i]`.
+fn unscale_ranges(
+    ranges: &[(f64, f64)],
+    bidx: &[usize],
+    scale_offset: &[(f64, f64)],
+) -> Vec<(f64, f64)> {
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(i, &(lo, hi))| {
+            let b = bidx.get(i).copied().unwrap_or(i);
+            let (s, o) = scale_offset.get(b).copied().unwrap_or((1.0, 0.0));
+            (lo * s + o, hi * s + o)
+        })
+        .collect()
+}
+
 /// Fully-transparent tile PNG. The bytes are constant for a given size,
 /// so encode once and memoize: out-of-bounds / out-of-domain tiles are
 /// common (whole viewport at COG edges), and PNG deflate on the async
@@ -362,7 +412,7 @@ pub(crate) fn empty_tile(size: usize) -> AgResult<Bytes> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tiler, TilerConfig};
+    use super::{Tiler, TilerConfig, unscale_image, unscale_ranges};
     use crate::bounds::{Bbox, GeoTransform};
 
     #[test]
@@ -406,6 +456,38 @@ mod tests {
         // World span 512 but ts=256 → 2 m/px request, not unit scale.
         let bbox = Bbox::new(0.0, -256.0, 512.0, 256.0);
         assert_eq!(Tiler::passthrough_window(&gt, &bbox, 256), None);
+    }
+
+    #[test]
+    fn unscale_image_applies_per_band_affine() {
+        use crate::pixel::{ImageData, PixelData};
+        use ndarray::array;
+        let pixels = PixelData::F64(array![[[10.0, 20.0]], [[1.0, 2.0]]]); // 2 bands,1x2
+        let img = ImageData {
+            pixels,
+            mask: None,
+            crs: crate::crs::Crs::epsg(3857),
+            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
+            nodata: Some(-9999.0),
+            bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
+        };
+        let so = [(0.1, 1.0), (2.0, 0.0)];
+        let out = unscale_image(&img, &so);
+        let f = out.pixels.to_f64();
+        assert_eq!(f[[0, 0, 0]], 10.0 * 0.1 + 1.0);
+        assert_eq!(f[[0, 0, 1]], 20.0 * 0.1 + 1.0);
+        assert_eq!(f[[1, 0, 0]], 1.0 * 2.0);
+        assert_eq!(out.nodata, Some(-9999.0));
+    }
+
+    #[test]
+    fn unscale_ranges_applies_source_band_affine() {
+        let ranges = vec![(0.0, 1000.0), (10.0, 20.0)];
+        let bidx = vec![0usize, 1];
+        let so = vec![(0.01, 5.0), (2.0, 0.0)];
+        let out = unscale_ranges(&ranges, &bidx, &so);
+        assert_eq!(out[0], (0.0 * 0.01 + 5.0, 1000.0 * 0.01 + 5.0));
+        assert_eq!(out[1], (10.0 * 2.0, 20.0 * 2.0));
     }
 
     #[test]
