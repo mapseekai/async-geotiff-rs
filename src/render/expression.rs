@@ -209,4 +209,38 @@ mod tests {
         assert!(parse_expression("*b1").is_err());
         assert!(parse_expression("b1 b2").is_err());
     }
+
+    #[test]
+    fn index_lowers_and_parses() {
+        for idx in [
+            Index::Ndvi { nir: 5, red: 4 },
+            Index::Ndwi { green: 3, nir: 5 },
+            Index::Ndbi { swir: 6, nir: 5 },
+            Index::Evi { nir: 5, red: 4, blue: 2 },
+            Index::Savi { nir: 5, red: 4, l: 0.5 },
+        ] {
+            let s = idx.to_expression();
+            assert!(parse_expression(&s).is_ok(), "unparseable: {s}");
+        }
+    }
+
+    #[test]
+    fn ndvi_index_matches_manual_expression_end_to_end() {
+        let idx = Index::Ndvi { nir: 5, red: 4 };
+        let t = parse_expression(&idx.to_expression()).unwrap();
+        let mut bands = vec![0.0; 5];
+        bands[4] = 0.5; bands[3] = 0.1;
+        assert!((eval_rpn(&t, &bands) - 0.6666667).abs() < 1e-5);
+    }
+
+    #[test]
+    fn savi_uses_l_factor() {
+        // SAVI = (1+L)(NIR-RED)/(NIR+RED+L); L=0.5,NIR=0.5,RED=0.1: 1.5*0.4/1.1 = 0.5454545
+        let idx = Index::Savi { nir: 5, red: 4, l: 0.5 };
+        let t = parse_expression(&idx.to_expression()).unwrap();
+        let mut bands = vec![0.0; 5];
+        bands[4] = 0.5; bands[3] = 0.1;
+        let v = eval_rpn(&t, &bands);
+        assert!((v - 0.5454545).abs() < 1e-5, "savi={v}");
+    }
 }
