@@ -23,12 +23,21 @@ pub fn parse_colormap_param(s: &str) -> AgResult<ColourDefinition> {
                     .map_err(|_| AgError::query("colormap", format!("key {k:?} is not an integer")))?;
                 pairs.push((key, c));
             }
+            if pairs.is_empty() {
+                return Err(AgError::query("colormap", "discrete colormap is empty"));
+            }
             Ok(ColourDefinition::Discrete(pairs))
         }
         Some('[') => {
             // Gradient: [ [value, [r,g,b,a]], ... ]
             let breaks: Vec<(f64, Colour)> = serde_json::from_str(s)
                 .map_err(|e| AgError::query("colormap", format!("gradient colormap: {e}")))?;
+            if breaks.len() < 2 {
+                return Err(AgError::query(
+                    "colormap",
+                    "gradient colormap needs at least 2 stops",
+                ));
+            }
             Ok(ColourDefinition::ColoursAndBreaks(breaks))
         }
         _ => Err(AgError::query(
@@ -84,6 +93,18 @@ mod tests {
     #[test]
     fn discrete_non_integer_key_is_query_error() {
         let err = parse_colormap_param(r#"{"abc":[1,2,3,4]}"#).unwrap_err();
+        assert!(matches!(err, AgError::Query { .. }));
+    }
+
+    #[test]
+    fn empty_gradient_is_query_error() {
+        let err = parse_colormap_param("[]").unwrap_err();
+        assert!(matches!(err, AgError::Query { .. }));
+    }
+
+    #[test]
+    fn empty_discrete_is_query_error() {
+        let err = parse_colormap_param("{}").unwrap_err();
         assert!(matches!(err, AgError::Query { .. }));
     }
 }

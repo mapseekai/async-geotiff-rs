@@ -4,6 +4,7 @@ use crate::error::{AgError, AgResult};
 use crate::render::color_formula::{parse as parse_formula, Op};
 use crate::render::composite::{ColourDefinition, Composite};
 use crate::render::pipeline::CompiledTileStyle;
+use crate::style::colormap_param::parse_colormap_param;
 use crate::style::stretch::{parse_stretch_kind, Stretch};
 use crate::warp::resampler::Resampling;
 
@@ -185,19 +186,10 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
 
     let composite = if let Some(cm) = &style.colormap {
         // Inline JSON colormap → reuse the existing ColourDefinition machinery.
-        // Optional single rescale range supplies vmin/vmax for the gradient case.
-        let def = crate::style::colormap_param::parse_colormap_param(cm)?;
-        if style.rescale.len() > 1 {
-            return Err(AgError::query(
-                "rescale",
-                "colormap accepts at most one rescale range",
-            ));
-        }
-        Composite::from_definition(
-            &def,
-            style.rescale.first().map(|r| vec![r.0]),
-            style.rescale.first().map(|r| vec![r.1]),
-        )?
+        // Discrete maps ignore value ranges; gradient breaks are self-ranging
+        // (they carry their own data values), so `rescale` does not apply here.
+        let def = parse_colormap_param(cm)?;
+        Composite::from_definition(&def, None, None)?
     } else if let Some(name) = &style.colormap_name {
         if style.rescale.len() > 1 {
             return Err(AgError::query(
