@@ -9,7 +9,6 @@ use crate::render::colour::Colour;
 use crate::render::composite::ColourDefinition;
 
 /// Route titiler `colormap=` JSON to a `ColourDefinition` by top-level shape.
-#[allow(dead_code)]
 pub fn parse_colormap_param(s: &str) -> AgResult<ColourDefinition> {
     let head = s.trim_start().chars().next();
     match head {

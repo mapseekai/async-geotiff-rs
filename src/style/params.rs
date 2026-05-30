@@ -10,6 +10,7 @@ use crate::warp::resampler::Resampling;
 pub const ALLOWED_TILE_SIZES: [u32; 5] = [64, 128, 256, 512, 1024];
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TileStyle {
     pub bidx: Vec<u32>, // 1-indexed as given in URL
     pub rescale: Vec<(f64, f64)>,
@@ -18,6 +19,9 @@ pub struct TileStyle {
     pub stretch_sigma: Option<f64>,
     pub nodata: Option<f64>,
     pub colormap_name: Option<String>,
+    /// Inline titiler-style `colormap=` JSON (discrete object or gradient array).
+    /// Mutually exclusive with `colormap_name`.
+    pub colormap: Option<String>,
     pub color_formula: Option<String>,
     pub resampling: Resampling,
     pub reproject: Resampling,
@@ -34,6 +38,7 @@ impl Default for TileStyle {
             stretch_sigma: None,
             nodata: None,
             colormap_name: None,
+            colormap: None,
             color_formula: None,
             resampling: Resampling::Nearest,
             reproject: Resampling::Nearest,
@@ -109,6 +114,7 @@ impl TileStyle {
             }
             "nodata" => self.nodata = Some(parse_nodata(v)?),
             "colormap_name" => self.colormap_name = Some(v.to_owned()),
+            "colormap" => self.colormap = Some(v.to_owned()),
             "color_formula" => self.color_formula = Some(v.to_owned()),
             "resampling" => {
                 self.resampling =
@@ -161,6 +167,12 @@ fn validate_tilesize(tilesize: u32) -> AgResult<()> {
 
 pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
     validate_tilesize(style.tilesize)?;
+    if style.colormap.is_some() && style.colormap_name.is_some() {
+        return Err(AgError::query(
+            "colormap",
+            "colormap and colormap_name are mutually exclusive",
+        ));
+    }
     if let Some(&bad) = style.bidx.iter().find(|&&b| b == 0) {
         return Err(AgError::query("bidx", format!("{bad} is not 1-indexed")));
     }
@@ -168,9 +180,25 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
     let auto_rgb = style.bidx.is_empty()
         && style.rescale.is_empty()
         && style.colormap_name.is_none()
+        && style.colormap.is_none()
         && style.color_formula.is_none();
 
-    let composite = if let Some(name) = &style.colormap_name {
+    let composite = if let Some(cm) = &style.colormap {
+        // Inline JSON colormap → reuse the existing ColourDefinition machinery.
+        // Optional single rescale range supplies vmin/vmax for the gradient case.
+        let def = crate::style::colormap_param::parse_colormap_param(cm)?;
+        if style.rescale.len() > 1 {
+            return Err(AgError::query(
+                "rescale",
+                "colormap accepts at most one rescale range",
+            ));
+        }
+        Composite::from_definition(
+            &def,
+            style.rescale.first().map(|r| vec![r.0]),
+            style.rescale.first().map(|r| vec![r.1]),
+        )?
+    } else if let Some(name) = &style.colormap_name {
         if style.rescale.len() > 1 {
             return Err(AgError::query(
                 "rescale",
@@ -317,6 +345,33 @@ mod tests {
     fn compile_rejects_zero_bidx() {
         let s = TileStyle::from_query("bidx=0").unwrap();
         assert!(compile(&s).is_err());
+    }
+
+    #[test]
+    fn colormap_discrete_compiles_to_discrete_composite() {
+        use crate::render::composite::CompositeKind;
+        let s = TileStyle {
+            colormap: Some(r#"{"1":[255,0,0,255]}"#.to_string()),
+            ..TileStyle::default()
+        };
+        let compiled = compile(&s).unwrap();
+        assert_eq!(compiled.composite.kind, CompositeKind::Discrete);
+    }
+
+    #[test]
+    fn colormap_and_colormap_name_are_mutually_exclusive() {
+        let s = TileStyle {
+            colormap: Some(r#"{"1":[255,0,0,255]}"#.to_string()),
+            colormap_name: Some("viridis".to_string()),
+            ..TileStyle::default()
+        };
+        assert!(compile(&s).is_err());
+    }
+
+    #[test]
+    fn colormap_param_is_parsed_from_query() {
+        let s = TileStyle::from_query("colormap=%7B%221%22%3A%5B255%2C0%2C0%2C255%5D%7D").unwrap();
+        assert_eq!(s.colormap.as_deref(), Some(r#"{"1":[255,0,0,255]}"#));
     }
 
     #[test]
