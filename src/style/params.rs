@@ -19,6 +19,8 @@ pub struct TileStyle {
     pub stretch_pc: Option<(f64, f64)>,
     pub stretch_sigma: Option<f64>,
     pub nodata: Option<f64>,
+    /// Apply per-band GDAL SCALE/OFFSET metadata (physical = raw*scale+offset).
+    pub unscale: bool,
     pub colormap_name: Option<String>,
     /// Inline titiler-style `colormap=` JSON (discrete object or gradient array).
     /// Mutually exclusive with `colormap_name`.
@@ -38,6 +40,7 @@ impl Default for TileStyle {
             stretch_pc: None,
             stretch_sigma: None,
             nodata: None,
+            unscale: false,
             colormap_name: None,
             colormap: None,
             color_formula: None,
@@ -114,6 +117,7 @@ impl TileStyle {
                 ));
             }
             "nodata" => self.nodata = Some(parse_nodata(v)?),
+            "unscale" => self.unscale = matches!(v, "true" | "1" | "yes"),
             "colormap_name" => self.colormap_name = Some(v.to_owned()),
             "colormap" => self.colormap = Some(v.to_owned()),
             "color_formula" => self.color_formula = Some(v.to_owned()),
@@ -364,6 +368,13 @@ mod tests {
     fn colormap_param_is_parsed_from_query() {
         let s = TileStyle::from_query("colormap=%7B%221%22%3A%5B255%2C0%2C0%2C255%5D%7D").unwrap();
         assert_eq!(s.colormap.as_deref(), Some(r#"{"1":[255,0,0,255]}"#));
+    }
+
+    #[test]
+    fn unscale_parsed_from_query() {
+        let s = TileStyle::from_query("unscale=true").unwrap();
+        assert!(s.unscale);
+        assert!(!TileStyle::default().unscale);
     }
 
     #[test]
