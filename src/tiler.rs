@@ -344,8 +344,7 @@ impl Tiler {
 }
 
 /// Apply per-band `physical = raw * scale + offset`, returning a new F64
-/// `ImageData`. `nodata` is left as-is (the sentinel is compared pre-unscale
-/// at decode, not a physical value). Bands beyond `scale_offset.len()` use identity.
+/// `ImageData`. Bands beyond `scale_offset.len()` use identity.
 fn unscale_image(img: &ImageData, scale_offset: &[(f64, f64)]) -> ImageData {
     use ndarray::Axis;
     let mut data = img.pixels.to_f64();
@@ -355,12 +354,20 @@ fn unscale_image(img: &ImageData, scale_offset: &[(f64, f64)]) -> ImageData {
             band.mapv_inplace(|v| v * scale + offset);
         }
     }
+    // The nodata sentinel is compared by VALUE in render's compute_valid_mask.
+    // Pixels are unscaled, so the sentinel must move to physical space too, or
+    // interior nodata pixels (for COGs without a mask IFD) render opaque.
+    // GDAL stores one nodata value for all bands → use band 0's affine.
+    let nodata_physical = img.nodata.map(|nd| {
+        let (s, o) = scale_offset.first().copied().unwrap_or((1.0, 0.0));
+        nd * s + o
+    });
     ImageData {
         pixels: PixelData::F64(data),
         mask: img.mask.clone(),
         crs: img.crs.clone(),
         transform: img.transform,
-        nodata: img.nodata,
+        nodata: nodata_physical,
         bbox: img.bbox,
     }
 }
@@ -477,7 +484,29 @@ mod tests {
         assert_eq!(f[[0, 0, 0]], 10.0 * 0.1 + 1.0);
         assert_eq!(f[[0, 0, 1]], 20.0 * 0.1 + 1.0);
         assert_eq!(f[[1, 0, 0]], 1.0 * 2.0);
-        assert_eq!(out.nodata, Some(-9999.0));
+        assert_eq!(out.nodata, Some(-9999.0 * 0.1 + 1.0)); // sentinel moved to physical space
+    }
+
+    #[test]
+    fn unscale_moves_nodata_sentinel_with_pixels() {
+        use crate::pixel::{ImageData, PixelData};
+        use ndarray::array;
+        // single band, 1x2: one valid pixel (50) and one nodata pixel (-9999).
+        let img = ImageData {
+            pixels: PixelData::F64(array![[[50.0, -9999.0]]]),
+            mask: None,
+            crs: crate::crs::Crs::epsg(3857),
+            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
+            nodata: Some(-9999.0),
+            bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
+        };
+        let out = unscale_image(&img, &[(0.1, 1.0)]);
+        let f = out.pixels.to_f64();
+        // the transformed nodata pixel must still equal the transformed sentinel,
+        // so render's value-based nodata masking keeps working.
+        assert_eq!(f[[0, 0, 1]], out.nodata.unwrap());
+        // and a valid pixel is unaffected by the sentinel.
+        assert_eq!(f[[0, 0, 0]], 50.0 * 0.1 + 1.0);
     }
 
     #[test]
