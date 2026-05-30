@@ -1,6 +1,7 @@
 mod cache;
 pub mod cog;
 mod decode;
+mod scale_offset;
 pub mod stats;
 pub mod window;
 
