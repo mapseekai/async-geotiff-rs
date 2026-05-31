@@ -26,6 +26,12 @@ can land in any release** and are called out explicitly under a
   extent or the projection's valid domain; `Err(AgError::query)` for a band
   index that is 0 or exceeds the band count.
 
+### Fixed
+
+- Hardened band-math expression parsing with byte and token ceilings so flat
+  but very long query expressions cannot force unbounded lexing/parsing or
+  per-pixel evaluation work. This complements the existing nesting-depth cap.
+
 ## [0.0.5] - 2026-05-30
 
 ### Added

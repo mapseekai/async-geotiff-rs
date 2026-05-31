@@ -4,6 +4,9 @@
 
 use crate::error::{AgError, AgResult};
 
+const MAX_EXPRESSION_BYTES: usize = 4096;
+const MAX_EXPRESSION_TOKENS: usize = 256;
+
 /// RPN token. `Band(i)` is 0-indexed (source `b1` → `Band(0)`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -17,7 +20,13 @@ pub enum Token {
 }
 
 pub fn parse_expression(input: &str) -> AgResult<Vec<Token>> {
+    if input.len() > MAX_EXPRESSION_BYTES {
+        return Err(AgError::query("expression", "expression is too long"));
+    }
     let toks = lex(input)?;
+    if toks.len() > MAX_EXPRESSION_TOKENS {
+        return Err(AgError::query("expression", "expression has too many tokens"));
+    }
     let mut p = Parser { toks: &toks, pos: 0, out: Vec::new(), depth: 0 };
     p.expr()?;
     if p.pos != p.toks.len() {
@@ -306,6 +315,12 @@ mod tests {
     fn rejects_deeply_nested() {
         let deep = format!("{}b1{}", "(".repeat(500), ")".repeat(500));
         assert!(matches!(parse_expression(&deep), Err(AgError::Query { .. })));
+    }
+
+    #[test]
+    fn rejects_excessively_long_expression() {
+        let long = ["b1"; 300].join("+");
+        assert!(matches!(parse_expression(&long), Err(AgError::Query { .. })));
     }
 
     #[test]
