@@ -198,10 +198,7 @@ impl CogReader {
     ///
     /// `key` must be a **decoded** object key (e.g. `"data/my file.tif"`),
     /// not a URL-encoded string — it is passed verbatim to `Path::from`.
-    pub async fn open_object_store(
-        store: Arc<dyn ObjectStore>,
-        key: &str,
-    ) -> AgResult<Self> {
+    pub async fn open_object_store(store: Arc<dyn ObjectStore>, key: &str) -> AgResult<Self> {
         Self::open_object_store_with_config(store, key, ReaderConfig::default()).await
     }
 

@@ -838,7 +838,8 @@ mod tests {
     #[test]
     fn mode_downsample_preserves_class_not_mean() {
         // 4x4 single band: left half class 1, right half class 9.
-        let a = ndarray::Array3::from_shape_fn((1, 4, 4), |(_, _, c)| if c < 2 { 1.0 } else { 9.0 });
+        let a =
+            ndarray::Array3::from_shape_fn((1, 4, 4), |(_, _, c)| if c < 2 { 1.0 } else { 9.0 });
         let src = ImageData {
             pixels: PixelData::F64(a),
             mask: None,
@@ -858,7 +859,10 @@ mod tests {
         );
         let f = out.pixels.to_f64();
         for v in f.iter() {
-            assert!(*v == 1.0 || *v == 9.0, "mode produced a non-class value {v}");
+            assert!(
+                *v == 1.0 || *v == 9.0,
+                "mode produced a non-class value {v}"
+            );
         }
     }
 
@@ -901,9 +905,8 @@ mod tests {
         // lon 7° in EPSG:3857 ≈    779 236 m
         // lat 1° in EPSG:3857 ≈    111 325 m
         // lat 7° in EPSG:3857 ≈    781 863 m
-        let arr = Array3::<f64>::from_shape_fn((1, 8, 16), |(_, _, x)| {
-            if x < 8 { 1.0 } else { 9.0 }
-        });
+        let arr =
+            Array3::<f64>::from_shape_fn((1, 8, 16), |(_, _, x)| if x < 8 { 1.0 } else { 9.0 });
         let src = ImageData {
             pixels: PixelData::F64(arr),
             mask: None,

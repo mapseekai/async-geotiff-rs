@@ -242,11 +242,23 @@ mod tests {
         let r = rgb_reader().await;
         let [w, s, e, n] = r.wgs84_bounds().unwrap();
         let (lon, lat) = ((w + e) / 2.0, (s + n) / 2.0);
-        let all = r.point(lon, lat, &Crs::epsg(4326), &[]).await.unwrap().unwrap();
-        let one = r.point(lon, lat, &Crs::epsg(4326), &[1]).await.unwrap().unwrap();
+        let all = r
+            .point(lon, lat, &Crs::epsg(4326), &[])
+            .await
+            .unwrap()
+            .unwrap();
+        let one = r
+            .point(lon, lat, &Crs::epsg(4326), &[1])
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(one.values.len(), 1);
         assert_eq!(one.values[0], all.values[0]);
-        let rev = r.point(lon, lat, &Crs::epsg(4326), &[3, 1]).await.unwrap().unwrap();
+        let rev = r
+            .point(lon, lat, &Crs::epsg(4326), &[3, 1])
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(rev.values, vec![all.values[2], all.values[0]]);
     }
 

@@ -117,7 +117,11 @@ mod tests {
         assert_eq!(a0, 255);
         // High end is near-white.
         let [r255, g255, b255, _] = lut[255];
-        assert!(r255 > 240 && g255 > 240 && b255 > 240, "high={:?}", [r255, g255, b255]);
+        assert!(
+            r255 > 240 && g255 > 240 && b255 > 240,
+            "high={:?}",
+            [r255, g255, b255]
+        );
     }
 
     #[test]

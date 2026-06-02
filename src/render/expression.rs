@@ -25,9 +25,17 @@ pub fn parse_expression(input: &str) -> AgResult<Vec<Token>> {
     }
     let toks = lex(input)?;
     if toks.len() > MAX_EXPRESSION_TOKENS {
-        return Err(AgError::query("expression", "expression has too many tokens"));
+        return Err(AgError::query(
+            "expression",
+            "expression has too many tokens",
+        ));
     }
-    let mut p = Parser { toks: &toks, pos: 0, out: Vec::new(), depth: 0 };
+    let mut p = Parser {
+        toks: &toks,
+        pos: 0,
+        out: Vec::new(),
+        depth: 0,
+    };
     p.expr()?;
     if p.pos != p.toks.len() {
         return Err(AgError::query("expression", "unexpected trailing input"));
@@ -40,7 +48,12 @@ pub fn parse_expression(input: &str) -> AgResult<Vec<Token>> {
 
 /// Highest 0-indexed band referenced, or None if no band refs.
 pub fn max_band_ref(rpn: &[Token]) -> Option<usize> {
-    rpn.iter().filter_map(|t| match t { Token::Band(i) => Some(*i), _ => None }).max()
+    rpn.iter()
+        .filter_map(|t| match t {
+            Token::Band(i) => Some(*i),
+            _ => None,
+        })
+        .max()
 }
 
 /// Like [`eval_rpn`] but reuses a caller-provided scratch stack to avoid a
@@ -51,7 +64,10 @@ pub(crate) fn eval_rpn_with(rpn: &[Token], bands: &[f64], stack: &mut Vec<f64>) 
         match t {
             Token::Num(n) => stack.push(*n),
             Token::Band(i) => stack.push(bands.get(*i).copied().unwrap_or(f64::NAN)),
-            Token::Neg => { let a = stack.pop().unwrap_or(f64::NAN); stack.push(-a); }
+            Token::Neg => {
+                let a = stack.pop().unwrap_or(f64::NAN);
+                stack.push(-a);
+            }
             op => {
                 let b = stack.pop().unwrap_or(f64::NAN);
                 let a = stack.pop().unwrap_or(f64::NAN);
@@ -77,7 +93,16 @@ pub fn eval_rpn(rpn: &[Token], bands: &[f64]) -> f64 {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Lexeme { Num(f64), Band(usize), Plus, Minus, Star, Slash, LParen, RParen }
+enum Lexeme {
+    Num(f64),
+    Band(usize),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+}
 
 fn lex(s: &str) -> AgResult<Vec<Lexeme>> {
     let b = s.as_bytes();
@@ -87,53 +112,110 @@ fn lex(s: &str) -> AgResult<Vec<Lexeme>> {
         let c = b[i] as char;
         match c {
             ' ' | '\t' | '\n' | '\r' => i += 1,
-            '+' => { out.push(Lexeme::Plus); i += 1; }
-            '-' => { out.push(Lexeme::Minus); i += 1; }
-            '*' => { out.push(Lexeme::Star); i += 1; }
-            '/' => { out.push(Lexeme::Slash); i += 1; }
-            '(' => { out.push(Lexeme::LParen); i += 1; }
-            ')' => { out.push(Lexeme::RParen); i += 1; }
+            '+' => {
+                out.push(Lexeme::Plus);
+                i += 1;
+            }
+            '-' => {
+                out.push(Lexeme::Minus);
+                i += 1;
+            }
+            '*' => {
+                out.push(Lexeme::Star);
+                i += 1;
+            }
+            '/' => {
+                out.push(Lexeme::Slash);
+                i += 1;
+            }
+            '(' => {
+                out.push(Lexeme::LParen);
+                i += 1;
+            }
+            ')' => {
+                out.push(Lexeme::RParen);
+                i += 1;
+            }
             'b' | 'B' => {
                 let start = i + 1;
                 let mut j = start;
-                while j < b.len() && b[j].is_ascii_digit() { j += 1; }
-                if j == start { return Err(AgError::query("expression", "band ref 'b' needs a number")); }
-                let n: usize = s[start..j].parse().map_err(|_| AgError::query("expression", "invalid band number"))?;
-                if n == 0 { return Err(AgError::query("expression", "bands are 1-indexed (b1 is first)")); }
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j == start {
+                    return Err(AgError::query("expression", "band ref 'b' needs a number"));
+                }
+                let n: usize = s[start..j]
+                    .parse()
+                    .map_err(|_| AgError::query("expression", "invalid band number"))?;
+                if n == 0 {
+                    return Err(AgError::query(
+                        "expression",
+                        "bands are 1-indexed (b1 is first)",
+                    ));
+                }
                 out.push(Lexeme::Band(n - 1));
                 i = j;
             }
             c if c.is_ascii_digit() || c == '.' => {
                 let start = i;
                 let mut j = i;
-                while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'.') { j += 1; }
-                let n: f64 = s[start..j].parse().map_err(|_| AgError::query("expression", "invalid number"))?;
+                while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'.') {
+                    j += 1;
+                }
+                let n: f64 = s[start..j]
+                    .parse()
+                    .map_err(|_| AgError::query("expression", "invalid number"))?;
                 out.push(Lexeme::Num(n));
                 i = j;
             }
-            other => return Err(AgError::query("expression", format!("unexpected character {other:?}"))),
+            other => {
+                return Err(AgError::query(
+                    "expression",
+                    format!("unexpected character {other:?}"),
+                ))
+            }
         }
     }
     Ok(out)
 }
 
-struct Parser<'a> { toks: &'a [Lexeme], pos: usize, out: Vec<Token>, depth: usize }
+struct Parser<'a> {
+    toks: &'a [Lexeme],
+    pos: usize,
+    out: Vec<Token>,
+    depth: usize,
+}
 
 impl<'a> Parser<'a> {
-    fn peek(&self) -> Option<&Lexeme> { self.toks.get(self.pos) }
+    fn peek(&self) -> Option<&Lexeme> {
+        self.toks.get(self.pos)
+    }
     fn expr(&mut self) -> AgResult<()> {
         self.term()?;
         while let Some(op) = self.peek() {
-            let t = match op { Lexeme::Plus => Token::Add, Lexeme::Minus => Token::Sub, _ => break };
-            self.pos += 1; self.term()?; self.out.push(t);
+            let t = match op {
+                Lexeme::Plus => Token::Add,
+                Lexeme::Minus => Token::Sub,
+                _ => break,
+            };
+            self.pos += 1;
+            self.term()?;
+            self.out.push(t);
         }
         Ok(())
     }
     fn term(&mut self) -> AgResult<()> {
         self.factor()?;
         while let Some(op) = self.peek() {
-            let t = match op { Lexeme::Star => Token::Mul, Lexeme::Slash => Token::Div, _ => break };
-            self.pos += 1; self.factor()?; self.out.push(t);
+            let t = match op {
+                Lexeme::Star => Token::Mul,
+                Lexeme::Slash => Token::Div,
+                _ => break,
+            };
+            self.pos += 1;
+            self.factor()?;
+            self.out.push(t);
         }
         Ok(())
     }
@@ -148,17 +230,39 @@ impl<'a> Parser<'a> {
     }
     fn factor_inner(&mut self) -> AgResult<()> {
         match self.peek() {
-            Some(Lexeme::Num(n)) => { let n = *n; self.out.push(Token::Num(n)); self.pos += 1; Ok(()) }
-            Some(Lexeme::Band(i)) => { let i = *i; self.out.push(Token::Band(i)); self.pos += 1; Ok(()) }
-            Some(Lexeme::Minus) => { self.pos += 1; self.factor()?; self.out.push(Token::Neg); Ok(()) }
+            Some(Lexeme::Num(n)) => {
+                let n = *n;
+                self.out.push(Token::Num(n));
+                self.pos += 1;
+                Ok(())
+            }
+            Some(Lexeme::Band(i)) => {
+                let i = *i;
+                self.out.push(Token::Band(i));
+                self.pos += 1;
+                Ok(())
+            }
+            Some(Lexeme::Minus) => {
+                self.pos += 1;
+                self.factor()?;
+                self.out.push(Token::Neg);
+                Ok(())
+            }
             Some(Lexeme::LParen) => {
-                self.pos += 1; self.expr()?;
+                self.pos += 1;
+                self.expr()?;
                 match self.peek() {
-                    Some(Lexeme::RParen) => { self.pos += 1; Ok(()) }
+                    Some(Lexeme::RParen) => {
+                        self.pos += 1;
+                        Ok(())
+                    }
                     _ => Err(AgError::query("expression", "unbalanced parentheses")),
                 }
             }
-            _ => Err(AgError::query("expression", "expected a number, band, or '('")),
+            _ => Err(AgError::query(
+                "expression",
+                "expected a number, band, or '('",
+            )),
         }
     }
 }
@@ -168,10 +272,14 @@ impl<'a> Parser<'a> {
 /// expression uses. Matches the nodata semantics used across the render and
 /// auto-stretch paths so they never diverge.
 pub(crate) fn referenced_nodata_hit(px: &[f64], refs: &[usize], nodata: Option<f64>) -> bool {
-    let Some(nd) = nodata else { return false; };
+    let Some(nd) = nodata else {
+        return false;
+    };
     let nd_is_nan = nd.is_nan();
     for &b in refs {
-        let Some(&x) = px.get(b) else { continue; };
+        let Some(&x) = px.get(b) else {
+            continue;
+        };
         if (nd_is_nan && x.is_nan()) || (!nd_is_nan && (x - nd).abs() < 1e-9) {
             return true;
         }
@@ -211,7 +319,9 @@ impl Index {
 mod tests {
     use super::*;
 
-    fn rpn(s: &str) -> Vec<Token> { parse_expression(s).unwrap() }
+    fn rpn(s: &str) -> Vec<Token> {
+        parse_expression(s).unwrap()
+    }
 
     #[test]
     fn referenced_nodata_hit_only_checks_refs() {
@@ -230,7 +340,8 @@ mod tests {
     fn ndvi_value() {
         let t = rpn("(b5-b4)/(b5+b4)");
         let mut bands = vec![0.0; 5];
-        bands[4] = 0.5; bands[3] = 0.1;
+        bands[4] = 0.5;
+        bands[3] = 0.1;
         let v = eval_rpn(&t, &bands);
         assert!((v - 0.6666667).abs() < 1e-5, "ndvi={v}");
     }
@@ -254,19 +365,43 @@ mod tests {
         assert_eq!(max_band_ref(&rpn("1+2")), None);
     }
     #[test]
-    fn rejects_empty() { assert!(matches!(parse_expression("   "), Err(AgError::Query { .. }))); }
+    fn rejects_empty() {
+        assert!(matches!(
+            parse_expression("   "),
+            Err(AgError::Query { .. })
+        ));
+    }
     #[test]
-    fn rejects_band_zero() { assert!(matches!(parse_expression("b0+1"), Err(AgError::Query { .. }))); }
+    fn rejects_band_zero() {
+        assert!(matches!(
+            parse_expression("b0+1"),
+            Err(AgError::Query { .. })
+        ));
+    }
     #[test]
-    fn rejects_bare_b() { assert!(matches!(parse_expression("b+1"), Err(AgError::Query { .. }))); }
+    fn rejects_bare_b() {
+        assert!(matches!(
+            parse_expression("b+1"),
+            Err(AgError::Query { .. })
+        ));
+    }
     #[test]
     fn rejects_trailing_garbage() {
-        assert!(matches!(parse_expression("b1+1 xyz"), Err(AgError::Query { .. })));
-        assert!(matches!(parse_expression("b1)"), Err(AgError::Query { .. })));
+        assert!(matches!(
+            parse_expression("b1+1 xyz"),
+            Err(AgError::Query { .. })
+        ));
+        assert!(matches!(
+            parse_expression("b1)"),
+            Err(AgError::Query { .. })
+        ));
     }
     #[test]
     fn rejects_unbalanced_parens() {
-        assert!(matches!(parse_expression("(b1+1"), Err(AgError::Query { .. })));
+        assert!(matches!(
+            parse_expression("(b1+1"),
+            Err(AgError::Query { .. })
+        ));
     }
 
     #[test]
@@ -294,8 +429,16 @@ mod tests {
             Index::Ndvi { nir: 5, red: 4 },
             Index::Ndwi { green: 3, nir: 5 },
             Index::Ndbi { swir: 6, nir: 5 },
-            Index::Evi { nir: 5, red: 4, blue: 2 },
-            Index::Savi { nir: 5, red: 4, l: 0.5 },
+            Index::Evi {
+                nir: 5,
+                red: 4,
+                blue: 2,
+            },
+            Index::Savi {
+                nir: 5,
+                red: 4,
+                l: 0.5,
+            },
         ] {
             let s = idx.to_expression();
             assert!(parse_expression(&s).is_ok(), "unparseable: {s}");
@@ -307,29 +450,41 @@ mod tests {
         let idx = Index::Ndvi { nir: 5, red: 4 };
         let t = parse_expression(&idx.to_expression()).unwrap();
         let mut bands = vec![0.0; 5];
-        bands[4] = 0.5; bands[3] = 0.1;
+        bands[4] = 0.5;
+        bands[3] = 0.1;
         assert!((eval_rpn(&t, &bands) - 0.6666667).abs() < 1e-5);
     }
 
     #[test]
     fn rejects_deeply_nested() {
         let deep = format!("{}b1{}", "(".repeat(500), ")".repeat(500));
-        assert!(matches!(parse_expression(&deep), Err(AgError::Query { .. })));
+        assert!(matches!(
+            parse_expression(&deep),
+            Err(AgError::Query { .. })
+        ));
     }
 
     #[test]
     fn rejects_excessively_long_expression() {
         let long = ["b1"; 300].join("+");
-        assert!(matches!(parse_expression(&long), Err(AgError::Query { .. })));
+        assert!(matches!(
+            parse_expression(&long),
+            Err(AgError::Query { .. })
+        ));
     }
 
     #[test]
     fn savi_uses_l_factor() {
         // SAVI = (1+L)(NIR-RED)/(NIR+RED+L); L=0.5,NIR=0.5,RED=0.1: 1.5*0.4/1.1 = 0.5454545
-        let idx = Index::Savi { nir: 5, red: 4, l: 0.5 };
+        let idx = Index::Savi {
+            nir: 5,
+            red: 4,
+            l: 0.5,
+        };
         let t = parse_expression(&idx.to_expression()).unwrap();
         let mut bands = vec![0.0; 5];
-        bands[4] = 0.5; bands[3] = 0.1;
+        bands[4] = 0.5;
+        bands[3] = 0.1;
         let v = eval_rpn(&t, &bands);
         assert!((v - 0.5454545).abs() < 1e-5, "savi={v}");
     }

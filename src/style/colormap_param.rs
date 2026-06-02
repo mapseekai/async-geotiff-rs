@@ -19,9 +19,9 @@ pub(crate) fn parse_colormap_param(s: &str) -> AgResult<ColourDefinition> {
                 .map_err(|e| AgError::query("colormap", format!("discrete colormap: {e}")))?;
             let mut pairs = Vec::with_capacity(map.len());
             for (k, c) in map {
-                let key: i64 = k
-                    .parse()
-                    .map_err(|_| AgError::query("colormap", format!("key {k:?} is not an integer")))?;
+                let key: i64 = k.parse().map_err(|_| {
+                    AgError::query("colormap", format!("key {k:?} is not an integer"))
+                })?;
                 pairs.push((key, c));
             }
             if pairs.is_empty() {
@@ -73,8 +73,7 @@ mod tests {
 
     #[test]
     fn parses_gradient_array() {
-        let def =
-            parse_colormap_param(r#"[[0.0,[255,0,0,255]],[1.0,[0,0,255,255]]]"#).unwrap();
+        let def = parse_colormap_param(r#"[[0.0,[255,0,0,255]],[1.0,[0,0,255,255]]]"#).unwrap();
         match def {
             ColourDefinition::ColoursAndBreaks(breaks) => {
                 assert_eq!(breaks.len(), 2);
@@ -118,7 +117,8 @@ mod tests {
     #[test]
     fn non_finite_gradient_position_is_query_error() {
         // JSON `null` deserialises to f64::NAN for the stop position.
-        let err = parse_colormap_param(r#"[[null,[255,0,0,255]],[1.0,[0,0,255,255]]]"#).unwrap_err();
+        let err =
+            parse_colormap_param(r#"[[null,[255,0,0,255]],[1.0,[0,0,255,255]]]"#).unwrap_err();
         assert!(matches!(err, AgError::Query { .. }));
     }
 }

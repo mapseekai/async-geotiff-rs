@@ -435,7 +435,15 @@ mod tests {
     fn mode_all_invalid_returns_fill() {
         let a = ndarray::Array2::from_elem((2, 2), 5.0);
         let none_valid = ndarray::Array2::from_elem((2, 2), false);
-        let v = Resampling::Mode.sample_mode(a.view(), Some(none_valid.view()), 0.5, 0.5, 1.0, 1.0, -7.0);
+        let v = Resampling::Mode.sample_mode(
+            a.view(),
+            Some(none_valid.view()),
+            0.5,
+            0.5,
+            1.0,
+            1.0,
+            -7.0,
+        );
         assert_eq!(v, -7.0);
     }
 
@@ -445,7 +453,10 @@ mod tests {
         // reverse to an empty box; must fall back to Nearest, not return fill.
         let a = ndarray::array![[3.0, 3.0, 7.0], [3.0, 7.0, 7.0]];
         let v = Resampling::Mode.sample_mode(a.view(), None, 1.0, 0.5, 1.0, 0.3, -1.0);
-        assert_ne!(v, -1.0, "anisotropic footprint must not produce a fill hole");
+        assert_ne!(
+            v, -1.0,
+            "anisotropic footprint must not produce a fill hole"
+        );
         // Nearest at (1.0, 0.5) rounds to a real cell value (3 or 7), never fill.
         let n = Resampling::Nearest.sample_masked(a.view(), None, 1.0, 0.5, -1.0);
         assert_eq!(v, n);

@@ -57,7 +57,12 @@ pub fn parse_scale_offset(gdal_metadata: Option<&str>, bands: usize) -> Vec<(f64
             .and_then(|(_, _, v)| v.parse::<f64>().ok())
     };
     (0..bands)
-        .map(|b| (get("SCALE", b).unwrap_or(1.0), get("OFFSET", b).unwrap_or(0.0)))
+        .map(|b| {
+            (
+                get("SCALE", b).unwrap_or(1.0),
+                get("OFFSET", b).unwrap_or(0.0),
+            )
+        })
         .collect()
 }
 

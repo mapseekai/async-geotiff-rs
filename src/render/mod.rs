@@ -1,9 +1,9 @@
 pub mod color_formula;
-pub mod expression;
 pub mod colormap;
 pub mod colour;
 pub mod composite;
 pub mod encode;
+pub mod expression;
 pub mod pipeline;
 
 pub use colour::Colour;
