@@ -120,7 +120,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("MapLibre viewer: {http_base}/maplibre");
     println!("OpenLayers viewer: {http_base}/openlayers");
     println!("Leaflet viewer: {http_base}/leaflet");
-    println!("Tile endpoint: {http_base}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png");
+    let tile_base = format!("{http_base}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}");
+    println!("Tile endpoint: {tile_base}.png");
+    println!("  WebP tiles: {tile_base}.webp");
+    println!("  JPEG tiles: {tile_base}.jpg");
+    println!("  (the path extension picks the format; WebP/JPEG require: --features webp,jpeg)");
+    println!("Formats endpoint: {http_base}/formats");
     if mosaic_loaded {
         println!(
             "Mosaic endpoint: {http_base}/mosaic/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?pixel_selection=first"

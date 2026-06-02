@@ -141,6 +141,12 @@
         </select>
       </div>
       <div class="field">
+        <label for="format">Format</label>
+        <select id="format" name="format">
+          <option value="png">PNG</option>
+        </select>
+      </div>
+      <div class="field">
         <label for="opacity">Opacity</label>
         <input
           id="opacity"
@@ -162,7 +168,9 @@
     <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
       const ORIGIN = window.location.origin;
-      const TILE_PATH = "/tiles/WebMercatorQuad/{z}/{x}/{y}.png";
+      // Base without extension; the server is titiler-style so the path
+      // extension drives the output format. tileUrl() appends the selected ext.
+      const TILE_BASE = "/tiles/WebMercatorQuad/{z}/{x}/{y}";
       let styleVersion = 0;
       const c = {
         dataset: document.getElementById("dataset"),
@@ -173,6 +181,7 @@
         bidx: document.getElementById("bidx"),
         resampling: document.getElementById("resampling"),
         tilesize: document.getElementById("tilesize"),
+        format: document.getElementById("format"),
         opacity: document.getElementById("opacity"),
       };
 
@@ -206,7 +215,10 @@
         p.set("reproject", c.resampling.value);
         p.set("tilesize", c.tilesize.value || "256");
         p.set("_v", String(styleVersion));
-        return `${ORIGIN}${TILE_PATH}?${p.toString()}`;
+        // Format is carried by the path extension (.png/.webp/.jpg), not a
+        // query param, to satisfy the server's extension-drives-format rule.
+        const ext = (c.format.value || "png");
+        return `${ORIGIN}${TILE_BASE}.${ext}?${p.toString()}`;
       }
 
       const map = L.map("map", { center: [0, 0], zoom: 2 });
@@ -269,11 +281,34 @@
         applyStyle();
       });
       c.tilesize.addEventListener("change", applyStyle);
+      c.format.addEventListener("change", applyStyle);
       c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
       c.rescale.disabled = c.stretch.value !== "custom";
       c.opacity.addEventListener("input", () =>
         cogLayer.setOpacity(Number(c.opacity.value)),
       );
+
+      // List only formats this build can encode (PNG always; WebP/JPG when the
+      // server was started with --features webp,jpeg), so we never offer a
+      // format that would 400.
+      (async function loadFormats() {
+        try {
+          const r = await fetch(`${ORIGIN}/formats`);
+          if (!r.ok) return;
+          const formats = await r.json();
+          if (!Array.isArray(formats) || !formats.length) return;
+          c.format.innerHTML = "";
+          for (const fmt of formats) {
+            const o = document.createElement("option");
+            o.value = fmt.value;
+            o.textContent = fmt.label;
+            c.format.appendChild(o);
+          }
+          c.format.value = "png";
+        } catch (err) {
+          console.warn("format list unavailable", err);
+        }
+      })();
 
       (async function init() {
         try {

@@ -207,6 +207,12 @@
         </select>
       </div>
       <div class="field">
+        <label for="format">Format</label>
+        <select id="format" name="format">
+          <option value="png">PNG</option>
+        </select>
+      </div>
+      <div class="field">
         <label for="opacity">Opacity</label>
         <input id="opacity" name="opacity" type="range" min="0" max="1" step="0.05">
       </div>
@@ -222,15 +228,22 @@
 
     <script>
       const DEFAULT_TILE_ORIGIN = "http://127.0.0.1:8080";
-      const TILE_PATH = "/tiles/WebMercatorQuad/{z}/{x}/{y}.png";
-      const MOSAIC_PATH = "/mosaic/tiles/WebMercatorQuad/{z}/{x}/{y}.png";
+      const SINGLE_PATH = "/tiles/WebMercatorQuad/{z}/{x}/{y}";
+      const MOSAIC_PATH = "/mosaic/tiles/WebMercatorQuad/{z}/{x}/{y}";
 
       function isMosaic() {
         return controls.mode && controls.mode.value === "mosaic";
       }
 
+      // The server is titiler-style: the path extension drives the output
+      // format, and any ?format= must agree. Build the path with the selected
+      // extension so .webp/.jpg requests aren't rejected against a .png path.
+      function currentExt() {
+        return (controls.format && controls.format.value) || "png";
+      }
+
       function tilePath() {
-        return isMosaic() ? MOSAIC_PATH : TILE_PATH;
+        return `${isMosaic() ? MOSAIC_PATH : SINGLE_PATH}.${currentExt()}`;
       }
       const SERVER_DEFAULT_CENTER = "__ASYNC_GEOTIFF_DEFAULT_CENTER__";
       const SERVER_DEFAULT_ZOOM = "__ASYNC_GEOTIFF_DEFAULT_ZOOM__";
@@ -247,6 +260,7 @@
         bidx: document.getElementById("bidx"),
         resampling: document.getElementById("resampling"),
         tilesize: document.getElementById("tilesize"),
+        format: document.getElementById("format"),
         opacity: document.getElementById("opacity"),
         status: document.getElementById("status")
       };
@@ -342,6 +356,12 @@
         params.set("resampling", controls.resampling.value);
         params.set("reproject", controls.resampling.value);
         params.set("tilesize", controls.tilesize.value || "256");
+        // Omit format=png so the default request stays byte-identical to the
+        // pre-format behaviour; only webp/jpg are sent explicitly.
+        const fmt = controls.format.value;
+        if (fmt && fmt !== "png") {
+          params.set("format", fmt);
+        }
         return params;
       }
 
@@ -455,6 +475,36 @@
 
       controls.opacity.addEventListener("input", () => {
         map.setPaintProperty("cog-raster", "raster-opacity", Number(controls.opacity.value));
+      });
+
+      // Populate the Format switcher from /formats. The server lists only
+      // formats this build can encode (PNG always; WebP/JPG only when the
+      // server was started with `--features webp,jpeg`), so we never offer a
+      // format that would 400 and break tiles. Falls back to PNG-only.
+      (async function loadFormats() {
+        const wanted = pageParams.get("format") ?? "png";
+        try {
+          const resp = await fetch(`${tileOrigin()}/formats`);
+          if (!resp.ok) return;
+          const formats = await resp.json();
+          if (!Array.isArray(formats) || formats.length === 0) return;
+          controls.format.innerHTML = "";
+          for (const fmt of formats) {
+            const opt = document.createElement("option");
+            opt.value = fmt.value;
+            opt.textContent = fmt.label;
+            controls.format.appendChild(opt);
+          }
+          const has = formats.some((f) => f.value === wanted);
+          controls.format.value = has ? wanted : "png";
+          syncStatus();
+        } catch (err) {
+          console.warn("format list unavailable", err);
+        }
+      })();
+
+      controls.format.addEventListener("change", () => {
+        document.getElementById("style-form").requestSubmit();
       });
 
       // Populate the dataset switcher from the server's /datasets list.

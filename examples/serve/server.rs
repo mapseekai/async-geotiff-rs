@@ -107,6 +107,7 @@ pub fn router(state: AppState) -> Router {
             get(mosaic_tile_handler).options(cors_preflight),
         )
         .route("/datasets", get(datasets_handler))
+        .route("/formats", get(formats_handler))
         .route("/bounds", get(bounds_handler))
         .route(
             "/data/{name}",
@@ -299,6 +300,38 @@ pub async fn datasets_handler(State(state): State<AppState>) -> Response {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("serialize datasets: {e}"),
+            )
+                .into_response(),
+        ),
+    }
+}
+
+/// `GET /formats` -> JSON array of the tile output formats this build can
+/// actually encode, e.g. `[{"value":"png","label":"PNG"}, ...]`. WebP/JPEG only
+/// appear when the server was built with their cargo features, so viewers can
+/// list only formats that won't 400. The `value` is the tile path extension
+/// (`.png`/`.webp`/`.jpg`), which is what drives the output format.
+pub async fn formats_handler() -> Response {
+    use async_geotiff::style::TileFormat;
+
+    let available: Vec<serde_json::Value> = [TileFormat::Png, TileFormat::Webp, TileFormat::Jpeg]
+        .into_iter()
+        .filter(TileFormat::is_available)
+        .map(|f| {
+            serde_json::json!({
+                "value": f.extension(),
+                "label": f.extension().to_uppercase(),
+                "content_type": f.content_type(),
+            })
+        })
+        .collect();
+
+    match serde_json::to_string(&available) {
+        Ok(body) => with_cors(([("content-type", "application/json")], body).into_response()),
+        Err(e) => with_cors(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("serialize formats: {e}"),
             )
                 .into_response(),
         ),
