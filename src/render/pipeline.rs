@@ -1,4 +1,5 @@
-//! Fused render pipeline: rescale → color_formula → composite → encode PNG.
+//! Fused render pipeline: rescale → color_formula → composite → encode
+//! (PNG/WebP/JPEG per `style.format`).
 //!
 //! Hot path uses ndarray matrix operations end-to-end:
 //! - normalise per band as one `mapv` (broadcast scalar arithmetic over `Array2`),
@@ -8,13 +9,13 @@
 //! Validity mask is applied as a single `Zip` over the alpha channel.
 
 use bytes::Bytes;
-use ndarray::{ArrayView3, s, Array2, Array3, Axis, Zip};
+use ndarray::{s, Array2, Array3, ArrayView3, Axis, Zip};
 
 use crate::error::{AgError, AgResult};
 use crate::pixel::ImageData;
 use crate::render::color_formula::Op;
 use crate::render::composite::{Composite, HandleGet};
-use crate::render::encode::encode_png;
+use crate::render::encode::{encode, TileFormat};
 use crate::render::expression::{eval_rpn_with, max_band_ref, Token};
 use crate::warp::resampler::Resampling;
 
@@ -35,6 +36,8 @@ pub struct CompiledTileStyle {
     pub tile_size: u32,
     pub resampling: Resampling,
     pub auto_rgb: bool,
+    /// Output encoding selected by the request.
+    pub format: TileFormat,
 }
 
 pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
@@ -51,7 +54,7 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
     // RGB COGs (Sentinel TCI, NAIP, drone orthos), where every other render
     // path is wasted CPU.
     if let Some(rgba) = try_u8_rgb_fastpath(image, style, auto_rgb, h, w) {
-        return encode_png(&rgba);
+        return encode(&rgba, style.format);
     }
 
     let src = image.pixels.to_f64();
@@ -60,9 +63,13 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
     if !style.expression.is_empty() {
         let nodata = style.nodata.or(image.nodata);
         let (band, valid) = eval_expression_band(&src.view(), &style.expression, nodata, h, w)?;
-        let valid_opt = if valid.iter().all(|&b| b) { None } else { Some(valid) };
+        let valid_opt = if valid.iter().all(|&b| b) {
+            None
+        } else {
+            Some(valid)
+        };
         let rgba = render_single_band(&band, valid_opt.as_ref(), style);
-        return encode_png(&rgba);
+        return encode(&rgba, style.format);
     }
 
     let bidx: Vec<usize> = if style.bidx.is_empty() {
@@ -119,7 +126,7 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
     // Render assumes the warp stage has already produced an image at
     // `style.tile_size`; if not, the encoded PNG simply matches input dims.
     let _ = style.tile_size;
-    encode_png(&rgba)
+    encode(&rgba, style.format)
 }
 
 /// Returns Some(rgba) when the u8 RGB fast path applies. Conditions:
@@ -485,10 +492,13 @@ fn eval_expression_band(
 
     // Unique referenced band indices (0-based), computed once.
     let refs: Vec<usize> = {
-        let mut v: Vec<usize> = rpn.iter().filter_map(|t| match t {
-            crate::render::expression::Token::Band(i) => Some(*i),
-            _ => None,
-        }).collect();
+        let mut v: Vec<usize> = rpn
+            .iter()
+            .filter_map(|t| match t {
+                crate::render::expression::Token::Band(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
         v.sort_unstable();
         v.dedup();
         v
@@ -544,11 +554,9 @@ mod tests {
     #[test]
     fn eval_expression_band_masks_nodata_in_referenced_band() {
         use crate::render::expression::parse_expression;
-        let src =
-            ndarray::Array3::from_shape_vec((2, 1, 2), vec![-9999.0, 0.2, 0.4, 0.6]).unwrap();
+        let src = ndarray::Array3::from_shape_vec((2, 1, 2), vec![-9999.0, 0.2, 0.4, 0.6]).unwrap();
         let rpn = parse_expression("b1+b2").unwrap();
-        let (_band, valid) =
-            eval_expression_band(&src.view(), &rpn, Some(-9999.0), 1, 2).unwrap();
+        let (_band, valid) = eval_expression_band(&src.view(), &rpn, Some(-9999.0), 1, 2).unwrap();
         assert!(!valid[[0, 0]], "nodata in referenced band → invalid");
         assert!(valid[[0, 1]]);
     }
@@ -560,7 +568,10 @@ mod tests {
         let src = ndarray::Array3::from_shape_vec((2, 1, 1), vec![0.5, -9999.0]).unwrap();
         let rpn = parse_expression("b1").unwrap();
         let (_band, valid) = eval_expression_band(&src.view(), &rpn, Some(-9999.0), 1, 1).unwrap();
-        assert!(valid[[0, 0]], "unreferenced-band nodata must not invalidate");
+        assert!(
+            valid[[0, 0]],
+            "unreferenced-band nodata must not invalidate"
+        );
     }
 
     #[test]
@@ -606,9 +617,45 @@ mod tests {
             tile_size: 16,
             resampling: Resampling::Nearest,
             auto_rgb: false,
+            format: TileFormat::Png,
         };
         let bytes = render(&img, &style).unwrap();
         assert!(bytes.starts_with(b"\x89PNG"));
+    }
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn render_honors_webp_format() {
+        let arr = Array3::<u8>::from_elem((3, 8, 8), 200u8);
+        let img = ImageData {
+            pixels: PixelData::U8(arr),
+            mask: None,
+            bbox: Bbox::new(0.0, 0.0, 8.0, 8.0),
+            crs: Crs::epsg(3857),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 8.0, 0.0, -1.0]),
+            nodata: None,
+        };
+        let comp = Composite::from_definition(
+            &ColourDefinition::Rgb([0.0, 0.0, 0.0], [255.0, 255.0, 255.0]),
+            None,
+            None,
+        )
+        .unwrap();
+        let style = CompiledTileStyle {
+            composite: comp,
+            rescale: vec![],
+            formula: vec![],
+            expression: vec![],
+            bidx: vec![],
+            nodata: None,
+            tile_size: 8,
+            resampling: Resampling::Nearest,
+            auto_rgb: false,
+            format: TileFormat::Webp,
+        };
+        let bytes = render(&img, &style).unwrap();
+        assert!(bytes.starts_with(b"RIFF"));
+        assert_eq!(&bytes[8..12], b"WEBP");
     }
 
     #[test]
@@ -640,6 +687,7 @@ mod tests {
             tile_size: 8,
             resampling: Resampling::Nearest,
             auto_rgb: false,
+            format: TileFormat::Png,
         };
         let bytes = render(&img, &style).unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap();
@@ -673,6 +721,7 @@ mod tests {
             tile_size: 2,
             resampling: Resampling::Nearest,
             auto_rgb: false,
+            format: TileFormat::Png,
         };
         let bytes = render(&img, &style).unwrap();
         let rgba = image::load_from_memory(&bytes).unwrap().to_rgba8();
@@ -707,6 +756,7 @@ mod tests {
             tile_size: 1,
             resampling: Resampling::Nearest,
             auto_rgb: false,
+            format: TileFormat::Png,
         };
         assert!(render(&img, &style).is_err());
     }
@@ -738,6 +788,7 @@ mod tests {
             tile_size: 1,
             resampling: Resampling::Nearest,
             auto_rgb: false,
+            format: TileFormat::Png,
         };
 
         let bytes = render(&img, &style).unwrap();
@@ -772,6 +823,7 @@ mod tests {
             tile_size: 1,
             resampling: Resampling::Nearest,
             auto_rgb: true,
+            format: TileFormat::Png,
         };
 
         let bytes = render(&img, &style).unwrap();

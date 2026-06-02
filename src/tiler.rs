@@ -11,6 +11,7 @@ use crate::error::{AgError, AgResult};
 use crate::io::stats::{load_dataset_stats, DatasetStats};
 use crate::io::CogReader;
 use crate::pixel::{ImageData, PixelData};
+use crate::render::encode::TileFormat;
 use crate::render::pipeline::{render, CompiledTileStyle};
 use crate::style::params::compile_cached;
 use crate::style::stretch::{fallback_rescale, resolve_rescale, Stretch};
@@ -256,7 +257,7 @@ impl Tiler {
     ) -> AgResult<Bytes> {
         let warped = match self.warp_tile(tile_matrix_set, z, x, y, style).await? {
             Some(img) => img,
-            None => return empty_tile(style.tilesize as usize),
+            None => return empty_tile(style.tilesize as usize, style.format),
         };
         let warped = if style.unscale {
             unscale_image(&warped, self.reader.band_scale_offset())
@@ -458,41 +459,72 @@ fn unscale_ranges(
         .collect()
 }
 
-/// Fully-transparent tile PNG. The bytes are constant for a given size,
-/// so encode once and memoize: out-of-bounds / out-of-domain tiles are
-/// common (whole viewport at COG edges), and PNG deflate on the async
-/// worker would otherwise stall the reactor under load.
-pub(crate) fn empty_tile(size: usize) -> AgResult<Bytes> {
+/// Fully-transparent (or, for JPEG, fully-black) tile. The bytes are constant
+/// for a given (size, format), so encode once and memoize: out-of-bounds /
+/// out-of-domain tiles are common (whole viewport at COG edges), and encoding
+/// on the async worker would otherwise stall the reactor under load.
+pub(crate) fn empty_tile(size: usize, format: TileFormat) -> AgResult<Bytes> {
     use std::collections::HashMap;
     use std::sync::{OnceLock, RwLock};
 
-    static CACHE: OnceLock<RwLock<HashMap<usize, Bytes>>> = OnceLock::new();
+    static CACHE: OnceLock<RwLock<HashMap<(usize, TileFormat), Bytes>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
 
+    let key = (size, format);
     if let Some(bytes) = cache
         .read()
         .map_err(|_| AgError::Tiff("empty tile cache read lock poisoned".into()))?
-        .get(&size)
+        .get(&key)
     {
         return Ok(bytes.clone());
     }
     let rgba = ndarray::Array3::<u8>::zeros((size, size, 4));
-    let png = crate::render::encode::encode_png(&rgba)?;
+    let bytes = crate::render::encode::encode(&rgba, format)?;
     cache
         .write()
         .map_err(|_| AgError::Tiff("empty tile cache write lock poisoned".into()))?
-        .insert(size, png.clone());
-    Ok(png)
+        .insert(key, bytes.clone());
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Tiler, TilerConfig, expression_rescale, unscale_image, unscale_ranges};
+    use super::{expression_rescale, unscale_image, unscale_ranges, Tiler, TilerConfig};
     use crate::bounds::{Bbox, GeoTransform};
 
     #[test]
     fn tiler_type_compiles() {
         let _ = std::mem::size_of::<Tiler>();
+    }
+
+    #[test]
+    fn empty_tile_png_is_transparent_png() {
+        use crate::render::encode::TileFormat;
+        let bytes = super::empty_tile(64, TileFormat::Png).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG"));
+        // Memoized: second call returns identical bytes.
+        let again = super::empty_tile(64, TileFormat::Png).unwrap();
+        assert_eq!(bytes, again);
+    }
+
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn empty_tile_jpeg_is_black_jpeg() {
+        use crate::render::encode::TileFormat;
+        let bytes = super::empty_tile(64, TileFormat::Jpeg).unwrap();
+        assert!(bytes.starts_with(b"\xFF\xD8\xFF"));
+    }
+
+    // empty_tile feeds a fully-transparent (alpha=0) RGBA buffer to the
+    // encoder; exercise the WebP branch on exactly that path, since alpha
+    // preservation is the reason to prefer WebP over JPEG for edge tiles.
+    #[cfg(feature = "webp")]
+    #[test]
+    fn empty_tile_webp_is_valid_webp() {
+        use crate::render::encode::TileFormat;
+        let bytes = super::empty_tile(64, TileFormat::Webp).unwrap();
+        assert!(bytes.starts_with(b"RIFF"));
+        assert_eq!(&bytes[8..12], b"WEBP");
     }
 
     #[test]
@@ -592,13 +624,16 @@ mod tests {
         use crate::pixel::{ImageData, PixelData};
         use crate::render::expression::parse_expression;
         // every pixel 0/0 → NaN → no finite value → None.
-        let pixels = PixelData::F64(ndarray::Array3::from_shape_vec((2,1,2), vec![0.0,0.0, 0.0,0.0]).unwrap());
+        let pixels = PixelData::F64(
+            ndarray::Array3::from_shape_vec((2, 1, 2), vec![0.0, 0.0, 0.0, 0.0]).unwrap(),
+        );
         let img = ImageData {
-            pixels, mask: None,
+            pixels,
+            mask: None,
             crs: crate::crs::Crs::epsg(3857),
-            transform: crate::bounds::GeoTransform::from_gdal(&[0.0,1.0,0.0,0.0,0.0,-1.0]),
+            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
             nodata: None,
-            bbox: crate::bounds::Bbox::new(0.0,0.0,2.0,1.0),
+            bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
         };
         let rpn = parse_expression("(b2-b1)/(b2+b1)").unwrap();
         assert!(expression_rescale(&img, &rpn, None).is_none());

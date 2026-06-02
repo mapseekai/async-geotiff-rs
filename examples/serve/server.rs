@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use async_geotiff::error::{AgError, AgResult};
 use async_geotiff::io::CogReader;
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
-use async_geotiff::style::TileStyle;
+use async_geotiff::style::{TileFormat, TileStyle};
 use async_geotiff::tiler::Tiler;
 use async_geotiff::tms::TileMatrixSet;
 
@@ -123,9 +123,10 @@ pub async fn tile_handler(
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
     let (y_str, ext) = ye.split_once('.').unwrap_or((ye.as_str(), "png"));
-    if ext != "png" {
-        return with_cors((StatusCode::UNPROCESSABLE_ENTITY, "unsupported format").into_response());
-    }
+    let path_format = match tile_format_from_extension(ext) {
+        Ok(format) => format,
+        Err(e) => return error_response(e),
+    };
     let y: u32 = match y_str.parse() {
         Ok(v) => v,
         Err(_) => return with_cors((StatusCode::BAD_REQUEST, "bad y").into_response()),
@@ -149,9 +150,9 @@ pub async fn tile_handler(
         .find(|(k, _)| k == "dataset")
         .map(|(_, v)| v.clone());
 
-    let style = match TileStyle::from_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+    let style = match style_from_tile_params(&params, path_format) {
         Ok(s) => s,
-        Err(e) => return with_cors((StatusCode::BAD_REQUEST, e.to_string()).into_response()),
+        Err(e) => return error_response(e),
     };
 
     let tiler = match state.tiler_for(dataset.as_deref()).await {
@@ -160,7 +161,9 @@ pub async fn tile_handler(
     };
 
     match tiler.tile(tile_matrix_set, z, x, y, &style).await {
-        Ok(bytes) => with_cors(([("content-type", "image/png")], bytes).into_response()),
+        Ok(bytes) => {
+            with_cors(([("content-type", style.format.content_type())], bytes).into_response())
+        }
         Err(e) => error_response(e),
     }
 }
@@ -176,7 +179,7 @@ fn parse_pixel_selection(s: &str) -> Option<PixelSelection> {
     }
 }
 
-/// `GET /mosaic/tiles/{tms}/{z}/{x}/{y}.png?pixel_selection=first&...`
+/// `GET /mosaic/tiles/{tms}/{z}/{x}/{y}.{ext}?pixel_selection=first&...`
 /// Serves the startup-loaded MosaicJSON mosaic. Styling query params are
 /// the same as `/tiles`; `pixel_selection` picks the reducer (default
 /// `first`).
@@ -196,9 +199,10 @@ pub async fn mosaic_tile_handler(
     };
 
     let (y_str, ext) = ye.split_once('.').unwrap_or((ye.as_str(), "png"));
-    if ext != "png" {
-        return with_cors((StatusCode::UNPROCESSABLE_ENTITY, "unsupported format").into_response());
-    }
+    let path_format = match tile_format_from_extension(ext) {
+        Ok(format) => format,
+        Err(e) => return error_response(e),
+    };
     let y: u32 = match y_str.parse() {
         Ok(v) => v,
         Err(_) => return with_cors((StatusCode::BAD_REQUEST, "bad y").into_response()),
@@ -233,18 +237,58 @@ pub async fn mosaic_tile_handler(
         None => PixelSelection::First,
     };
 
-    let style = match TileStyle::from_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+    let style = match style_from_tile_params(&params, path_format) {
         Ok(s) => s,
-        Err(e) => return with_cors((StatusCode::BAD_REQUEST, e.to_string()).into_response()),
+        Err(e) => return error_response(e),
     };
 
     match mosaic
         .tile(tile_matrix_set, z, x, y, selection, &style)
         .await
     {
-        Ok(bytes) => with_cors(([("content-type", "image/png")], bytes).into_response()),
+        Ok(bytes) => {
+            with_cors(([("content-type", style.format.content_type())], bytes).into_response())
+        }
         Err(e) => error_response(e),
     }
+}
+
+fn tile_format_from_extension(ext: &str) -> AgResult<TileFormat> {
+    let format = match ext.to_ascii_lowercase().as_str() {
+        "png" => TileFormat::Png,
+        "webp" => TileFormat::Webp,
+        "jpg" | "jpeg" => TileFormat::Jpeg,
+        _ => {
+            return Err(AgError::UnsupportedPixel(format!(
+                "unsupported tile extension '{ext}'; expected png|webp|jpg|jpeg"
+            )))
+        }
+    };
+    format.ensure_available()?;
+    Ok(format)
+}
+
+fn style_from_tile_params(
+    params: &[(String, String)],
+    path_format: TileFormat,
+) -> AgResult<TileStyle> {
+    path_format.ensure_available()?;
+    let mut style = TileStyle::from_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+    if style.format == path_format {
+        return Ok(style);
+    }
+    if params.iter().any(|(k, _)| k == "format") {
+        return Err(AgError::query(
+            "format",
+            format!(
+                "query format {} does not match path extension {}",
+                style.format.extension(),
+                path_format.extension()
+            ),
+        ));
+    }
+    style.format = path_format;
+    Ok(style)
 }
 
 /// `GET /datasets` -> JSON array of available local dataset filenames.
@@ -467,9 +511,67 @@ fn with_cors(mut response: Response) -> Response {
 mod tests {
     use super::*;
 
+    fn params(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
     #[test]
     fn router_builds_with_axum_08_capture_syntax() {
         let state = AppState::new(None, None, Vec::new(), "http://127.0.0.1:0");
         let _router = router(state);
+    }
+
+    #[test]
+    fn png_extension_keeps_default_format() {
+        let style = style_from_tile_params(&params(&[]), TileFormat::Png).unwrap();
+        assert_eq!(style.format, TileFormat::Png);
+    }
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn webp_extension_sets_format_when_query_absent() {
+        assert_eq!(
+            tile_format_from_extension("webp").unwrap(),
+            TileFormat::Webp
+        );
+        let style = style_from_tile_params(&params(&[]), TileFormat::Webp).unwrap();
+        assert_eq!(style.format, TileFormat::Webp);
+    }
+
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn jpeg_extensions_set_format_when_query_absent() {
+        assert_eq!(tile_format_from_extension("jpg").unwrap(), TileFormat::Jpeg);
+        assert_eq!(
+            tile_format_from_extension("jpeg").unwrap(),
+            TileFormat::Jpeg
+        );
+        let style = style_from_tile_params(&params(&[]), TileFormat::Jpeg).unwrap();
+        assert_eq!(style.format, TileFormat::Jpeg);
+    }
+
+    #[cfg(not(feature = "webp"))]
+    #[test]
+    fn webp_extension_errors_without_feature() {
+        let err = tile_format_from_extension("webp").unwrap_err();
+        assert!(matches!(err, AgError::UnsupportedPixel(_)));
+    }
+
+    #[cfg(not(feature = "jpeg"))]
+    #[test]
+    fn jpeg_extension_errors_without_feature() {
+        let err = tile_format_from_extension("jpg").unwrap_err();
+        assert!(matches!(err, AgError::UnsupportedPixel(_)));
+    }
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn query_format_must_match_path_extension() {
+        let err =
+            style_from_tile_params(&params(&[("format", "webp")]), TileFormat::Png).unwrap_err();
+        assert!(matches!(err, AgError::Query { .. }));
     }
 }

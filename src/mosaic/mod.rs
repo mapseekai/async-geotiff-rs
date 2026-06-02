@@ -92,7 +92,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
             .assets_for_tile(tile_matrix_set, z, x, y)
             .await?;
         if assets.is_empty() {
-            return crate::tiler::empty_tile(style.tilesize as usize);
+            return crate::tiler::empty_tile(style.tilesize as usize, style.format);
         }
 
         let mut reducer = Reducer::new(selection);
@@ -129,7 +129,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
         }
 
         if fed == 0 {
-            return crate::tiler::empty_tile(style.tilesize as usize);
+            return crate::tiler::empty_tile(style.tilesize as usize, style.format);
         }
 
         let composite = reducer.finish()?;

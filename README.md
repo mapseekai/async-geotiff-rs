@@ -42,8 +42,8 @@ ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 
 ## URL contract (titiler-compatible subset)
 
-Path: `/tiles/{tms}/{z}/{x}/{y}.{ext}` where `ext ∈ {png}` (`jpeg`/`webp`
-behind feature flags post-MVP).
+Path: `/tiles/{tms}/{z}/{x}/{y}.{ext}` where `ext ∈ {png, webp, jpg, jpeg}`.
+`webp` and `jpg`/`jpeg` require building with the matching cargo feature.
 
 | Parameter | Repeat | Example | Notes |
 |---|---|---|---|

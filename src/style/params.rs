@@ -3,6 +3,7 @@
 use crate::error::{AgError, AgResult};
 use crate::render::color_formula::{parse as parse_formula, Op};
 use crate::render::composite::{ColourDefinition, Composite};
+use crate::render::encode::TileFormat;
 use crate::render::pipeline::CompiledTileStyle;
 use crate::style::colormap_param::parse_colormap_param;
 use crate::style::stretch::{parse_stretch_kind, Stretch};
@@ -31,6 +32,8 @@ pub struct TileStyle {
     pub resampling: Resampling,
     pub reproject: Resampling,
     pub tilesize: u32,
+    /// Output encoding. Defaults to PNG.
+    pub format: TileFormat,
 }
 
 impl Default for TileStyle {
@@ -50,6 +53,7 @@ impl Default for TileStyle {
             resampling: Resampling::Nearest,
             reproject: Resampling::Nearest,
             tilesize: 256,
+            format: TileFormat::Png,
         }
     }
 }
@@ -148,9 +152,26 @@ impl TileStyle {
             "sigma" => {
                 self.stretch_sigma = Some(v.parse().map_err(|_| AgError::query("sigma", v))?)
             }
+            "format" => {
+                let format = parse_format(v)?;
+                format.ensure_available()?;
+                self.format = format;
+            }
             _ => {} // unknown params silently ignored (titiler-compatible)
         }
         Ok(())
+    }
+}
+
+fn parse_format(v: &str) -> AgResult<TileFormat> {
+    match v.to_ascii_lowercase().as_str() {
+        "png" => Ok(TileFormat::Png),
+        "webp" => Ok(TileFormat::Webp),
+        "jpeg" | "jpg" => Ok(TileFormat::Jpeg),
+        _ => Err(AgError::query(
+            "format",
+            format!("unknown format '{v}'; expected png|webp|jpeg"),
+        )),
     }
 }
 
@@ -175,6 +196,7 @@ fn validate_tilesize(tilesize: u32) -> AgResult<()> {
 }
 
 pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
+    style.format.ensure_available()?;
     validate_tilesize(style.tilesize)?;
     if style.colormap.is_some() && style.colormap_name.is_some() {
         return Err(AgError::query(
@@ -194,7 +216,11 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
                 "expression and bidx are mutually exclusive",
             ));
         }
-        if style.color_formula.as_deref().is_some_and(|s| !s.is_empty()) {
+        if style
+            .color_formula
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        {
             return Err(AgError::query(
                 "expression",
                 "expression and color_formula are mutually exclusive",
@@ -274,6 +300,7 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
         tile_size: style.tilesize,
         resampling: style.resampling,
         auto_rgb,
+        format: style.format,
     })
 }
 
@@ -300,6 +327,62 @@ pub async fn compile_cached(style: &TileStyle) -> AgResult<std::sync::Arc<Compil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_defaults_to_png() {
+        let s = TileStyle::from_query("").unwrap();
+        assert_eq!(s.format, TileFormat::Png);
+    }
+
+    #[cfg(all(feature = "webp", feature = "jpeg"))]
+    #[test]
+    fn parses_format_param() {
+        assert_eq!(
+            TileStyle::from_query("format=webp").unwrap().format,
+            TileFormat::Webp
+        );
+        assert_eq!(
+            TileStyle::from_query("format=jpeg").unwrap().format,
+            TileFormat::Jpeg
+        );
+        // `jpg` alias and case-insensitivity.
+        assert_eq!(
+            TileStyle::from_query("format=JPG").unwrap().format,
+            TileFormat::Jpeg
+        );
+        assert_eq!(
+            TileStyle::from_query("format=PNG").unwrap().format,
+            TileFormat::Png
+        );
+    }
+
+    #[cfg(not(feature = "webp"))]
+    #[test]
+    fn rejects_webp_format_without_feature() {
+        let err = TileStyle::from_query("format=webp").unwrap_err();
+        assert!(matches!(err, AgError::UnsupportedPixel(_)));
+    }
+
+    #[cfg(not(feature = "jpeg"))]
+    #[test]
+    fn rejects_jpeg_format_without_feature() {
+        let err = TileStyle::from_query("format=jpeg").unwrap_err();
+        assert!(matches!(err, AgError::UnsupportedPixel(_)));
+    }
+
+    #[test]
+    fn rejects_unknown_format() {
+        let err = TileStyle::from_query("format=gif").unwrap_err();
+        assert!(matches!(err, AgError::Query { .. }));
+    }
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn compile_passes_format_through() {
+        let s = TileStyle::from_query("format=webp").unwrap();
+        let compiled = compile(&s).unwrap();
+        assert_eq!(compiled.format, TileFormat::Webp);
+    }
 
     #[test]
     fn parses_titiler_url() {
@@ -417,7 +500,10 @@ mod tests {
             ..TileStyle::default()
         };
         let c = compile(&s).unwrap();
-        assert!(!c.expression.is_empty(), "expression RPN should be populated");
+        assert!(
+            !c.expression.is_empty(),
+            "expression RPN should be populated"
+        );
     }
 
     #[test]
