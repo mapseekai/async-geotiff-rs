@@ -18,10 +18,11 @@ use crate::blocking::default_blocking_permits;
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
-use crate::io::cache::{build_window_cache, CacheConfig, WindowCache, WindowKey};
-use crate::io::decode::{decode_window, DecodeWindowJob};
+use crate::io::block_cache::{BlockCache, BlockKey, BlockKind, DecodedBlock};
+use crate::io::cache::CacheConfig;
 use crate::io::window::{tile_range_for_window, validate_window_shape, IfdInfo};
-use crate::pixel::ImageData;
+use crate::pixel::{ImageData, PixelData};
+use ndarray::Array2;
 
 #[cfg(test)]
 const TEST_OVERVIEW_PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
@@ -31,23 +32,30 @@ const TEST_OVERVIEW_PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
 /// `max_decode_tasks` caps concurrent CPU-heavy decode/stitch jobs submitted
 /// through `spawn_blocking`. Waiting for a permit is async, so excess requests
 /// yield the Tokio worker instead of flooding the blocking pool.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct ReaderConfig {
     pub cache: CacheConfig,
     pub max_decode_tasks: usize,
+    /// Caller-supplied id for this logical source (same id ⇒ shared blocks).
+    pub source_id: String,
+    /// Shared decoded-block cache injected by the caller.
+    pub block_cache: Arc<BlockCache>,
 }
 
 impl Default for ReaderConfig {
     fn default() -> Self {
+        let cache = CacheConfig::default();
         Self {
-            cache: CacheConfig::default(),
+            cache,
             max_decode_tasks: default_blocking_permits(),
+            source_id: String::new(),
+            block_cache: Arc::new(BlockCache::new(cache)),
         }
     }
 }
 
 impl ReaderConfig {
-    fn decode_task_limit(self) -> usize {
+    fn decode_task_limit(&self) -> usize {
         self.max_decode_tasks.max(1)
     }
 }
@@ -65,9 +73,11 @@ pub struct CogReader {
     alpha_bands: Vec<Option<usize>>,
     /// Per-band `(scale, offset)` from GDAL metadata (identity where absent).
     band_scale_offset: Vec<(f64, f64)>,
-    /// Decoded-window cache. Keyed by `(level, col, row, w, h)`; value is a
-    /// shared `Arc<ImageData>` so cache hits clone a pointer, not a buffer.
-    window_cache: WindowCache,
+    /// Logical source id; combined with level/kind/tile to key the shared
+    /// block cache so identical tiles from the same source are reused.
+    source_id: Arc<str>,
+    /// Shared decoded-block cache (may be shared across readers).
+    block_cache: Arc<BlockCache>,
     decode_semaphore: Arc<Semaphore>,
 }
 
@@ -187,7 +197,8 @@ impl CogReader {
             mask_ifds,
             alpha_bands,
             band_scale_offset,
-            window_cache: build_window_cache(config.cache),
+            source_id: Arc::from(config.source_id.as_str()),
+            block_cache: config.block_cache.clone(),
             decode_semaphore: Arc::new(Semaphore::new(config.decode_task_limit())),
         })
     }
@@ -332,17 +343,10 @@ impl CogReader {
         pick_overview_from_gsds(&gsds, target_gsd)
     }
 
-    /// Read a pixel window from the chosen overview level.
-    /// Returns ImageData (planar (C,H,W) layout from async-tiff).
-    ///
-    /// The whole CPU chain `decode → stitch (+ optional mask decode/stitch)`
-    /// runs inside one `spawn_blocking` job. Previously `decode_tiles` was
-    /// blocking but `stitch` (which after the dtype refactor does the bulk
-    /// memcpy + planar-axis view assembly) ran back on the tokio worker —
-    /// blocking the reactor for any window large enough to matter.
-    /// Read a pixel window, served from the decoded-window cache when
-    /// possible. Concurrent identical reads are coalesced by moka into a
-    /// single decode (single-flight); errors are not cached.
+    /// Read a pixel window. Each native tile in the window is resolved through
+    /// the shared block cache (single-flight decode on a miss), and the decoded
+    /// blocks are stitched into the requested window. Blocks are cached and may
+    /// be shared across readers with the same `source_id`.
     pub async fn read_window(
         &self,
         level: usize,
@@ -354,113 +358,162 @@ impl CogReader {
         validate_window_shape(width, height)?;
         checked_window_end(col_off, width, "column")?;
         checked_window_end(row_off, height, "row")?;
-        let key = WindowKey {
-            level,
-            col: col_off,
-            row: row_off,
-            w: width,
-            h: height,
-        };
-        let t = std::time::Instant::now();
-        let hit = self.window_cache.contains_key(&key);
-        let out = self
-            .window_cache
-            .try_get_with(key, async {
-                self.read_window_uncached(level, col_off, row_off, width, height)
-                    .await
-                    .map(Arc::new)
+
+        let ifd = self.data_ifd(level)?;
+        let ((tx0, tx1), (ty0, ty1)) = tile_range_for_window(ifd, col_off, row_off, width, height)
+            .ok_or_else(|| AgError::Tiff("ifd lacks tile dims".into()))?;
+        let coords: Vec<(usize, usize)> = (tx0..=tx1)
+            .flat_map(|x| (ty0..=ty1).map(move |y| (x as usize, y as usize)))
+            .collect();
+        let data_info = IfdInfo::from(ifd);
+
+        let data_blocks = self
+            .blocks_for(level, BlockKind::Data, ifd, &coords)
+            .await?;
+        let stitched = {
+            let coords2 = coords.clone();
+            let info = data_info;
+            let (w, h) = (width, height);
+            let (co, ro) = (col_off, row_off);
+            let permit = Arc::clone(&self.decode_semaphore)
+                .acquire_owned()
+                .await
+                .map_err(|_| AgError::Tiff("decode semaphore closed".into()))?;
+            // Move the Arc<DecodedBlock> handles (no pixel copy) into the
+            // blocking job and stitch from references built INSIDE the closure.
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let refs: Vec<&async_tiff::Array> = data_blocks.iter().map(|b| b.array()).collect();
+                crate::io::window::stitch_with_info(&refs, &coords2, &info, co, ro, w, h)
             })
             .await
-            .map_err(|e: Arc<AgError>| AgError::Tiff(format!("read_window: {e}")));
-        tracing::debug!(
-            level,
-            col_off,
-            row_off,
-            width,
-            height,
-            cache_hit = hit,
-            dur = ?t.elapsed(),
-            "read_window"
-        );
-        out
+            .map_err(|e| AgError::Tiff(format!("join: {e}")))??
+        };
+
+        let mask = if let Some(mask_ifd) = self.mask_ifd(level)? {
+            let mask_info = IfdInfo::from(mask_ifd);
+            let mask_blocks = self
+                .blocks_for(level, BlockKind::Mask, mask_ifd, &coords)
+                .await?;
+            let coords2 = coords.clone();
+            let (w, h) = (width, height);
+            let (co, ro) = (col_off, row_off);
+            let permit = Arc::clone(&self.decode_semaphore)
+                .acquire_owned()
+                .await
+                .map_err(|_| AgError::Tiff("decode semaphore closed".into()))?;
+            let m = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let refs: Vec<&async_tiff::Array> = mask_blocks.iter().map(|b| b.array()).collect();
+                crate::io::window::stitch_mask_with_info(&refs, &coords2, &mask_info, co, ro, w, h)
+            })
+            .await
+            .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+            Some(m)
+        } else {
+            None
+        };
+
+        let image = self.assemble_image(level, stitched, mask, col_off, row_off, width, height)?;
+        tracing::debug!(level, tiles = coords.len(), "read_window (block cache)");
+        Ok(Arc::new(image))
     }
 
-    async fn read_window_uncached(
+    /// Resolve every `(tx, ty)` in `coords` to a decoded block. Probes the
+    /// shared cache first, issues ONE coalesced `fetch_tiles` for the misses,
+    /// then decodes each miss exactly once via the cache's single-flight.
+    async fn blocks_for(
         &self,
         level: usize,
+        kind: BlockKind,
+        ifd: &ImageFileDirectory,
+        coords: &[(usize, usize)],
+    ) -> AgResult<Vec<Arc<DecodedBlock>>> {
+        let keys: Vec<BlockKey> = coords
+            .iter()
+            .map(|&(tx, ty)| BlockKey {
+                source: Arc::clone(&self.source_id),
+                level: level as u32,
+                kind,
+                tx: tx as u32,
+                ty: ty as u32,
+            })
+            .collect();
+        let mut resolved: Vec<Option<Arc<DecodedBlock>>> = Vec::with_capacity(keys.len());
+        let mut miss_idx: Vec<usize> = Vec::new();
+        let mut miss_coords: Vec<(usize, usize)> = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            match self.block_cache.get(k).await {
+                Some(b) => resolved.push(Some(b)),
+                None => {
+                    resolved.push(None);
+                    miss_idx.push(i);
+                    miss_coords.push(coords[i]);
+                }
+            }
+        }
+        if !miss_coords.is_empty() {
+            let tiles = ifd
+                .fetch_tiles(&miss_coords, &self.reader)
+                .await
+                .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
+            for (mi, tile) in miss_idx.iter().zip(tiles.into_iter()) {
+                let key = keys[*mi].clone();
+                let sem = Arc::clone(&self.decode_semaphore);
+                let block = self
+                    .block_cache
+                    .try_get_with(key, async move {
+                        let permit = sem
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| AgError::Tiff("decode semaphore closed".into()))?;
+                        let arr = tokio::task::spawn_blocking(move || {
+                            let _permit = permit;
+                            crate::io::decode::decode_one(tile)
+                        })
+                        .await
+                        .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+                        Ok(DecodedBlock::new(arr))
+                    })
+                    .await?;
+                resolved[*mi] = Some(block);
+            }
+        }
+        resolved
+            .into_iter()
+            .map(|b| b.ok_or_else(|| AgError::Tiff("block unresolved after fetch".into())))
+            .collect()
+    }
+
+    /// Build the `ImageData` from a stitched window: applies alpha-band → mask
+    /// promotion (rio-tiler priority: alpha > nodata), then derives the window
+    /// transform / bbox / nodata. Pixel output is identical to the previous
+    /// per-window decode path.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_image(
+        &self,
+        level: usize,
+        pixels: PixelData,
+        mask: Option<Array2<bool>>,
         col_off: i64,
         row_off: i64,
         width: u64,
         height: u64,
     ) -> AgResult<ImageData> {
-        let ifd = self.data_ifd(level)?;
-        let ((tx0, tx1), (ty0, ty1)) = tile_range_for_window(ifd, col_off, row_off, width, height)
-            .ok_or_else(|| AgError::Tiff("ifd lacks tile dims".into()))?;
-        let data_info = IfdInfo::from(ifd);
-
-        let coords: Vec<(usize, usize)> = (tx0..=tx1)
-            .flat_map(|x| (ty0..=ty1).map(move |y| (x as usize, y as usize)))
-            .collect();
-
-        // I/O: ranged HTTP fetch (object_store handles coalescing). Stays async.
-        let t_fetch = std::time::Instant::now();
-        let data_fetch = ifd.fetch_tiles(&coords, &self.reader);
-        let (data_tiles, mask_tiles_opt, mask_info_opt) =
-            if let Some(mask_ifd) = self.mask_ifd(level)? {
-                let mask_fetch = mask_ifd.fetch_tiles(&coords, &self.reader);
-                let (data_tiles, mask_tiles) = tokio::try_join!(data_fetch, mask_fetch)
-                    .map_err(|e| AgError::Tiff(format!("fetch tiles: {e}")))?;
-                (data_tiles, Some(mask_tiles), Some(IfdInfo::from(mask_ifd)))
-            } else {
-                let data_tiles = data_fetch
-                    .await
-                    .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
-                (data_tiles, None, None)
-            };
-
-        let dur_fetch = t_fetch.elapsed();
-
-        // CPU: decode + stitch in one semaphore-limited blocking job.
-        let t_decode = std::time::Instant::now();
-        let (stitched, mask) = decode_window(
-            DecodeWindowJob {
-                data_tiles,
-                mask_tiles: mask_tiles_opt,
-                coords: coords.clone(),
-                data_info,
-                mask_info: mask_info_opt,
-                col_off,
-                row_off,
-                width,
-                height,
-            },
-            Arc::clone(&self.decode_semaphore),
-        )
-        .await?;
-        let dur_decode = t_decode.elapsed();
-        tracing::debug!(
-            level,
-            tiles = coords.len(),
-            ?dur_fetch,
-            ?dur_decode,
-            "read_window miss (fetch + decode)"
-        );
-
-        // Alpha-band → mask promotion (rio-tiler priority: alpha > nodata).
-        // Only applies when no separate mask IFD was present and the data
-        // IFD's ExtraSamples tags one band as alpha. `split_off_band` only
-        // runs when the index is in range, so the consume-on-call is safe.
+        // Alpha-band → mask promotion. Only applies when no separate mask IFD
+        // was present and the data IFD's ExtraSamples tags one band as alpha.
+        // `split_off_band` only runs when the index is in range.
         let alpha_idx = self.alpha_bands.get(level).copied().flatten();
-        let (stitched, mask) = match (mask, alpha_idx) {
-            (None, Some(b)) if b < stitched.bands() => {
-                if let Some((rest, alpha)) = stitched.split_off_band(b) {
+        let (pixels, mask) = match (mask, alpha_idx) {
+            (None, Some(b)) if b < pixels.bands() => {
+                if let Some((rest, alpha)) = pixels.split_off_band(b) {
                     (rest, Some(alpha))
                 } else {
                     // Unreachable given the guard above, but keep the path total.
                     return Err(AgError::Tiff("alpha-band split failed".into()));
                 }
             }
-            (m, _) => (stitched, m),
+            (m, _) => (pixels, m),
         };
 
         let level_transform = self.level_transform(level)?;
@@ -472,7 +525,7 @@ impl CogReader {
             .and_then(|s| s.parse::<f64>().ok());
 
         Ok(ImageData {
-            pixels: stitched,
+            pixels,
             mask,
             bbox: bbox_world,
             crs: self.src_crs.clone(),
@@ -742,6 +795,78 @@ mod open_object_store_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn open_local_for_test(
+        tif: &std::path::Path,
+        source_id: &str,
+        cache: std::sync::Arc<crate::io::block_cache::BlockCache>,
+    ) -> CogReader {
+        use async_tiff::reader::ObjectReader;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as OsPath;
+        let os_path = OsPath::from_filesystem_path(tif).unwrap();
+        let reader = ObjectReader::new(std::sync::Arc::new(LocalFileSystem::new()), os_path);
+        CogReader::open_with_reader_and_config(
+            reader,
+            ReaderConfig {
+                source_id: source_id.to_string(),
+                block_cache: cache,
+                ..ReaderConfig::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_window_reuses_blocks_on_identical_window() {
+        use crate::io::block_cache::BlockCache;
+        use crate::io::cache::CacheConfig;
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("data/cog_uint8_rgb_nodata.tif");
+        if !tif.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
+        let r = open_local_for_test(&tif, "src-A", cache.clone()).await;
+        let a = r.read_window(0, 0, 0, 64, 64).await.unwrap();
+        let n1 = cache.sync_count().await;
+        let b = r.read_window(0, 0, 0, 64, 64).await.unwrap();
+        let n2 = cache.sync_count().await;
+        assert_eq!(
+            a.pixels.to_f64(),
+            b.pixels.to_f64(),
+            "identical window → identical pixels"
+        );
+        assert!(n1 > 0, "blocks must be cached");
+        assert_eq!(n1, n2, "identical window must not add blocks");
+    }
+
+    #[tokio::test]
+    async fn distinct_sources_add_separate_blocks() {
+        use crate::io::block_cache::BlockCache;
+        use crate::io::cache::CacheConfig;
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("data/cog_uint8_rgb_nodata.tif");
+        if !tif.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
+        let a = open_local_for_test(&tif, "src-A", cache.clone()).await;
+        let b = open_local_for_test(&tif, "src-B", cache.clone()).await;
+        let _ = a.read_window(0, 0, 0, 32, 32).await.unwrap();
+        let na = cache.sync_count().await;
+        let _ = b.read_window(0, 0, 0, 32, 32).await.unwrap();
+        let nb = cache.sync_count().await;
+        assert!(
+            nb > na,
+            "different source ids must add separate block entries"
+        );
+    }
 
     #[test]
     fn overview_brackets_target_from_below_downsample() {
