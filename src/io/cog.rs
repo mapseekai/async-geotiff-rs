@@ -467,26 +467,38 @@ impl CogReader {
                 .fetch_tiles(&miss_coords, &self.reader)
                 .await
                 .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
-            for (mi, tile) in miss_idx.iter().zip(tiles.into_iter()) {
-                let key = keys[*mi].clone();
+            // Decode misses CONCURRENTLY (bounded by `decode_semaphore`) rather
+            // than one-at-a-time: a cold window with many misses decodes in
+            // parallel across the blocking pool instead of serially. Each block's
+            // `try_get_with` still single-flights that block; results are placed
+            // by index, so stitch ordering is unaffected.
+            let mut set = tokio::task::JoinSet::new();
+            for (mi, tile) in miss_idx.iter().copied().zip(tiles.into_iter()) {
+                let key = keys[mi].clone();
                 let sem = Arc::clone(&self.decode_semaphore);
-                let block = self
-                    .block_cache
-                    .try_get_with(key, async move {
-                        let permit = sem
-                            .acquire_owned()
+                let cache = Arc::clone(&self.block_cache);
+                set.spawn(async move {
+                    let block = cache
+                        .try_get_with(key, async move {
+                            let permit = sem
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| AgError::Tiff("decode semaphore closed".into()))?;
+                            let arr = tokio::task::spawn_blocking(move || {
+                                let _permit = permit;
+                                crate::io::decode::decode_one(tile)
+                            })
                             .await
-                            .map_err(|_| AgError::Tiff("decode semaphore closed".into()))?;
-                        let arr = tokio::task::spawn_blocking(move || {
-                            let _permit = permit;
-                            crate::io::decode::decode_one(tile)
+                            .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+                            Ok(DecodedBlock::new(arr))
                         })
-                        .await
-                        .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
-                        Ok(DecodedBlock::new(arr))
-                    })
-                    .await?;
-                resolved[*mi] = Some(block);
+                        .await?;
+                    Ok::<(usize, Arc<DecodedBlock>), AgError>((mi, block))
+                });
+            }
+            while let Some(res) = set.join_next().await {
+                let (mi, block) = res.map_err(|e| AgError::Tiff(format!("decode task: {e}")))??;
+                resolved[mi] = Some(block);
             }
         }
         resolved
