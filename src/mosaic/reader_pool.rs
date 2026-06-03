@@ -7,7 +7,6 @@
 //! total memory budget is bounded by a single `CacheConfig` rather than
 //! multiplied by the number of open assets.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::error::{AgError, AgResult};
@@ -16,9 +15,6 @@ use crate::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 pub struct ReaderPool {
     cache: moka::future::Cache<String, Arc<CogReader>>,
     block_cache: Arc<BlockCache>,
-    /// Stable URL → source-id mapping so a re-opened reader reuses cached blocks.
-    ids: moka::future::Cache<String, Arc<str>>,
-    next_id: AtomicU64,
 }
 
 impl ReaderPool {
@@ -33,8 +29,6 @@ impl ReaderPool {
         Self {
             cache: moka::future::Cache::new(capacity),
             block_cache,
-            ids: moka::future::Cache::new(100_000),
-            next_id: AtomicU64::new(0),
         }
     }
 
@@ -44,24 +38,19 @@ impl ReaderPool {
     }
 
     /// Get the cached reader for `url`, opening it (over HTTP) on first use.
-    /// Concurrent first-opens for the same URL are coalesced by moka.
-    /// All readers share the pool's single [`BlockCache`].
-    pub async fn get_or_open(&self, url: &str) -> AgResult<Arc<CogReader>> {
+    /// Concurrent first-opens for the same URL are coalesced by moka. The
+    /// caller-supplied `source_id` is the block-cache identity for this COG —
+    /// reuse the same string for the same COG (here and on any single-dataset
+    /// reader) to share decoded blocks. All readers share the pool's single
+    /// [`BlockCache`].
+    pub async fn get_or_open(&self, url: &str, source_id: &str) -> AgResult<Arc<CogReader>> {
         let url_owned = url.to_string();
-        // Stable per-URL source id: a re-opened reader for the same URL will
-        // reuse blocks already in the shared cache.
-        let source_id = self
-            .ids
-            .get_with(url_owned.clone(), async {
-                let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-                Arc::<str>::from(format!("asset-{n}"))
-            })
-            .await;
+        let source_id = source_id.to_string();
         let block_cache = Arc::clone(&self.block_cache);
         self.cache
             .try_get_with(url_owned.clone(), async move {
                 let cfg = ReaderConfig {
-                    source_id: source_id.to_string(),
+                    source_id,
                     block_cache,
                     ..ReaderConfig::default()
                 };
@@ -80,7 +69,9 @@ mod tests {
     #[tokio::test]
     async fn open_failure_is_mosaic_error() {
         let pool = ReaderPool::new(8);
-        let result = pool.get_or_open("http://127.0.0.1:1/nope.tif").await;
+        let result = pool
+            .get_or_open("http://127.0.0.1:1/nope.tif", "nope")
+            .await;
         match result {
             Err(AgError::Mosaic(_)) => {}
             Err(other) => {

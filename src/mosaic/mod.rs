@@ -123,8 +123,9 @@ impl<S: MosaicSource> MosaicTiler<S> {
         for chunk in assets.chunks(self.cfg.chunk_size) {
             let futs = chunk.iter().map(|a| {
                 let url = a.url.clone();
+                let source_id = a.source_id.clone();
                 async move {
-                    let reader = self.pool.get_or_open(&url).await?;
+                    let reader = self.pool.get_or_open(&url, &source_id).await?;
                     let tiler = Tiler::new(reader);
                     let img = tiler.warp_tile(tile_matrix_set, z, x, y, style).await?;
                     Ok::<Option<ImageData>, AgError>(img)
@@ -188,6 +189,7 @@ mod tests {
         ) -> AgResult<Vec<AssetRef>> {
             Ok(vec![AssetRef {
                 url: self.abspath.clone(),
+                source_id: self.abspath.clone(),
                 bbox: Bbox::new(-180.0, -90.0, 180.0, 90.0),
             }])
         }

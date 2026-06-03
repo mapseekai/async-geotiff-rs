@@ -240,12 +240,16 @@ impl MosaicSource for MosaicJsonSource {
         urls.dedup();
         Ok(urls
             .into_iter()
-            .map(|url| AssetRef {
-                url: match &self.doc.asset_prefix {
+            .map(|url| {
+                let url = match &self.doc.asset_prefix {
                     Some(prefix) => format!("{prefix}{url}"),
                     None => url,
-                },
-                bbox: self.bbox,
+                };
+                AssetRef {
+                    source_id: url.clone(),
+                    url,
+                    bbox: self.bbox,
+                }
             })
             .collect())
     }

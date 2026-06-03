@@ -127,6 +127,7 @@ impl MosaicSource for StacSource {
                 .unwrap_or(wb);
 
             out.push(AssetRef {
+                source_id: asset.href.clone(),
                 url: asset.href.clone(),
                 bbox,
             });

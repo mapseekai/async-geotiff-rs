@@ -31,6 +31,7 @@ impl MosaicSource for UrlList {
 async fn main() -> AgResult<()> {
     let source = UrlList(vec![AssetRef {
         url: "https://example.com/scene_a.tif".into(),
+        source_id: "https://example.com/scene_a.tif".into(),
         bbox: Bbox::new(-10.0, -10.0, 10.0, 10.0),
     }]);
     let mosaic = MosaicTiler::new(source);

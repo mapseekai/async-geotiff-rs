@@ -10,6 +10,12 @@ use crate::tms::TileMatrixSet;
 #[derive(Debug, Clone)]
 pub struct AssetRef {
     pub url: String,
+    /// Stable cache identity for this COG, supplied by the `MosaicSource`.
+    /// Decoded blocks are keyed by it, so use the **same** `source_id` here and
+    /// when opening the same COG via single-dataset `ReaderConfig` to reuse
+    /// decoded blocks across both paths (given a shared `BlockCache`). The
+    /// library's built-in sources set it to the asset URL.
+    pub source_id: String,
     /// Source-provided bounding box (WGS84) intended for the `MosaicSource`
     /// implementation's own spatial filtering. The orchestrator does not
     /// currently consume this field — it is part of the contract by design
@@ -53,6 +59,7 @@ mod tests {
     async fn trait_object_is_usable() {
         let s: Box<dyn MosaicSource> = Box::new(Fixed(vec![AssetRef {
             url: "https://example.com/a.tif".into(),
+            source_id: "https://example.com/a.tif".into(),
             bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
         }]));
         let got = s

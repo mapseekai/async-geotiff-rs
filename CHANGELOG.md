@@ -61,6 +61,13 @@ can land in any release** and are called out explicitly under a
   shared block cache (with a stable per-URL `source_id`) into every asset
   reader. Known limitation: concurrent requests that both miss the same cold
   block may each fetch its bytes once (decode is still single-flighted).
+- ⚠️ **BREAKING** — `AssetRef` (the `MosaicSource` contract) now carries a
+  caller-supplied `source_id: String`; the reader pool no longer invents an
+  internal `asset-{n}` id. Set `source_id` to a stable identity for each COG
+  (the built-in `MosaicJsonSource`/STAC sources use the asset URL) and reuse the
+  **same** string when opening that COG via single-dataset `ReaderConfig` to
+  share decoded blocks across the mosaic and single-dataset paths (given a
+  shared `BlockCache`). `ReaderPool::get_or_open` gained a `source_id` argument.
 
 ## [0.0.6] - 2026-05-31
 
