@@ -5,6 +5,7 @@
 //! using moka's TinyLFU policy.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_tiff::Array;
@@ -76,13 +77,57 @@ impl DecodedBlock {
 
 // ── BlockCache ──────────────────────────────────────────────────────────────
 
+// ── Stats ───────────────────────────────────────────────────────────────────
+
+/// Monotonic counters shared by all clones of a [`BlockCache`].
+#[derive(Debug, Default)]
+struct Counters {
+    /// Probe (`get`) calls that found a live entry.
+    hits: AtomicU64,
+    /// Probe (`get`) calls that found nothing.
+    misses: AtomicU64,
+    /// Blocks actually decoded (one per `try_get_with` miss; single-flighted).
+    decoded: AtomicU64,
+    /// Blocks fetched from the object store. May exceed `decoded` when
+    /// concurrent requests fetch the same cold block before either inserts it.
+    fetched: AtomicU64,
+}
+
+/// Point-in-time snapshot of [`BlockCache`] activity, for metrics/monitoring.
+///
+/// `hits`/`misses`/`decoded`/`fetched` are monotonic since the cache was
+/// created; `entries`/`resident_bytes` are the current (eventually-consistent)
+/// cache occupancy. Poll this periodically and export to your metrics backend
+/// (e.g. OpenTelemetry gauges/counters):
+/// - hit ratio = `hits / (hits + misses)`,
+/// - decode-saving = `1 - decoded / misses`,
+/// - fetch amplification = `fetched / decoded` (1.0 = no duplicate fetches),
+/// - `resident_bytes` vs the configured budget = memory pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockCacheStats {
+    /// Probe hits (block already decoded and resident).
+    pub hits: u64,
+    /// Probe misses (block needed fetch + decode).
+    pub misses: u64,
+    /// Blocks decoded (single-flighted; ~= unique cold blocks).
+    pub decoded: u64,
+    /// Blocks fetched from the object store.
+    pub fetched: u64,
+    /// Current number of cached blocks (eventually consistent).
+    pub entries: u64,
+    /// Current resident byte size of cached blocks (eventually consistent).
+    pub resident_bytes: u64,
+}
+
 /// Shared, byte-bounded cache of decoded TIFF blocks.
 ///
-/// `BlockCache` is cheaply cloneable (`Clone` delegates to the inner
-/// `moka::future::Cache` which is `Arc`-backed).
+/// `BlockCache` is cheaply cloneable; clones share the same underlying cache
+/// (the inner `moka::future::Cache` is `Arc`-backed) **and** the same stats
+/// counters.
 #[derive(Clone)]
 pub struct BlockCache {
     inner: moka::future::Cache<BlockKey, Arc<DecodedBlock>>,
+    counters: Arc<Counters>,
 }
 
 impl BlockCache {
@@ -96,7 +141,30 @@ impl BlockCache {
         }
         Self {
             inner: builder.build(),
+            counters: Arc::new(Counters::default()),
         }
+    }
+
+    /// Snapshot the cache's activity counters and current occupancy.
+    ///
+    /// Cheap and non-blocking; intended to be polled periodically by a metrics
+    /// exporter. `entries`/`resident_bytes` come from moka and are eventually
+    /// consistent.
+    pub fn stats(&self) -> BlockCacheStats {
+        BlockCacheStats {
+            hits: self.counters.hits.load(Ordering::Relaxed),
+            misses: self.counters.misses.load(Ordering::Relaxed),
+            decoded: self.counters.decoded.load(Ordering::Relaxed),
+            fetched: self.counters.fetched.load(Ordering::Relaxed),
+            entries: self.inner.entry_count(),
+            resident_bytes: self.inner.weighted_size(),
+        }
+    }
+
+    /// Record that `n` blocks were fetched from the object store. Called by the
+    /// reader after a coalesced fetch of cache misses.
+    pub(crate) fn record_fetched(&self, n: u64) {
+        self.counters.fetched.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Return the cached block for `key`, calling `init` exactly once when
@@ -110,15 +178,31 @@ impl BlockCache {
         key: BlockKey,
         init: impl Future<Output = Result<DecodedBlock, AgError>>,
     ) -> Result<Arc<DecodedBlock>, AgError> {
+        // The init future runs only on a miss (moka single-flights it), so
+        // counting here counts actual decodes, deduped across concurrent races.
+        let counters = Arc::clone(&self.counters);
         self.inner
-            .try_get_with(key, async move { init.await.map(Arc::new) })
+            .try_get_with(key, async move {
+                let v = init.await.map(Arc::new);
+                if v.is_ok() {
+                    counters.decoded.fetch_add(1, Ordering::Relaxed);
+                }
+                v
+            })
             .await
             .map_err(|e: Arc<AgError>| AgError::Tiff(format!("block decode: {e}")))
     }
 
-    /// Probe the cache without populating it.
+    /// Probe the cache without populating it. Records a hit or miss.
     pub async fn get(&self, key: &BlockKey) -> Option<Arc<DecodedBlock>> {
-        self.inner.get(key).await
+        let hit = self.inner.get(key).await;
+        let counter = if hit.is_some() {
+            &self.counters.hits
+        } else {
+            &self.counters.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        hit
     }
 
     /// Flush pending internal tasks and return the number of live entries.
@@ -317,5 +401,45 @@ mod tests {
         assert_eq!(b2.weight(), expected_weight, "second block weight mismatch");
 
         assert_eq!(cache.sync_count().await, 2, "cache should hold 2 entries");
+    }
+
+    #[tokio::test]
+    async fn stats_track_hits_misses_decode_and_fetch() {
+        let Some(array) = sample_array().await else {
+            eprintln!("fixture missing, skipping");
+            return;
+        };
+        let cache = BlockCache::new(CacheConfig::default());
+        let key = make_key("s1");
+
+        // Initial probe → miss.
+        assert!(cache.get(&key).await.is_none());
+        // Decode + insert (one decode).
+        cache
+            .try_get_with(key.clone(), async move {
+                Ok::<_, AgError>(DecodedBlock::new(array))
+            })
+            .await
+            .unwrap();
+        // Two probes → two hits.
+        assert!(cache.get(&key).await.is_some());
+        assert!(cache.get(&key).await.is_some());
+        // A probe for an absent key → miss.
+        assert!(cache.get(&make_key("absent")).await.is_none());
+        cache.record_fetched(3);
+
+        // `entries`/`resident_bytes` are eventually consistent in moka; flush
+        // pending tasks so they reflect the single insert deterministically.
+        let _ = cache.sync_count().await;
+        let s = cache.stats();
+        assert_eq!(s.hits, 2, "hits");
+        assert_eq!(s.misses, 2, "misses");
+        assert_eq!(s.decoded, 1, "decoded once (single-flight init)");
+        assert_eq!(s.fetched, 3, "fetched");
+        assert_eq!(s.entries, 1, "one cached entry");
+        assert!(s.resident_bytes > 0, "resident bytes after one insert");
+
+        // Stats are shared across clones.
+        assert_eq!(cache.clone().stats().hits, 2, "clone shares counters");
     }
 }

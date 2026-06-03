@@ -357,6 +357,11 @@ impl CogReader {
     /// the shared block cache (single-flight decode on a miss), and the decoded
     /// blocks are stitched into the requested window. Blocks are cached and may
     /// be shared across readers with the same `source_id`.
+    #[tracing::instrument(
+        skip(self),
+        fields(source = %self.source_id, level, width, height),
+        err
+    )]
     pub async fn read_window(
         &self,
         level: usize,
@@ -470,6 +475,7 @@ impl CogReader {
             }
         }
         if !miss_coords.is_empty() {
+            self.block_cache.record_fetched(miss_coords.len() as u64);
             let tiles = ifd
                 .fetch_tiles(&miss_coords, &self.reader)
                 .await

@@ -190,6 +190,39 @@ or every asset in a mosaic) to bound their combined decode memory to a single
 budget instead of one cache per reader. `MosaicTiler` does this automatically
 via its `ReaderPool`.
 
+## Observability
+
+The library emits [`tracing`](https://docs.rs/tracing) only — it takes **no**
+OpenTelemetry (or other metrics-backend) dependency, so your application owns
+the export pipeline. Two integration points:
+
+**Spans → traces.** `Tiler::tile` and `CogReader::read_window` are
+`#[tracing::instrument]`-ed (fields: source id, tile coords, level, format).
+Bridge them to OpenTelemetry with a `tracing-opentelemetry` layer:
+
+```rust
+use tracing_subscriber::prelude::*;
+tracing_subscriber::registry()
+    .with(tracing_subscriber::EnvFilter::new("async_geotiff=info"))
+    .with(tracing_opentelemetry::layer().with_tracer(tracer)) // your OTLP tracer
+    .init();
+```
+
+**Cache metrics → gauges/counters.** You construct the shared `Arc<BlockCache>`,
+so poll `BlockCache::stats()` periodically and feed it to your metrics backend:
+
+```rust
+let s = block_cache.stats(); // BlockCacheStats { hits, misses, decoded, fetched, entries, resident_bytes }
+// hit ratio        = hits / (hits + misses)
+// fetch amplification = fetched / decoded   (1.0 = no duplicate cold fetches)
+// memory pressure  = resident_bytes / configured budget
+```
+
+Boundary metrics you can't read from the library (request rate, latency
+percentiles, the HTTP-204 "no tile" rate) are best recorded where you call
+`Tiler::tile` / `MosaicTiler::tile` — match on `Ok(Some)` / `Ok(None)` / `Err`
+and record OTel histograms/counters there.
+
 ## License
 
 MIT OR Apache-2.0

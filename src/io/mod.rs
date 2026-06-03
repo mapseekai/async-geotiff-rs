@@ -8,7 +8,7 @@ pub mod stats;
 pub mod window;
 
 pub use async_tiff::reader::ObjectReader;
-pub use block_cache::{BlockCache, BlockKey, BlockKind, DecodedBlock};
+pub use block_cache::{BlockCache, BlockCacheStats, BlockKey, BlockKind, DecodedBlock};
 pub use cache::CacheConfig;
 pub use cog::{CogReader, ReaderConfig};
 pub use object_store;

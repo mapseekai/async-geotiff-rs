@@ -253,6 +253,11 @@ impl Tiler {
     /// would otherwise cover the map where PNG/WebP stay transparent).
     /// In-range tiles that happen to be all-nodata still render normally
     /// (transparent for PNG/WebP).
+    #[tracing::instrument(
+        skip(self, style),
+        fields(tms = tile_matrix_set.name(), z, x, y, format = ?style.format),
+        err
+    )]
     pub async fn tile(
         &self,
         tile_matrix_set: TileMatrixSet,

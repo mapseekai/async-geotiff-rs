@@ -25,6 +25,13 @@ can land in any release** and are called out explicitly under a
 - `CogReader::open_http_with_config_default(url, ReaderConfig)` — open a COG over
   HTTP with a full `ReaderConfig` (to inject a shared block cache + source id)
   while keeping the default tuned client options.
+- Observability hooks for metrics/monitoring. `BlockCache::stats() -> BlockCacheStats`
+  snapshots `{ hits, misses, decoded, fetched, entries, resident_bytes }` — poll it
+  to export cache hit ratio, decode/fetch counts (incl. fetch amplification), and
+  resident memory vs the budget. `Tiler::tile` and `CogReader::read_window` carry
+  `#[tracing::instrument]` spans (with source/tile/level/format fields). The library
+  emits `tracing` only and takes no OpenTelemetry dependency; bridge it in your app
+  via `tracing-opentelemetry` and poll `stats()` into OTel gauges/counters.
 
 ### Changed
 
