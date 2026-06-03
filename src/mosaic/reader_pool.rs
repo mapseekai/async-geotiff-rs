@@ -1,30 +1,59 @@
 //! URL-keyed cache of opened `CogReader`s. Opening a COG = an HTTP range
 //! read of the TIFF footer + IFD parse; the same COG is reused by many
 //! adjacent tiles, so cache the opened reader keyed by its address.
+//!
+//! All readers in the pool share **one** [`BlockCache`] so decoded tile
+//! blocks from the same asset are reused across reader instances, and the
+//! total memory budget is bounded by a single `CacheConfig` rather than
+//! multiplied by the number of open assets.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::error::{AgError, AgResult};
-use crate::io::CogReader;
+use crate::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 
 pub struct ReaderPool {
     cache: moka::future::Cache<String, Arc<CogReader>>,
+    block_cache: Arc<BlockCache>,
+    /// Stable URL → source-id mapping so a re-opened reader reuses cached blocks.
+    ids: moka::future::Cache<String, Arc<str>>,
+    next_id: AtomicU64,
 }
 
 impl ReaderPool {
     pub fn new(capacity: u64) -> Self {
         Self {
             cache: moka::future::Cache::new(capacity),
+            block_cache: Arc::new(BlockCache::new(CacheConfig::default())),
+            ids: moka::future::Cache::new(capacity.max(1)),
+            next_id: AtomicU64::new(0),
         }
     }
 
     /// Get the cached reader for `url`, opening it (over HTTP) on first use.
     /// Concurrent first-opens for the same URL are coalesced by moka.
+    /// All readers share the pool's single [`BlockCache`].
     pub async fn get_or_open(&self, url: &str) -> AgResult<Arc<CogReader>> {
         let url_owned = url.to_string();
+        // Stable per-URL source id: a re-opened reader for the same URL will
+        // reuse blocks already in the shared cache.
+        let source_id = self
+            .ids
+            .get_with(url_owned.clone(), async {
+                let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+                Arc::<str>::from(format!("asset-{n}"))
+            })
+            .await;
+        let block_cache = Arc::clone(&self.block_cache);
         self.cache
             .try_get_with(url_owned.clone(), async move {
-                let r = CogReader::open_http(&url_owned).await?;
+                let cfg = ReaderConfig {
+                    source_id: source_id.to_string(),
+                    block_cache,
+                    ..ReaderConfig::default()
+                };
+                let r = CogReader::open_http_with_config_default(&url_owned, cfg).await?;
                 Ok::<_, AgError>(Arc::new(r))
             })
             .await
