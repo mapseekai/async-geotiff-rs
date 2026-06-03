@@ -377,9 +377,20 @@ impl CogReader {
             .collect();
         let data_info = IfdInfo::from(ifd);
 
-        let data_blocks = self
-            .blocks_for(level, BlockKind::Data, ifd, &coords)
-            .await?;
+        let mask_ifd = self.mask_ifd(level)?;
+        let (data_blocks, mask_blocks) = if let Some(mask_ifd) = mask_ifd {
+            let mask_info = IfdInfo::from(mask_ifd);
+            let data_blocks = self.blocks_for(level, BlockKind::Data, ifd, &coords);
+            let mask_blocks = self.blocks_for(level, BlockKind::Mask, mask_ifd, &coords);
+            let (data_blocks, mask_blocks) = tokio::try_join!(data_blocks, mask_blocks)?;
+            (data_blocks, Some((mask_blocks, mask_info)))
+        } else {
+            (
+                self.blocks_for(level, BlockKind::Data, ifd, &coords)
+                    .await?,
+                None,
+            )
+        };
         let stitched = {
             let coords2 = coords.clone();
             let info = data_info;
@@ -400,11 +411,7 @@ impl CogReader {
             .map_err(|e| AgError::Tiff(format!("join: {e}")))??
         };
 
-        let mask = if let Some(mask_ifd) = self.mask_ifd(level)? {
-            let mask_info = IfdInfo::from(mask_ifd);
-            let mask_blocks = self
-                .blocks_for(level, BlockKind::Mask, mask_ifd, &coords)
-                .await?;
+        let mask = if let Some((mask_blocks, mask_info)) = mask_blocks {
             let coords2 = coords.clone();
             let (w, h) = (width, height);
             let (co, ro) = (col_off, row_off);
