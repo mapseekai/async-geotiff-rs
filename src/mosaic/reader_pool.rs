@@ -26,7 +26,7 @@ impl ReaderPool {
         Self {
             cache: moka::future::Cache::new(capacity),
             block_cache: Arc::new(BlockCache::new(CacheConfig::default())),
-            ids: moka::future::Cache::new(capacity.max(1)),
+            ids: moka::future::Cache::new(100_000),
             next_id: AtomicU64::new(0),
         }
     }

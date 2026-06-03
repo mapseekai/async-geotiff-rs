@@ -1,6 +1,7 @@
 //! `CogReader` — async-tiff reader orchestration with GeoTransform/CRS derivation.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
@@ -24,6 +25,8 @@ use crate::io::window::{tile_range_for_window, validate_window_shape, IfdInfo};
 use crate::pixel::{ImageData, PixelData};
 use ndarray::Array2;
 
+static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(test)]
 const TEST_OVERVIEW_PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
 
@@ -34,7 +37,6 @@ const TEST_OVERVIEW_PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
 /// yield the Tokio worker instead of flooding the blocking pool.
 #[derive(Clone)]
 pub struct ReaderConfig {
-    pub cache: CacheConfig,
     pub max_decode_tasks: usize,
     /// Caller-supplied id for this logical source (same id ⇒ shared blocks).
     pub source_id: String,
@@ -44,12 +46,10 @@ pub struct ReaderConfig {
 
 impl Default for ReaderConfig {
     fn default() -> Self {
-        let cache = CacheConfig::default();
         Self {
-            cache,
             max_decode_tasks: default_blocking_permits(),
-            source_id: String::new(),
-            block_cache: Arc::new(BlockCache::new(cache)),
+            source_id: format!("cog-{}", NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed)),
+            block_cache: Arc::new(BlockCache::new(CacheConfig::default())),
         }
     }
 }
@@ -98,7 +98,7 @@ impl CogReader {
     }
 
     /// Like [`Self::open_http_with_options`] but also lets the caller size the
-    /// decoded-window cache.
+    /// decoded-block cache.
     pub async fn open_http_with_cache(
         url: &str,
         options: ClientOptions,
@@ -108,7 +108,7 @@ impl CogReader {
             url,
             options,
             ReaderConfig {
-                cache,
+                block_cache: Arc::new(crate::io::block_cache::BlockCache::new(cache)),
                 ..ReaderConfig::default()
             },
         )
@@ -164,7 +164,7 @@ impl CogReader {
         Self::open_with_reader_and_config(
             reader,
             ReaderConfig {
-                cache,
+                block_cache: Arc::new(crate::io::block_cache::BlockCache::new(cache)),
                 ..ReaderConfig::default()
             },
         )
@@ -224,7 +224,7 @@ impl CogReader {
         Self::open_object_store_with_config(store, key, ReaderConfig::default()).await
     }
 
-    /// Like [`Self::open_object_store`] but lets the caller size the decoded-window
+    /// Like [`Self::open_object_store`] but lets the caller size the decoded-block
     /// cache.
     pub async fn open_object_store_with_cache(
         store: Arc<dyn ObjectStore>,
@@ -235,7 +235,7 @@ impl CogReader {
             store,
             key,
             ReaderConfig {
-                cache,
+                block_cache: Arc::new(crate::io::block_cache::BlockCache::new(cache)),
                 ..ReaderConfig::default()
             },
         )
