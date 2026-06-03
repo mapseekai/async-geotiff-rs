@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use async_tiff::Array;
 use async_tiff::Tile;
 use ndarray::Array2;
 use tokio::sync::Semaphore;
@@ -8,6 +9,18 @@ use tokio::sync::Semaphore;
 use crate::error::{AgError, AgResult};
 use crate::io::window::{stitch_mask_with_info, stitch_with_info, IfdInfo};
 use crate::pixel::PixelData;
+
+fn registry() -> &'static async_tiff::decoder::DecoderRegistry {
+    static DECODERS: OnceLock<async_tiff::decoder::DecoderRegistry> = OnceLock::new();
+    DECODERS.get_or_init(async_tiff::decoder::DecoderRegistry::default)
+}
+
+/// Decode one fetched native tile to its pixel `Array`. CPU-bound; callers run
+/// it inside `spawn_blocking` under the decode semaphore.
+pub(crate) fn decode_one(tile: Tile) -> AgResult<Array> {
+    tile.decode(registry())
+        .map_err(|e| AgError::Tiff(format!("decode: {e}")))
+}
 
 pub(crate) struct DecodeWindowJob {
     pub(crate) data_tiles: Vec<Tile>,
@@ -50,11 +63,9 @@ fn decode_window_sync(job: DecodeWindowJob) -> AgResult<(PixelData, Option<Array
         height,
     } = job;
 
-    static DECODERS: OnceLock<async_tiff::decoder::DecoderRegistry> = OnceLock::new();
-    let registry = DECODERS.get_or_init(async_tiff::decoder::DecoderRegistry::default);
-    let data_arrays: Vec<async_tiff::Array> = data_tiles
+    let data_arrays: Vec<Array> = data_tiles
         .into_iter()
-        .map(|t| t.decode(registry))
+        .map(|t| t.decode(registry()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| AgError::Tiff(format!("decode: {e}")))?;
     let stitched = stitch_with_info(
@@ -68,9 +79,9 @@ fn decode_window_sync(job: DecodeWindowJob) -> AgResult<(PixelData, Option<Array
     )?;
     let mask = match (mask_tiles, mask_info) {
         (Some(tiles), Some(info)) => {
-            let mask_arrays: Vec<async_tiff::Array> = tiles
+            let mask_arrays: Vec<Array> = tiles
                 .into_iter()
-                .map(|t| t.decode(registry))
+                .map(|t| t.decode(registry()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| AgError::Tiff(format!("decode mask: {e}")))?;
             Some(stitch_mask_with_info(
