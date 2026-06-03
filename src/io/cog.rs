@@ -117,12 +117,11 @@ impl CogReader {
 
     /// Like [`Self::open_http`] but lets the caller inject a full [`ReaderConfig`]
     /// (shared block cache, stable source id, decode concurrency) while using
-    /// the default tuned [`ClientOptions`].  Primarily used by `ReaderPool` so
-    /// all mosaic asset readers share one block-cache budget.
-    pub(crate) async fn open_http_with_config_default(
-        url: &str,
-        config: ReaderConfig,
-    ) -> AgResult<Self> {
+    /// the default tuned [`ClientOptions`]. Use this to make several readers
+    /// share one `Arc<BlockCache>` (and one memory budget): give each a distinct
+    /// `source_id` and the same `block_cache`. `ReaderPool` does exactly this so
+    /// all mosaic asset readers share one budget.
+    pub async fn open_http_with_config_default(url: &str, config: ReaderConfig) -> AgResult<Self> {
         Self::open_http_with_config(url, default_client_options(), config).await
     }
 

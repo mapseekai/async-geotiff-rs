@@ -11,7 +11,7 @@ use axum::{routing::get, Router};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use async_geotiff::error::{AgError, AgResult};
-use async_geotiff::io::CogReader;
+use async_geotiff::io::{BlockCache, CogReader, ReaderConfig};
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
 use async_geotiff::style::{TileFormat, TileStyle};
 use async_geotiff::tiler::Tiler;
@@ -37,6 +37,9 @@ pub struct AppState {
     pub mosaic: Option<Arc<MosaicTiler<MosaicJsonSource>>>,
     http_base: String,
     tilers: moka::future::Cache<String, Arc<Tiler>>,
+    /// One decoded-block cache shared by every per-dataset reader, so the
+    /// total decode-memory budget is bounded once instead of per dataset.
+    block_cache: Arc<BlockCache>,
 }
 
 impl AppState {
@@ -45,6 +48,7 @@ impl AppState {
         data_dir: Option<PathBuf>,
         datasets: Vec<String>,
         http_base: impl Into<String>,
+        block_cache: Arc<BlockCache>,
     ) -> Self {
         Self {
             default_tiler,
@@ -53,6 +57,7 @@ impl AppState {
             mosaic: None,
             http_base: http_base.into(),
             tilers: moka::future::Cache::new(64),
+            block_cache,
         }
     }
 
@@ -71,10 +76,18 @@ impl AppState {
                 return Err(AgError::Tiff(format!("unknown dataset: {name}")));
             }
             let url = self.dataset_url(name)?;
+            // Inject the one shared block cache, with the dataset name as the
+            // stable `source_id`, so every dataset's readers draw from a single
+            // bounded decode-memory budget (and re-opens reuse cached blocks).
+            let cfg = ReaderConfig {
+                source_id: name.to_string(),
+                block_cache: Arc::clone(&self.block_cache),
+                ..ReaderConfig::default()
+            };
             return self
                 .tilers
                 .try_get_with(name.to_string(), async move {
-                    let reader = CogReader::open_http(&url).await?;
+                    let reader = CogReader::open_http_with_config_default(&url, cfg).await?;
                     Ok::<_, AgError>(Arc::new(Tiler::new(Arc::new(reader))))
                 })
                 .await
@@ -558,7 +571,8 @@ mod tests {
 
     #[test]
     fn router_builds_with_axum_08_capture_syntax() {
-        let state = AppState::new(None, None, Vec::new(), "http://127.0.0.1:0");
+        let block_cache = Arc::new(BlockCache::new(async_geotiff::io::CacheConfig::default()));
+        let state = AppState::new(None, None, Vec::new(), "http://127.0.0.1:0", block_cache);
         let _router = router(state);
     }
 

@@ -15,7 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use async_geotiff::crs::Crs;
-use async_geotiff::io::CogReader;
+use async_geotiff::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler};
 use async_geotiff::tiler::Tiler;
 use async_geotiff::warp::Projector;
@@ -52,8 +52,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     datasets.sort();
     println!("Datasets discovered in ./data: {}", datasets.len());
 
+    // One decoded-block cache shared by the default reader, every per-dataset
+    // reader, and (indirectly) the mosaic — so the whole server runs under a
+    // single bounded decode-memory budget instead of one cache per COG.
+    let block_cache = Arc::new(BlockCache::new(CacheConfig::default()));
+
     let (default_tiler, view) = if let Some(u) = url.as_deref() {
-        let reader = CogReader::open_http(u).await?;
+        let reader = CogReader::open_http_with_config_default(
+            u,
+            ReaderConfig {
+                source_id: u.to_string(),
+                block_cache: Arc::clone(&block_cache),
+                ..ReaderConfig::default()
+            },
+        )
+        .await?;
         let v = default_view(&reader).unwrap_or(DefaultView {
             center_lon: 0.0,
             center_lat: 0.0,
@@ -75,8 +88,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_base = local_http_base(bind_addr);
     let viewer_html = Arc::new(maplibre_viewer_html(view));
     // Optional mosaic: ASYNC_GEOTIFF_MOSAIC=<path to a MosaicJSON file>.
-    let mut state =
-        server::AppState::new(default_tiler, Some(data_dir), datasets, http_base.clone());
+    let mut state = server::AppState::new(
+        default_tiler,
+        Some(data_dir),
+        datasets,
+        http_base.clone(),
+        Arc::clone(&block_cache),
+    );
     let mut mosaic_loaded = false;
     if let Ok(path) = std::env::var("ASYNC_GEOTIFF_MOSAIC") {
         let json = std::fs::read_to_string(&path)?;
