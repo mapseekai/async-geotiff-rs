@@ -11,6 +11,46 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+### Added
+
+- WebP and JPEG tile output, behind the `webp` and `jpeg` cargo features (PNG is
+  always available). The output format is chosen by the tile **path extension**
+  (`.png` / `.webp` / `.jpg`, titiler-style); an optional `format=` query param,
+  if given, must agree with the extension. WebP is lossless (pure-Rust
+  `image-webp`); JPEG is quality 75 with transparency flattened over black
+  (JPEG has no alpha channel). The example server gains a `GET /formats`
+  endpoint that reports only the formats the running build can encode, and the
+  MapLibre / OpenLayers / Leaflet viewers gain a Format switcher populated from
+  it (so an unavailable format is never offered).
+- `CogReader::open_http_with_config_default(url, ReaderConfig)` — open a COG over
+  HTTP with a full `ReaderConfig` (to inject a shared block cache + source id)
+  while keeping the default tuned client options.
+
+### Changed
+
+- ⚠️ **BREAKING** — `Tiler::tile` and `MosaicTiler::tile` now return
+  `AgResult<Option<Bytes>>`. A tile fully outside the dataset (or the
+  projection's valid domain) yields `Ok(None)` instead of a synthesised blank
+  tile; the example server maps `None` to **HTTP 204 No Content**. This stops
+  out-of-range JPEG tiles from rendering as opaque black (PNG/WebP were
+  transparent; JPEG has no alpha). In-range all-nodata tiles still render
+  normally. The internal `empty_tile` helper was removed.
+- ⚠️ **BREAKING** — replaced the per-`CogReader` decoded-window cache with a
+  shared, injected `Arc<BlockCache>` that caches decoded native TIFF blocks
+  under **one global byte budget**. `ReaderConfig` now carries
+  `source_id: String` and `block_cache: Arc<BlockCache>` (and no longer a
+  `cache` field); build readers via the `open_*_with_config` /
+  `open_*_with_cache` entry points. This bounds total decode memory across many
+  datasets / mosaic assets to a single budget instead of `N × 256 MB`, and
+  decoded blocks are reused across overlapping windows and across readers that
+  share a `source_id`. `read_window` now probes the cache per native block,
+  fetches only the misses (coalesced) and decodes them concurrently
+  (single-flighted per block via the shared cache), then stitches; data and
+  mask blocks are resolved in parallel. `MosaicTiler`'s `ReaderPool` injects one
+  shared block cache (with a stable per-URL `source_id`) into every asset
+  reader. Known limitation: concurrent requests that both miss the same cold
+  block may each fetch its bytes once (decode is still single-flighted).
+
 ## [0.0.6] - 2026-05-31
 
 ### Added

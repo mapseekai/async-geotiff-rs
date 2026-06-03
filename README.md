@@ -129,15 +129,19 @@ See `CHANGELOG.md` (English) or `~/知识库/async-geotiff-rs/CHANGELOG-CN.md` (
 Example HTTP request (axum, `examples/serve.rs`)
   ├─ TMS.tile_bbox(z, x, y)            tile-grid
   ├─ CogReader.read_window              async-tiff + object_store
-  │    └─ Tile::decode in semaphore-limited spawn_blocking
+  │    └─ decoded native blocks from a shared BlockCache (one byte budget);
+  │       misses fetched coalesced + decoded in semaphore-limited spawn_blocking
   ├─ warp::warp (if src_crs ≠ dst_crs)  proj coarse-grid + bilinear
   │    └─ runs in semaphore-limited spawn_blocking (Proj is !Send + !Sync)
   ├─ render pipeline:                   ndarray + palette
   │    ├─ rescale per band
   │    ├─ color_formula (sRGB Lab/Lch)
   │    └─ composite (LUT for gradient / HashMap for discrete / per-band rgb)
-  └─ encode PNG                         image
+  └─ encode PNG / WebP / JPEG           image (+ image-webp)
 ```
+
+Out-of-range tiles return `Ok(None)` (the example server replies HTTP 204);
+WebP/JPEG output is gated behind the `webp` / `jpeg` cargo features.
 
 Module layout:
 
@@ -149,9 +153,10 @@ src/
   pixel.rs            PixelData + ImageData
   tms.rs              WebMercatorQuad + WorldCRS84Quad
   io/
-    cog.rs            CogReader open/metadata/window-fetch orchestration
-    cache.rs          decoded-window cache keys, sizing, and single-flight cache
-    decode.rs         semaphore-limited decode/stitch spawn_blocking helper
+    cog.rs            CogReader open/metadata/block-fetch orchestration
+    block_cache.rs    shared decoded-block cache (BlockKey/BlockCache, one budget)
+    cache.rs          CacheConfig (block-cache byte budget + optional TTL)
+    decode.rs         semaphore-limited single-block decode spawn_blocking helper
     window.rs         source tile-range and stitch helpers
   warp/               Projector + Resampling + coarse-grid warp
   render/             colour, colormap, color_formula, composite, encode, pipeline
@@ -176,6 +181,14 @@ with `async_geotiff::io::ReaderConfig` to tune decode concurrency, and
 `Tiler::with_config` with `async_geotiff::tiler::TilerConfig` to tune
 warp/render concurrency. Defaults use the host's available parallelism and
 clamp zero to one permit.
+
+Decoded native tile blocks are cached in a shared `Arc<BlockCache>` under one
+byte budget. `ReaderConfig` carries a caller-supplied `source_id` (the cache
+key prefix) and the `block_cache`; pass the **same** `block_cache` with
+**distinct** `source_id`s to several readers (e.g. every dataset in a server,
+or every asset in a mosaic) to bound their combined decode memory to a single
+budget instead of one cache per reader. `MosaicTiler` does this automatically
+via its `ReaderPool`.
 
 ## License
 
