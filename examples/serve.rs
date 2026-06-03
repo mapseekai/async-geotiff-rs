@@ -99,7 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(path) = std::env::var("ASYNC_GEOTIFF_MOSAIC") {
         let json = std::fs::read_to_string(&path)?;
         let source = MosaicJsonSource::from_str(&json)?;
-        state = state.with_mosaic(Arc::new(MosaicTiler::new(source)));
+        // Share the one process-wide block cache with the mosaic too, so the
+        // whole server (single datasets + mosaic) runs under a single budget.
+        let mosaic = MosaicTiler::with_block_cache(source, Arc::clone(&block_cache));
+        state = state.with_mosaic(Arc::new(mosaic));
         mosaic_loaded = true;
         println!("Mosaic loaded from {path}");
     }
