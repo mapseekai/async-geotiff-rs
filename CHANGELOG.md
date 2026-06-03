@@ -32,6 +32,10 @@ can land in any release** and are called out explicitly under a
   `#[tracing::instrument]` spans (with source/tile/level/format fields). The library
   emits `tracing` only and takes no OpenTelemetry dependency; bridge it in your app
   via `tracing-opentelemetry` and poll `stats()` into OTel gauges/counters.
+- `MosaicTiler::with_block_cache(source, Arc<BlockCache>)` and
+  `MosaicTiler::block_cache()` — inject / read the mosaic reader pool's shared
+  block cache, so the mosaic path is observable (and can share one budget with
+  your other readers) instead of owning a hidden internal cache.
 
 ### Changed
 

@@ -23,12 +23,24 @@ pub struct ReaderPool {
 
 impl ReaderPool {
     pub fn new(capacity: u64) -> Self {
+        Self::with_block_cache(capacity, Arc::new(BlockCache::new(CacheConfig::default())))
+    }
+
+    /// Like [`Self::new`] but uses a caller-supplied shared block cache, so the
+    /// pool's decoded blocks live in (and are bounded by) the same cache the
+    /// caller can observe via [`BlockCache::stats`] and share with other readers.
+    pub fn with_block_cache(capacity: u64, block_cache: Arc<BlockCache>) -> Self {
         Self {
             cache: moka::future::Cache::new(capacity),
-            block_cache: Arc::new(BlockCache::new(CacheConfig::default())),
+            block_cache,
             ids: moka::future::Cache::new(100_000),
             next_id: AtomicU64::new(0),
         }
+    }
+
+    /// The shared block cache backing this pool (clone of the `Arc`).
+    pub fn block_cache(&self) -> Arc<BlockCache> {
+        Arc::clone(&self.block_cache)
     }
 
     /// Get the cached reader for `url`, opening it (over HTTP) on first use.

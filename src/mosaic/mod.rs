@@ -17,7 +17,10 @@ pub use stac::StacSource;
 
 use bytes::Bytes;
 
+use std::sync::Arc;
+
 use crate::error::{AgError, AgResult};
+use crate::io::BlockCache;
 use crate::pixel::ImageData;
 use crate::render::pipeline::render;
 use crate::style::params::compile_cached;
@@ -72,6 +75,25 @@ impl<S: MosaicSource> MosaicTiler<S> {
             source,
             cfg,
         }
+    }
+
+    /// Create a `MosaicTiler` that draws its decoded blocks from a
+    /// caller-supplied shared [`BlockCache`]. Inject the same `Arc<BlockCache>`
+    /// here and into your other readers to bound the whole process to one decode
+    /// memory budget and to observe it via [`BlockCache::stats`].
+    pub fn with_block_cache(source: S, block_cache: Arc<BlockCache>) -> Self {
+        let cfg = MosaicConfig::default();
+        Self {
+            pool: ReaderPool::with_block_cache(cfg.reader_capacity, block_cache),
+            source,
+            cfg,
+        }
+    }
+
+    /// The shared block cache backing this mosaic's reader pool — poll
+    /// [`BlockCache::stats`] on it for metrics.
+    pub fn block_cache(&self) -> Arc<BlockCache> {
+        self.pool.block_cache()
     }
 
     /// Render one mosaicked tile. `style` is shared by all assets but
@@ -271,5 +293,16 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none(), "mosaic tile with no assets must return None");
+    }
+
+    #[test]
+    fn injected_block_cache_is_shared() {
+        use crate::io::CacheConfig;
+        let cache = Arc::new(BlockCache::new(CacheConfig::default()));
+        let m = MosaicTiler::with_block_cache(NoAssets, Arc::clone(&cache));
+        assert!(
+            Arc::ptr_eq(&m.block_cache(), &cache),
+            "with_block_cache must use the injected cache"
+        );
     }
 }
