@@ -11,7 +11,6 @@ use crate::error::{AgError, AgResult};
 use crate::io::stats::{load_dataset_stats, DatasetStats};
 use crate::io::CogReader;
 use crate::pixel::{ImageData, PixelData};
-use crate::render::encode::TileFormat;
 use crate::render::pipeline::{render, CompiledTileStyle};
 use crate::style::params::compile_cached;
 use crate::style::stretch::{fallback_rescale, resolve_rescale, Stretch};
@@ -161,8 +160,8 @@ impl Tiler {
 
     /// Read + warp the source COG onto the destination tile grid. Returns
     /// `None` when the tile is fully outside the COG or outside the
-    /// projection's valid domain (caller renders a transparent tile).
-    /// This is the per-asset primitive the mosaic layer reuses.
+    /// projection's valid domain — [`Tiler::tile`] turns that into "no tile"
+    /// (HTTP 204). This is the per-asset primitive the mosaic layer reuses.
     pub async fn warp_tile(
         &self,
         tile_matrix_set: TileMatrixSet,
@@ -247,6 +246,13 @@ impl Tiler {
         Ok(Some(warped))
     }
 
+    /// Render one tile. Returns `Ok(None)` when the tile lies fully outside
+    /// the dataset (or the projection's valid domain) — callers should treat
+    /// that as "no tile" (e.g. HTTP 204) rather than synthesising a blank one,
+    /// so out-of-range areas stay empty for every output format (a black JPEG
+    /// would otherwise cover the map where PNG/WebP stay transparent).
+    /// In-range tiles that happen to be all-nodata still render normally
+    /// (transparent for PNG/WebP).
     pub async fn tile(
         &self,
         tile_matrix_set: TileMatrixSet,
@@ -254,10 +260,10 @@ impl Tiler {
         x: u32,
         y: u32,
         style: &TileStyle,
-    ) -> AgResult<Bytes> {
+    ) -> AgResult<Option<Bytes>> {
         let warped = match self.warp_tile(tile_matrix_set, z, x, y, style).await? {
             Some(img) => img,
-            None => return empty_tile(style.tilesize as usize, style.format),
+            None => return Ok(None),
         };
         let warped = if style.unscale {
             unscale_image(&warped, self.reader.band_scale_offset())
@@ -267,8 +273,10 @@ impl Tiler {
         let compiled = compile_cached(style).await?;
         let compiled = self.effective_compiled(style, &compiled, &warped).await?;
         let img = warped;
-        self.run_tile_cpu("render", move || render(&img, &compiled))
-            .await
+        let bytes = self
+            .run_tile_cpu("render", move || render(&img, &compiled))
+            .await?;
+        Ok(Some(bytes))
     }
 
     async fn run_tile_cpu<T, F>(&self, label: &'static str, f: F) -> AgResult<T>
@@ -459,34 +467,6 @@ fn unscale_ranges(
         .collect()
 }
 
-/// Fully-transparent (or, for JPEG, fully-black) tile. The bytes are constant
-/// for a given (size, format), so encode once and memoize: out-of-bounds /
-/// out-of-domain tiles are common (whole viewport at COG edges), and encoding
-/// on the async worker would otherwise stall the reactor under load.
-pub(crate) fn empty_tile(size: usize, format: TileFormat) -> AgResult<Bytes> {
-    use std::collections::HashMap;
-    use std::sync::{OnceLock, RwLock};
-
-    static CACHE: OnceLock<RwLock<HashMap<(usize, TileFormat), Bytes>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-
-    let key = (size, format);
-    if let Some(bytes) = cache
-        .read()
-        .map_err(|_| AgError::Tiff("empty tile cache read lock poisoned".into()))?
-        .get(&key)
-    {
-        return Ok(bytes.clone());
-    }
-    let rgba = ndarray::Array3::<u8>::zeros((size, size, 4));
-    let bytes = crate::render::encode::encode(&rgba, format)?;
-    cache
-        .write()
-        .map_err(|_| AgError::Tiff("empty tile cache write lock poisoned".into()))?
-        .insert(key, bytes.clone());
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{expression_rescale, unscale_image, unscale_ranges, Tiler, TilerConfig};
@@ -497,34 +477,73 @@ mod tests {
         let _ = std::mem::size_of::<Tiler>();
     }
 
-    #[test]
-    fn empty_tile_png_is_transparent_png() {
-        use crate::render::encode::TileFormat;
-        let bytes = super::empty_tile(64, TileFormat::Png).unwrap();
-        assert!(bytes.starts_with(b"\x89PNG"));
-        // Memoized: second call returns identical bytes.
-        let again = super::empty_tile(64, TileFormat::Png).unwrap();
-        assert_eq!(bytes, again);
+    /// Standard slippy-map lon/lat -> (x, y) at zoom `z` (WebMercator).
+    fn lonlat_to_tile(lon: f64, lat: f64, z: u8) -> (u32, u32) {
+        let n = 2f64.powi(z as i32);
+        let x = ((lon + 180.0) / 360.0 * n).floor().clamp(0.0, n - 1.0) as u32;
+        let lat_rad = lat.to_radians();
+        let y = ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0
+            * n)
+            .floor()
+            .clamp(0.0, n - 1.0) as u32;
+        (x, y)
     }
 
-    #[cfg(feature = "jpeg")]
-    #[test]
-    fn empty_tile_jpeg_is_black_jpeg() {
-        use crate::render::encode::TileFormat;
-        let bytes = super::empty_tile(64, TileFormat::Jpeg).unwrap();
-        assert!(bytes.starts_with(b"\xFF\xD8\xFF"));
-    }
+    #[tokio::test]
+    async fn tile_returns_none_outside_data_and_some_inside() {
+        use crate::io::CogReader;
+        use crate::style::TileStyle;
+        use crate::tms::TileMatrixSet;
+        use async_tiff::reader::ObjectReader;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as OsPath;
+        use std::sync::Arc;
 
-    // empty_tile feeds a fully-transparent (alpha=0) RGBA buffer to the
-    // encoder; exercise the WebP branch on exactly that path, since alpha
-    // preservation is the reason to prefer WebP over JPEG for edge tiles.
-    #[cfg(feature = "webp")]
-    #[test]
-    fn empty_tile_webp_is_valid_webp() {
-        use crate::render::encode::TileFormat;
-        let bytes = super::empty_tile(64, TileFormat::Webp).unwrap();
-        assert!(bytes.starts_with(b"RIFF"));
-        assert_eq!(&bytes[8..12], b"WEBP");
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("data/cog_uint8_rgb_nodata.tif");
+        if !tif.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let os_path = OsPath::from_filesystem_path(&tif).unwrap();
+        let reader = CogReader::open_with_reader(ObjectReader::new(
+            Arc::new(LocalFileSystem::new()),
+            os_path,
+        ))
+        .await
+        .unwrap();
+        let tiler = Tiler::new(Arc::new(reader));
+        let style = TileStyle::from_query("").unwrap();
+        let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
+
+        // A tile over the dataset centre must render actual bytes.
+        let z = 12u8;
+        let (cx, cy) = lonlat_to_tile((w + e) / 2.0, (s + n) / 2.0, z);
+        let inside = tiler
+            .tile(TileMatrixSet::WebMercatorQuad, z, cx, cy, &style)
+            .await
+            .unwrap();
+        assert!(inside.is_some(), "in-bounds tile must produce bytes");
+
+        // The antipode is guaranteed outside any single real dataset → no tile.
+        let anti_lon = {
+            let l = (w + e) / 2.0 + 180.0;
+            if l > 180.0 {
+                l - 360.0
+            } else {
+                l
+            }
+        };
+        let (ax, ay) = lonlat_to_tile(anti_lon, -(s + n) / 2.0, z);
+        let outside = tiler
+            .tile(TileMatrixSet::WebMercatorQuad, z, ax, ay, &style)
+            .await
+            .unwrap();
+        assert!(
+            outside.is_none(),
+            "fully out-of-bounds tile must return None, got bytes"
+        );
     }
 
     #[test]

@@ -162,9 +162,12 @@ pub async fn tile_handler(
     };
 
     match tiler.tile(tile_matrix_set, z, x, y, &style).await {
-        Ok(bytes) => {
+        Ok(Some(bytes)) => {
             with_cors(([("content-type", style.format.content_type())], bytes).into_response())
         }
+        // Tile fully outside the dataset → no content, so the map draws nothing
+        // there (a black JPEG would otherwise cover out-of-range areas).
+        Ok(None) => with_cors(StatusCode::NO_CONTENT.into_response()),
         Err(e) => error_response(e),
     }
 }
@@ -247,9 +250,11 @@ pub async fn mosaic_tile_handler(
         .tile(tile_matrix_set, z, x, y, selection, &style)
         .await
     {
-        Ok(bytes) => {
+        Ok(Some(bytes)) => {
             with_cors(([("content-type", style.format.content_type())], bytes).into_response())
         }
+        // No asset covers this tile → no content (map draws nothing here).
+        Ok(None) => with_cors(StatusCode::NO_CONTENT.into_response()),
         Err(e) => error_response(e),
     }
 }

@@ -86,13 +86,13 @@ impl<S: MosaicSource> MosaicTiler<S> {
         y: u32,
         selection: PixelSelection,
         style: &TileStyle,
-    ) -> AgResult<Bytes> {
+    ) -> AgResult<Option<Bytes>> {
         let assets = self
             .source
             .assets_for_tile(tile_matrix_set, z, x, y)
             .await?;
         if assets.is_empty() {
-            return crate::tiler::empty_tile(style.tilesize as usize, style.format);
+            return Ok(None);
         }
 
         let mut reducer = Reducer::new(selection);
@@ -129,15 +129,16 @@ impl<S: MosaicSource> MosaicTiler<S> {
         }
 
         if fed == 0 {
-            return crate::tiler::empty_tile(style.tilesize as usize, style.format);
+            return Ok(None);
         }
 
         let composite = reducer.finish()?;
         let compiled = compile_cached(style).await?;
         let img = composite;
-        tokio::task::spawn_blocking(move || render(&img, &compiled))
+        let bytes = tokio::task::spawn_blocking(move || render(&img, &compiled))
             .await
-            .map_err(|e| AgError::Mosaic(format!("render join: {e}")))?
+            .map_err(|e| AgError::Mosaic(format!("render join: {e}")))??;
+        Ok(Some(bytes))
     }
 }
 
@@ -187,9 +188,22 @@ mod tests {
                 .unwrap();
         let tiler = Tiler::new(std::sync::Arc::new(reader));
         let style = TileStyle::from_query("").unwrap();
-        let bounds = tiler.wgs84_bounds().unwrap();
+        let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
+        let bounds = [w, s, e, n];
 
-        let (z, x, y) = (8u8, 128u32, 128u32);
+        // Derive a tile that actually covers the fixture (slippy-map formula)
+        // so both paths render real bytes; an out-of-bounds tile now returns
+        // None and would not exercise the single-vs-mosaic equivalence.
+        let z = 12u8;
+        let nz = 2f64.powi(z as i32);
+        let clon = (w + e) / 2.0;
+        let clat = (s + n) / 2.0;
+        let x = (((clon + 180.0) / 360.0 * nz).floor().clamp(0.0, nz - 1.0)) as u32;
+        let lat_rad = clat.to_radians();
+        let y = (((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0
+            * nz)
+            .floor()
+            .clamp(0.0, nz - 1.0)) as u32;
         let single = tiler
             .tile(TileMatrixSet::WebMercatorQuad, z, x, y, &style)
             .await;
@@ -210,16 +224,52 @@ mod tests {
             .await;
 
         let _ = bounds;
-        match (single, mosaic) {
-            (Ok(a), Ok(b)) => {
-                assert!(!a.is_empty());
-                assert!(!b.is_empty());
-            }
-            (Err(_), _) | (_, Err(_)) => {
-                // ReaderPool uses open_http not local FS, so a local-only
-                // path may legitimately error in the mosaic branch; the
-                // orchestration logic is covered by selection unit tests.
-            }
+        // The single-source path is the assertion: an in-bounds tile renders.
+        match single {
+            Ok(Some(a)) => assert!(!a.is_empty(), "in-bounds single-source tile must render"),
+            Ok(None) => panic!("in-bounds tile unexpectedly returned None"),
+            Err(_) => {} // environment-dependent reader error; tolerate.
         }
+        // The mosaic path opens assets through ReaderPool (open_http), so a
+        // local-FS fixture path may load nothing → None, or error. Either is
+        // acceptable here; mosaic orchestration is covered by
+        // `mosaic_with_no_assets_returns_none` and the selection unit tests.
+        if let Ok(Some(b)) = mosaic {
+            assert!(!b.is_empty());
+        }
+    }
+
+    struct NoAssets;
+
+    #[async_trait::async_trait]
+    impl MosaicSource for NoAssets {
+        async fn assets_for_tile(
+            &self,
+            _tile_matrix_set: TileMatrixSet,
+            _z: u8,
+            _x: u32,
+            _y: u32,
+        ) -> AgResult<Vec<AssetRef>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn mosaic_with_no_assets_returns_none() {
+        // No asset covers the tile → "no tile", not a synthesised blank one.
+        let m = MosaicTiler::new(NoAssets);
+        let style = TileStyle::from_query("").unwrap();
+        let out = m
+            .tile(
+                TileMatrixSet::WebMercatorQuad,
+                1,
+                0,
+                0,
+                PixelSelection::First,
+                &style,
+            )
+            .await
+            .unwrap();
+        assert!(out.is_none(), "mosaic tile with no assets must return None");
     }
 }

@@ -92,10 +92,11 @@ async fn main() -> AgResult<()> {
         )
         .await
     {
-        Ok(png) => println!(
+        Ok(Some(png)) => println!(
             "rendered {} bytes (placeholder URLs are skipped → transparent tile)",
             png.len()
         ),
+        Ok(None) => println!("no tile (outside all assets)"),
         Err(e) => println!("error: {e}"),
     }
     Ok(())

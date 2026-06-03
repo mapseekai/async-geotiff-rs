@@ -46,7 +46,8 @@ async fn main() -> AgResult<()> {
         )
         .await
     {
-        Ok(png) => println!("rendered {} bytes", png.len()),
+        Ok(Some(png)) => println!("rendered {} bytes", png.len()),
+        Ok(None) => println!("no tile (outside all assets)"),
         Err(e) => println!("expected (demo URL is fake): {e}"),
     }
     Ok(())
