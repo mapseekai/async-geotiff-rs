@@ -58,15 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block_cache = Arc::new(BlockCache::new(CacheConfig::default()));
 
     let (default_tiler, view) = if let Some(u) = url.as_deref() {
-        let reader = CogReader::open_http_with_config_default(
-            u,
-            ReaderConfig {
-                source_id: u.to_string(),
-                block_cache: Arc::clone(&block_cache),
-                ..ReaderConfig::default()
-            },
-        )
-        .await?;
+        let mut cfg = ReaderConfig::default();
+        cfg.source_id = u.to_string();
+        cfg.block_cache = Arc::clone(&block_cache);
+        let reader = CogReader::open_http_with_config_default(u, cfg).await?;
         let v = default_view(&reader).unwrap_or(DefaultView {
             center_lon: 0.0,
             center_lat: 0.0,

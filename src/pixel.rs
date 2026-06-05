@@ -56,6 +56,28 @@ impl PixelData {
         }
     }
 
+    /// Convert a single band `b` to an owned `Array2<f64>`. Cheaper than
+    /// [`to_f64`](Self::to_f64) when only a few of many bands are rendered: it
+    /// touches one band, not the whole `(bands, H, W)` cube. Panics if `b` is
+    /// out of range — callers validate `bidx` first.
+    pub fn band_to_f64(&self, b: usize) -> Array2<f64> {
+        use ndarray::Axis;
+        macro_rules! conv {
+            ($a:expr) => {
+                $a.index_axis(Axis(0), b).mapv(|v| v as f64)
+            };
+        }
+        match self {
+            Self::U8(a) => conv!(a),
+            Self::U16(a) => conv!(a),
+            Self::I16(a) => conv!(a),
+            Self::U32(a) => conv!(a),
+            Self::I32(a) => conv!(a),
+            Self::F32(a) => conv!(a),
+            Self::F64(a) => a.index_axis(Axis(0), b).to_owned(),
+        }
+    }
+
     /// Like [`to_f64`](Self::to_f64) but borrows the buffer for the
     /// already-`f64` case (`Cow::Borrowed`) instead of cloning a full
     /// `bands×H×W` array. The scalar cross-CRS warp only reads the

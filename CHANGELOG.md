@@ -36,9 +36,39 @@ can land in any release** and are called out explicitly under a
   `MosaicTiler::block_cache()` — inject / read the mosaic reader pool's shared
   block cache, so the mosaic path is observable (and can share one budget with
   your other readers) instead of owning a hidden internal cache.
+- `CpuLimiter` (re-exported at the crate root) — a cloneable, shared bound on
+  concurrent CPU-heavy `spawn_blocking` jobs (decode, stitch, warp, render).
+  Inject one via `ReaderConfig::cpu_limiter` so a whole process — or a whole
+  mosaic — draws from a single CPU budget instead of `N × available_parallelism`
+  independent semaphores. `ReaderPool` shares one limiter across every asset
+  reader and the final composite render, so a many-asset mosaic no longer
+  oversubscribes the machine.
 
 ### Changed
 
+- ⚠️ **BREAKING** — `ReaderConfig` is now `#[non_exhaustive]` and gained an
+  `Option<CpuLimiter>` field. Construct it via `ReaderConfig::default()` and
+  assign fields (struct-literal construction from outside the crate no longer
+  compiles); this makes future field additions non-breaking. When the limiter is
+  `None` the reader sizes its own from `max_decode_tasks` (prior behaviour);
+  inject `Some(..)` to share one CPU budget across readers/tilers.
+- ⚠️ **BREAKING (behaviour)** — `PixelSelection::Highest` / `Lowest` now read
+  **every** asset and take the global per-pixel extremum instead of
+  short-circuiting once the tile was fully covered. The old behaviour could miss
+  a higher/lower value carried by a not-yet-read overlapping asset; the new one
+  matches rio-tiler (only `First` exits when filled). Overlapping mosaics get
+  correct extrema at the cost of reading all assets.
+- Concurrent requests that both miss the same cold block now **single-flight the
+  network fetch across requests** (not just the decode), resolving the known
+  limitation noted in the block-cache entry above: the first caller fetches; the
+  others await its result through an in-flight registry. A dropped owner (fetch
+  error / task abort) cancels waiters, which retry.
+- Performance: mosaic `Mean` is computed as a streaming per-band sum/count
+  (memory O(1) in the number of assets, was O(assets); results bit-identical);
+  `Median` uses quickselect (`select_nth_unstable`, O(n)) instead of a full sort;
+  `First`'s `is_done` is O(1) (incremental hole count, was a per-asset mask scan);
+  and the render path converts only the **selected** bands to f64 (borrowing when
+  the source is already f64) instead of cloning the whole image up front.
 - ⚠️ **BREAKING** — `Tiler::tile` and `MosaicTiler::tile` now return
   `AgResult<Option<Bytes>>`. A tile fully outside the dataset (or the
   projection's valid domain) yields `Ok(None)` instead of a synthesised blank

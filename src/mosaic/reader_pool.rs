@@ -9,12 +9,17 @@
 
 use std::sync::Arc;
 
+use crate::blocking::CpuLimiter;
 use crate::error::{AgError, AgResult};
 use crate::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 
 pub struct ReaderPool {
     cache: moka::future::Cache<String, Arc<CogReader>>,
     block_cache: Arc<BlockCache>,
+    /// One CPU-job limiter shared by every reader the pool opens, so the whole
+    /// mosaic (all assets + their tilers + the final composite render) is bound
+    /// to a single CPU budget instead of N independent per-reader semaphores.
+    cpu: CpuLimiter,
 }
 
 impl ReaderPool {
@@ -29,12 +34,19 @@ impl ReaderPool {
         Self {
             cache: moka::future::Cache::new(capacity),
             block_cache,
+            cpu: CpuLimiter::default(),
         }
     }
 
     /// The shared block cache backing this pool (clone of the `Arc`).
     pub fn block_cache(&self) -> Arc<BlockCache> {
         Arc::clone(&self.block_cache)
+    }
+
+    /// The shared CPU-job limiter backing every reader in this pool. The mosaic
+    /// final render acquires from it too, so all CPU work shares one budget.
+    pub fn cpu_limiter(&self) -> CpuLimiter {
+        self.cpu.clone()
     }
 
     /// Get the cached reader for `url`, opening it (over HTTP) on first use.
@@ -47,11 +59,13 @@ impl ReaderPool {
         let url_owned = url.to_string();
         let source_id = source_id.to_string();
         let block_cache = Arc::clone(&self.block_cache);
+        let cpu = self.cpu.clone();
         self.cache
             .try_get_with(url_owned.clone(), async move {
                 let cfg = ReaderConfig {
                     source_id,
                     block_cache,
+                    cpu_limiter: Some(cpu),
                     ..ReaderConfig::default()
                 };
                 let r = CogReader::open_http_with_config_default(&url_owned, cfg).await?;

@@ -3,6 +3,7 @@
 //! See `docs/superpowers/specs/2026-05-14-async-geotiff-rs-design.md`.
 
 mod blocking;
+pub use blocking::CpuLimiter;
 pub mod bounds;
 pub mod crs;
 pub mod error;

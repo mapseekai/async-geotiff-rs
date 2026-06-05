@@ -9,7 +9,7 @@
 //! Validity mask is applied as a single `Zip` over the alpha channel.
 
 use bytes::Bytes;
-use ndarray::{s, Array2, Array3, ArrayView3, Axis, Zip};
+use ndarray::{s, Array2, Array3, ArrayView3, Zip};
 
 use crate::error::{AgError, AgResult};
 use crate::pixel::ImageData;
@@ -57,10 +57,11 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
         return encode(&rgba, style.format);
     }
 
-    let src = image.pixels.to_f64();
-
     // Expression path: evaluate band-math RPN per-pixel → synthetic single band.
     if !style.expression.is_empty() {
+        // Promote to f64 only on this path; `as_f64` borrows when the source is
+        // already F64 (no full-image clone).
+        let src = image.pixels.as_f64();
         let nodata = style.nodata.or(image.nodata);
         let (band, valid) = eval_expression_band(&src.view(), &style.expression, nodata, h, w)?;
         let valid_opt = if valid.iter().all(|&b| b) {
@@ -96,12 +97,11 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
     }
 
     let _ = n;
-    // Materialise per-band Array2<f64> views from the planar (C, H, W) source.
-    // `to_owned()` makes each a contiguous Array2<f64> we can broadcast over.
-    let band_views: Vec<Array2<f64>> = bidx
-        .iter()
-        .map(|&b| src.index_axis(Axis(0), b).to_owned())
-        .collect();
+    // Materialise only the SELECTED bands as f64 — avoids converting the whole
+    // (possibly many-band) image up front. `band_to_f64` copies a single band;
+    // for an F64 source it copies just that band, not the full cube. `bidx`
+    // is range-checked above, so indexing is safe.
+    let band_views: Vec<Array2<f64>> = bidx.iter().map(|&b| image.pixels.band_to_f64(b)).collect();
 
     let nodata = style.nodata.or(image.nodata);
     let valid: Option<Array2<bool>> = compute_valid_mask(image, &band_views, nodata, h, w);

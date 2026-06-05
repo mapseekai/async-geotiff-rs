@@ -79,11 +79,9 @@ impl AppState {
             // Inject the one shared block cache, with the dataset name as the
             // stable `source_id`, so every dataset's readers draw from a single
             // bounded decode-memory budget (and re-opens reuse cached blocks).
-            let cfg = ReaderConfig {
-                source_id: name.to_string(),
-                block_cache: Arc::clone(&self.block_cache),
-                ..ReaderConfig::default()
-            };
+            let mut cfg = ReaderConfig::default();
+            cfg.source_id = name.to_string();
+            cfg.block_cache = Arc::clone(&self.block_cache);
             return self
                 .tilers
                 .try_get_with(name.to_string(), async move {
