@@ -4,14 +4,59 @@
 //! It caches decoded `async_tiff::Array` tiles under a configurable byte budget
 //! using moka's TinyLFU policy.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_tiff::Array;
+use tokio::sync::watch;
 
 use crate::error::AgError;
 use crate::io::cache::CacheConfig;
+
+/// Result of an in-flight block fetch+decode, cloneable so concurrent waiters
+/// each get a copy. The error is `Arc`-wrapped because `AgError` is not `Clone`.
+pub(crate) type BlockResult = Result<Arc<DecodedBlock>, Arc<AgError>>;
+
+/// A receiver a concurrent caller awaits while another caller fetches the block.
+pub(crate) type PendingBlock = watch::Receiver<Option<BlockResult>>;
+
+/// Outcome of [`BlockCache::claim`]: either this caller owns the fetch (and must
+/// `resolve` the returned guard), or another caller is already fetching it.
+pub(crate) enum Claim {
+    Owned(InflightGuard),
+    Pending(PendingBlock),
+}
+
+/// Held by the caller that owns a block's fetch+decode. Dropping it without
+/// [`resolve`](InflightGuard::resolve) closes the channel, so waiters observe a
+/// cancellation and can retry, and the in-flight slot is always cleaned up.
+pub(crate) struct InflightGuard {
+    key: BlockKey,
+    tx: watch::Sender<Option<BlockResult>>,
+    inflight: Arc<Mutex<HashMap<BlockKey, PendingBlock>>>,
+    resolved: bool,
+}
+
+impl InflightGuard {
+    /// Publish the fetched+decoded result to any waiters and free the slot.
+    pub(crate) fn resolve(mut self, result: BlockResult) {
+        let _ = self.tx.send(Some(result));
+        self.inflight.lock().unwrap().remove(&self.key);
+        self.resolved = true;
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if !self.resolved {
+            // Owner gave up (fetch/decode error or task abort): remove the slot;
+            // dropping `tx` makes waiters' `changed()` return Err → they retry.
+            self.inflight.lock().unwrap().remove(&self.key);
+        }
+    }
+}
 
 // ── BlockKind ───────────────────────────────────────────────────────────────
 
@@ -128,6 +173,10 @@ pub struct BlockCacheStats {
 pub struct BlockCache {
     inner: moka::future::Cache<BlockKey, Arc<DecodedBlock>>,
     counters: Arc<Counters>,
+    /// In-flight compressed-block fetches, keyed identically to the decoded
+    /// cache. Lets concurrent requests for the same cold block coalesce the
+    /// network range GET (not just the decode, which moka already single-flights).
+    inflight: Arc<Mutex<HashMap<BlockKey, PendingBlock>>>,
 }
 
 impl BlockCache {
@@ -142,6 +191,46 @@ impl BlockCache {
         Self {
             inner: builder.build(),
             counters: Arc::new(Counters::default()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Claim the right to fetch+decode `key`, or get a handle to await whoever
+    /// already claimed it. The first caller for a cold block receives
+    /// [`Claim::Owned`]; concurrent callers receive [`Claim::Pending`] and avoid
+    /// issuing a duplicate network fetch.
+    pub(crate) fn claim(&self, key: &BlockKey) -> Claim {
+        let mut map = self.inflight.lock().unwrap();
+        if let Some(rx) = map.get(key) {
+            return Claim::Pending(rx.clone());
+        }
+        let (tx, rx) = watch::channel(None);
+        map.insert(key.clone(), rx);
+        Claim::Owned(InflightGuard {
+            key: key.clone(),
+            tx,
+            inflight: Arc::clone(&self.inflight),
+            resolved: false,
+        })
+    }
+
+    /// Await an in-flight block another caller is fetching.
+    pub(crate) async fn await_pending(
+        mut rx: PendingBlock,
+    ) -> Result<Arc<DecodedBlock>, AgError> {
+        // The value may already be published.
+        if let Some(v) = rx.borrow().clone() {
+            return v.map_err(|e| AgError::Tiff(format!("block decode: {e}")));
+        }
+        loop {
+            if rx.changed().await.is_err() {
+                // Sender dropped without publishing: owner's fetch/decode failed
+                // or was aborted. Surface as an error; the next request retries.
+                return Err(AgError::Tiff("in-flight block fetch canceled".into()));
+            }
+            if let Some(v) = rx.borrow().clone() {
+                return v.map_err(|e| AgError::Tiff(format!("block decode: {e}")));
+            }
         }
     }
 
@@ -401,6 +490,63 @@ mod tests {
         assert_eq!(b2.weight(), expected_weight, "second block weight mismatch");
 
         assert_eq!(cache.sync_count().await, 2, "cache should hold 2 entries");
+    }
+
+    #[tokio::test]
+    async fn claim_dedups_and_await_pending_receives_result() {
+        let Some(array) = sample_array().await else {
+            eprintln!("fixture missing, skipping");
+            return;
+        };
+        let cache = default_cache();
+        let key = make_key("inflight");
+
+        // First claim owns the fetch; a concurrent claim is pending.
+        let guard = match cache.claim(&key) {
+            Claim::Owned(g) => g,
+            Claim::Pending(_) => panic!("first claim must own the fetch"),
+        };
+        let pending = match cache.claim(&key) {
+            Claim::Pending(rx) => rx,
+            Claim::Owned(_) => panic!("second concurrent claim must be pending"),
+        };
+
+        let block = Arc::new(DecodedBlock::new(array));
+        guard.resolve(Ok(Arc::clone(&block)));
+
+        // The waiter receives the exact Arc the owner produced.
+        let got = BlockCache::await_pending(pending).await.unwrap();
+        assert!(Arc::ptr_eq(&got, &block), "waiter must get the owner's block");
+
+        // Slot is freed after resolve → a later claim owns again.
+        assert!(
+            matches!(cache.claim(&key), Claim::Owned(_)),
+            "resolved slot must be freed for re-claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_guard_cancels_waiters_and_frees_slot() {
+        let cache = default_cache();
+        let key = make_key("inflight-drop");
+        let guard = match cache.claim(&key) {
+            Claim::Owned(g) => g,
+            Claim::Pending(_) => unreachable!(),
+        };
+        let pending = match cache.claim(&key) {
+            Claim::Pending(rx) => rx,
+            Claim::Owned(_) => unreachable!(),
+        };
+        // Owner gives up without resolving (e.g. fetch error / task abort).
+        drop(guard);
+        assert!(
+            BlockCache::await_pending(pending).await.is_err(),
+            "waiter must observe cancellation when owner drops"
+        );
+        assert!(
+            matches!(cache.claim(&key), Claim::Owned(_)),
+            "cancelled slot must be freed for re-claim"
+        );
     }
 
     #[tokio::test]

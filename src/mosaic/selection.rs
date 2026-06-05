@@ -10,9 +10,13 @@ use crate::pixel::{ImageData, PixelData};
 pub enum PixelSelection {
     /// First valid pixel by paint order wins; short-circuits once tile is fully covered.
     First,
-    /// Per-pixel maximum on band 0; short-circuits once tile is fully covered.
+    /// Per-pixel maximum on band 0 across ALL assets (global extremum). Reads
+    /// every asset — does NOT short-circuit on full coverage, since a
+    /// not-yet-read overlapping asset can still hold a higher value. Matches
+    /// rio-tiler, where only `FirstMethod` sets `exit_when_filled`.
     Highest,
-    /// Per-pixel minimum on band 0; short-circuits once tile is fully covered.
+    /// Per-pixel minimum on band 0 across ALL assets (global extremum). Reads
+    /// every asset — does NOT short-circuit (see [`Self::Highest`]).
     Lowest,
     /// Per-pixel mean over all valid asset samples; all assets are read (no short-circuit).
     Mean,
@@ -22,20 +26,31 @@ pub enum PixelSelection {
 
 impl PixelSelection {
     /// `true` if this method can stop once every pixel is valid.
+    ///
+    /// Only `First` qualifies: once every pixel has a value, paint order
+    /// guarantees later assets cannot change the result. `Highest`/`Lowest`
+    /// need a global extremum, so an already-covered pixel can still be
+    /// overwritten by a later asset — they must read everything.
     fn exits_when_filled(self) -> bool {
-        matches!(self, Self::First | Self::Highest | Self::Lowest)
+        matches!(self, Self::First)
     }
 }
 
 /// Accumulates per-asset images into one composite.
 pub struct Reducer {
     method: PixelSelection,
-    /// `(bands, h, w)` accumulator (in-place family) — `None` until first feed.
+    /// `(bands, h, w)` accumulator — `None` until first feed.
+    /// First/Highest/Lowest: the running result. Mean: the running **sum**.
     acc: Option<Array3<f64>>,
     /// `(h, w)` validity of `acc`, `true = valid`.
     acc_mask: Option<Array2<bool>>,
-    /// stack family: every fed image's `(bands,h,w)` + mask.
+    /// Mean only: per-band finite-sample count, parallel to `acc` (the sum).
+    count: Option<Array3<u32>>,
+    /// Median only: every fed image's `(bands,h,w)` + mask.
     stack: Vec<(Array3<f64>, Array2<bool>)>,
+    /// First only: pixels still invalid, for O(1) [`Self::is_done`]. `usize::MAX`
+    /// until the first feed sizes it.
+    remaining_invalid: usize,
     bbox: Option<crate::bounds::Bbox>,
     crs: Option<crate::crs::Crs>,
     transform: Option<crate::bounds::GeoTransform>,
@@ -54,7 +69,9 @@ impl Reducer {
             method,
             acc: None,
             acc_mask: None,
+            count: None,
             stack: Vec::new(),
+            remaining_invalid: usize::MAX,
             bbox: None,
             crs: None,
             transform: None,
@@ -74,7 +91,8 @@ impl Reducer {
             PixelSelection::First => self.feed_first(arr, m),
             PixelSelection::Highest => self.feed_extreme(arr, m, true),
             PixelSelection::Lowest => self.feed_extreme(arr, m, false),
-            PixelSelection::Mean | PixelSelection::Median => {
+            PixelSelection::Mean => self.feed_mean(arr, m),
+            PixelSelection::Median => {
                 if let Some((first, _)) = self.stack.first() {
                     debug_assert_eq!(
                         arr.dim(),
@@ -91,6 +109,9 @@ impl Reducer {
     fn feed_first(&mut self, arr: Array3<f64>, m: Array2<bool>) -> AgResult<()> {
         match (&mut self.acc, &mut self.acc_mask) {
             (None, _) => {
+                // Seed `remaining_invalid` from the first asset so `is_done`
+                // is O(1) thereafter (decremented as holes fill).
+                self.remaining_invalid = m.iter().filter(|&&v| !v).count();
                 self.acc = Some(arr);
                 self.acc_mask = Some(m);
             }
@@ -104,11 +125,57 @@ impl Reducer {
                                 acc[[b, y, x]] = arr[[b, y, x]];
                             }
                             am[[y, x]] = true;
+                            self.remaining_invalid = self.remaining_invalid.saturating_sub(1);
                         }
                     }
                 }
             }
             _ => unreachable!("acc and acc_mask set together"),
+        }
+        Ok(())
+    }
+
+    /// Streaming mean: keep a running per-band `sum` (in `acc`) and finite-sample
+    /// `count`, instead of stacking every asset's full array. Memory is O(1) in
+    /// the number of assets. A pixel is valid (`acc_mask`) if ANY asset marks it
+    /// valid; per band, only finite samples contribute — matching the previous
+    /// stack aggregation exactly.
+    fn feed_mean(&mut self, arr: Array3<f64>, m: Array2<bool>) -> AgResult<()> {
+        let (bands, h, w) = arr.dim();
+        let (sum, count, am) = match (&mut self.acc, &mut self.count, &mut self.acc_mask) {
+            (Some(sum), Some(count), Some(am)) => {
+                debug_assert_eq!(
+                    sum.dim(),
+                    arr.dim(),
+                    "mosaic assets must be homogeneous (same shape)"
+                );
+                (sum, count, am)
+            }
+            _ => {
+                self.acc = Some(Array3::<f64>::zeros((bands, h, w)));
+                self.count = Some(Array3::<u32>::zeros((bands, h, w)));
+                self.acc_mask = Some(Array2::from_elem((h, w), false));
+                (
+                    self.acc.as_mut().unwrap(),
+                    self.count.as_mut().unwrap(),
+                    self.acc_mask.as_mut().unwrap(),
+                )
+            }
+        };
+        for y in 0..h {
+            for x in 0..w {
+                if !m[[y, x]] {
+                    continue;
+                }
+                am[[y, x]] = true;
+                for b in 0..bands {
+                    let v = arr[[b, y, x]];
+                    if v.is_finite() {
+                        sum[[b, y, x]] += v;
+                        count[[b, y, x]] += 1;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -149,14 +216,15 @@ impl Reducer {
     }
 
     /// `true` when the method can short-circuit (tile fully covered).
+    ///
+    /// O(1): only `First` exits-when-filled, and it tracks `remaining_invalid`
+    /// incrementally as holes fill, so no full mask scan is needed.
     pub fn is_done(&self) -> bool {
         if !self.method.exits_when_filled() {
             return false;
         }
-        match &self.acc_mask {
-            Some(am) => am.iter().all(|&v| v),
-            None => false,
-        }
+        // `remaining_invalid` is `usize::MAX` until the first feed sizes it.
+        self.acc.is_some() && self.remaining_invalid == 0
     }
 
     /// Collapse to one `ImageData`. `Err` if nothing was fed.
@@ -172,11 +240,28 @@ impl Reducer {
                         .expect("invariant: acc_mask is set whenever acc is set"),
                 )
             }
-            PixelSelection::Mean | PixelSelection::Median => {
+            PixelSelection::Mean => {
+                // Streamed: divide running sum by finite-sample count per band.
+                let sum = self
+                    .acc
+                    .ok_or_else(|| AgError::Mosaic("no assets fed".into()))?;
+                let count = self
+                    .count
+                    .expect("invariant: count is set whenever the Mean sum is set");
+                let mask = self
+                    .acc_mask
+                    .expect("invariant: acc_mask is set whenever the Mean sum is set");
+                let mut out = sum;
+                ndarray::Zip::from(&mut out).and(&count).for_each(|v, &c| {
+                    *v = if c > 0 { *v / c as f64 } else { 0.0 };
+                });
+                (out, mask)
+            }
+            PixelSelection::Median => {
                 if self.stack.is_empty() {
                     return Err(AgError::Mosaic("no assets fed".into()));
                 }
-                aggregate_stack(&self.stack, self.method == PixelSelection::Mean)
+                aggregate_median(&self.stack)
             }
         };
         Ok(ImageData {
@@ -190,11 +275,9 @@ impl Reducer {
     }
 }
 
-/// Mean (or median) across the stack, skipping invalid samples per pixel.
-fn aggregate_stack(
-    stack: &[(Array3<f64>, Array2<bool>)],
-    mean: bool,
-) -> (Array3<f64>, Array2<bool>) {
+/// Per-pixel median across the stack, skipping invalid samples per pixel.
+/// Uses `select_nth_unstable_by` (quickselect, O(n)) rather than a full sort.
+fn aggregate_median(stack: &[(Array3<f64>, Array2<bool>)]) -> (Array3<f64>, Array2<bool>) {
     let (bands, h, w) = stack[0].0.dim();
     let mut out = Array3::<f64>::zeros((bands, h, w));
     let mut out_mask = Array2::from_elem((h, w), false);
@@ -213,21 +296,17 @@ fn aggregate_stack(
                         buf.push(arr[[b, y, x]]);
                     }
                 }
-                out[[b, y, x]] = if mean {
-                    let finite: Vec<f64> = buf.iter().copied().filter(|v| v.is_finite()).collect();
-                    if finite.is_empty() {
-                        0.0
-                    } else {
-                        finite.iter().sum::<f64>() / finite.len() as f64
-                    }
+                let len = buf.len();
+                let mid = len / 2;
+                // total_cmp orders NaN last, matching the previous full-sort
+                // behaviour; quickselect only positions the needed rank(s).
+                let (_, hi, _) = buf.select_nth_unstable_by(mid, f64::total_cmp);
+                let hi_val = *hi;
+                out[[b, y, x]] = if len % 2 == 1 {
+                    hi_val
                 } else {
-                    buf.sort_by(f64::total_cmp);
-                    let mid = buf.len() / 2;
-                    if buf.len() % 2 == 1 {
-                        buf[mid]
-                    } else {
-                        (buf[mid - 1] + buf[mid]) / 2.0
-                    }
+                    let (_, lo, _) = buf.select_nth_unstable_by(mid - 1, f64::total_cmp);
+                    (*lo + hi_val) / 2.0
                 };
             }
         }
@@ -297,6 +376,44 @@ mod tests {
         md.feed(&img(&[10.0], &[true])).unwrap();
         md.feed(&img(&[3.0], &[true])).unwrap();
         assert_eq!(md.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 3.0);
+    }
+
+    #[test]
+    fn highest_lowest_do_not_short_circuit_and_take_global_extremum() {
+        // Two assets that both fully cover the tile. The second carries a
+        // higher value at the pixel, so a correct Highest must read it even
+        // though the tile was already "filled" after the first asset.
+        let mut hi = Reducer::new(PixelSelection::Highest);
+        hi.feed(&img(&[3.0], &[true])).unwrap();
+        assert!(
+            !hi.is_done(),
+            "Highest must never short-circuit (it needs a global max)"
+        );
+        hi.feed(&img(&[7.0], &[true])).unwrap();
+        assert!(!hi.is_done());
+        assert_eq!(hi.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 7.0);
+
+        let mut lo = Reducer::new(PixelSelection::Lowest);
+        lo.feed(&img(&[3.0], &[true])).unwrap();
+        assert!(!lo.is_done());
+        lo.feed(&img(&[1.0], &[true])).unwrap();
+        assert_eq!(lo.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 1.0);
+    }
+
+    #[test]
+    fn first_is_done_is_o1_and_tracks_remaining() {
+        // Empty reducer is not done; partial coverage is not done; full is.
+        let mut r = Reducer::new(PixelSelection::First);
+        assert!(!r.is_done(), "no assets fed → not done");
+        r.feed(&img(&[1.0, 0.0, 0.0], &[true, false, false]))
+            .unwrap();
+        assert!(!r.is_done());
+        r.feed(&img(&[0.0, 2.0, 0.0], &[false, true, false]))
+            .unwrap();
+        assert!(!r.is_done());
+        r.feed(&img(&[0.0, 0.0, 3.0], &[false, false, true]))
+            .unwrap();
+        assert!(r.is_done(), "all three pixels filled → done");
     }
 
     #[test]

@@ -158,9 +158,16 @@ impl<S: MosaicSource> MosaicTiler<S> {
         let composite = reducer.finish()?;
         let compiled = compile_cached(style).await?;
         let img = composite;
-        let bytes = tokio::task::spawn_blocking(move || render(&img, &compiled))
-            .await
-            .map_err(|e| AgError::Mosaic(format!("render join: {e}")))??;
+        // Bound the composite render with the same shared CPU limiter the
+        // per-asset reads/warps used, so it doesn't add an unbounded blocking
+        // job on top of the mosaic's CPU budget.
+        let permit = self.pool.cpu_limiter().acquire().await?;
+        let bytes = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            render(&img, &compiled)
+        })
+        .await
+        .map_err(|e| AgError::Mosaic(format!("render join: {e}")))??;
         Ok(Some(bytes))
     }
 }

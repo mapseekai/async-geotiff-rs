@@ -3,9 +3,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::Semaphore;
 
-use crate::blocking::default_blocking_permits;
+use crate::blocking::{default_blocking_permits, CpuLimiter};
 use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::io::stats::{load_dataset_stats, DatasetStats};
@@ -23,7 +22,7 @@ const PASSTHROUGH_PIXEL_TOLERANCE: f64 = 1e-3;
 
 pub struct Tiler {
     reader: Arc<CogReader>,
-    tile_cpu_semaphore: Arc<Semaphore>,
+    cpu: CpuLimiter,
     stats: OnceCell<Option<Arc<DatasetStats>>>,
 }
 
@@ -51,14 +50,27 @@ impl TilerConfig {
 }
 
 impl Tiler {
+    /// Build a `Tiler` that shares the reader's [`CpuLimiter`], so decode,
+    /// stitch, warp and render all draw from one CPU budget. In a mosaic, where
+    /// every asset's reader shares one limiter (via `ReaderPool`), this bounds
+    /// the whole mosaic's CPU work — preventing oversubscription. Use
+    /// [`Self::with_config`] to give a single-source tiler its own bound.
     pub fn new(reader: Arc<CogReader>) -> Self {
-        Self::with_config(reader, TilerConfig::default())
+        let cpu = reader.cpu_limiter();
+        Self {
+            reader,
+            cpu,
+            stats: OnceCell::new(),
+        }
     }
 
+    /// Build a `Tiler` with an independent CPU bound sized by
+    /// `config.max_blocking_tasks` (does not share the reader's limiter). Prefer
+    /// [`Self::new`] when you want one shared process/mosaic-wide budget.
     pub fn with_config(reader: Arc<CogReader>, config: TilerConfig) -> Self {
         Self {
             reader,
-            tile_cpu_semaphore: Arc::new(Semaphore::new(config.blocking_task_limit())),
+            cpu: CpuLimiter::new(config.blocking_task_limit()),
             stats: OnceCell::new(),
         }
     }
@@ -284,15 +296,26 @@ impl Tiler {
         Ok(Some(bytes))
     }
 
+    /// Run a pure-CPU closure `f` under one [`CpuLimiter`] permit.
+    ///
+    /// INVARIANT (deadlock-freedom): `f` must be **pure synchronous CPU** and
+    /// must NOT acquire another permit from the same limiter (directly, or by
+    /// calling back into a reader read). The limiter may be shared across decode,
+    /// stitch, warp and render; the safety of sharing rests on each job holding
+    /// at most ONE permit at a time. Reader reads (`read_window`) acquire+release
+    /// their decode permits in the async layer *before* `run_tile_cpu` is called,
+    /// so warp/render here never nest acquisition. Were `f` to await a second
+    /// permit, N permit-holding jobs could starve all remaining acquisitions.
     async fn run_tile_cpu<T, F>(&self, label: &'static str, f: F) -> AgResult<T>
     where
         T: Send + 'static,
         F: FnOnce() -> AgResult<T> + Send + 'static,
     {
-        let permit = Arc::clone(&self.tile_cpu_semaphore)
-            .acquire_owned()
+        let permit = self
+            .cpu
+            .acquire()
             .await
-            .map_err(|_| AgError::Warp(format!("{label} semaphore closed")))?;
+            .map_err(|_| AgError::Warp(format!("{label} cpu limiter closed")))?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             f()

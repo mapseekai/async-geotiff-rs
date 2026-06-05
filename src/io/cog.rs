@@ -13,13 +13,13 @@ use async_tiff::{ImageFileDirectory, TIFF};
 use object_store::http::HttpBuilder;
 use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore};
-use tokio::sync::Semaphore;
-
-use crate::blocking::default_blocking_permits;
+use crate::blocking::{default_blocking_permits, CpuLimiter};
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
-use crate::io::block_cache::{BlockCache, BlockKey, BlockKind, DecodedBlock};
+use crate::io::block_cache::{
+    BlockCache, BlockKey, BlockKind, BlockResult, Claim, DecodedBlock, InflightGuard, PendingBlock,
+};
 use crate::io::cache::CacheConfig;
 use crate::io::window::{tile_range_for_window, validate_window_shape, IfdInfo};
 use crate::pixel::{ImageData, PixelData};
@@ -35,13 +35,23 @@ const TEST_OVERVIEW_PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
 /// `max_decode_tasks` caps concurrent CPU-heavy decode/stitch jobs submitted
 /// through `spawn_blocking`. Waiting for a permit is async, so excess requests
 /// yield the Tokio worker instead of flooding the blocking pool.
+///
+/// `#[non_exhaustive]`: construct with [`ReaderConfig::default()`] and assign
+/// fields (or use struct-update syntax inside this crate). This lets new fields
+/// be added without breaking external callers.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ReaderConfig {
     pub max_decode_tasks: usize,
     /// Caller-supplied id for this logical source (same id ⇒ shared blocks).
     pub source_id: String,
     /// Shared decoded-block cache injected by the caller.
     pub block_cache: Arc<BlockCache>,
+    /// Shared CPU-job limiter. When `None`, the reader builds its own sized to
+    /// `max_decode_tasks`. Inject the same [`CpuLimiter`] into several readers
+    /// (and their [`Tiler`]s) to bound the whole process/mosaic to one CPU
+    /// budget — see [`crate::blocking::CpuLimiter`]. [`Tiler`]: crate::tiler::Tiler
+    pub cpu_limiter: Option<CpuLimiter>,
 }
 
 impl Default for ReaderConfig {
@@ -50,6 +60,7 @@ impl Default for ReaderConfig {
             max_decode_tasks: default_blocking_permits(),
             source_id: format!("cog-{}", NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed)),
             block_cache: Arc::new(BlockCache::new(CacheConfig::default())),
+            cpu_limiter: None,
         }
     }
 }
@@ -78,7 +89,9 @@ pub struct CogReader {
     source_id: Arc<str>,
     /// Shared decoded-block cache (may be shared across readers).
     block_cache: Arc<BlockCache>,
-    decode_semaphore: Arc<Semaphore>,
+    /// Shared CPU-job limiter, covering decode + stitch here and warp + render
+    /// in the [`Tiler`] built from this reader. [`Tiler`]: crate::tiler::Tiler
+    cpu: CpuLimiter,
 }
 
 impl CogReader {
@@ -209,7 +222,10 @@ impl CogReader {
             band_scale_offset,
             source_id: Arc::from(config.source_id.as_str()),
             block_cache: config.block_cache.clone(),
-            decode_semaphore: Arc::new(Semaphore::new(config.decode_task_limit())),
+            cpu: config
+                .cpu_limiter
+                .clone()
+                .unwrap_or_else(|| CpuLimiter::new(config.decode_task_limit())),
         })
     }
 
@@ -250,6 +266,13 @@ impl CogReader {
     ) -> AgResult<Self> {
         let reader = ObjectReader::new(store, Path::from(key));
         Self::open_with_reader_and_config(reader, config).await
+    }
+
+    /// The shared CPU-job limiter backing this reader. A [`Tiler`] built from
+    /// this reader reuses it so decode/stitch/warp/render all draw from one CPU
+    /// budget. [`Tiler`]: crate::tiler::Tiler
+    pub fn cpu_limiter(&self) -> CpuLimiter {
+        self.cpu.clone()
     }
 
     pub fn src_crs(&self) -> &Crs {
@@ -401,10 +424,7 @@ impl CogReader {
             let info = data_info;
             let (w, h) = (width, height);
             let (co, ro) = (col_off, row_off);
-            let permit = Arc::clone(&self.decode_semaphore)
-                .acquire_owned()
-                .await
-                .map_err(|_| AgError::Tiff("decode semaphore closed".into()))?;
+            let permit = self.cpu.acquire().await?;
             // Move the Arc<DecodedBlock> handles (no pixel copy) into the
             // blocking job and stitch from references built INSIDE the closure.
             tokio::task::spawn_blocking(move || {
@@ -420,10 +440,7 @@ impl CogReader {
             let coords2 = coords.clone();
             let (w, h) = (width, height);
             let (co, ro) = (col_off, row_off);
-            let permit = Arc::clone(&self.decode_semaphore)
-                .acquire_owned()
-                .await
-                .map_err(|_| AgError::Tiff("decode semaphore closed".into()))?;
+            let permit = self.cpu.acquire().await?;
             let m = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let refs: Vec<&async_tiff::Array> = mask_blocks.iter().map(|b| b.array()).collect();
@@ -475,43 +492,77 @@ impl CogReader {
             }
         }
         if !miss_coords.is_empty() {
-            self.block_cache.record_fetched(miss_coords.len() as u64);
-            let tiles = ifd
-                .fetch_tiles(&miss_coords, &self.reader)
-                .await
-                .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
-            // Decode misses CONCURRENTLY (bounded by `decode_semaphore`) rather
-            // than one-at-a-time: a cold window with many misses decodes in
-            // parallel across the blocking pool instead of serially. Each block's
-            // `try_get_with` still single-flights that block; results are placed
-            // by index, so stitch ordering is unaffected.
-            let mut set = tokio::task::JoinSet::new();
-            for (mi, tile) in miss_idx.iter().copied().zip(tiles.into_iter()) {
-                let key = keys[mi].clone();
-                let sem = Arc::clone(&self.decode_semaphore);
-                let cache = Arc::clone(&self.block_cache);
-                set.spawn(async move {
-                    let block = cache
-                        .try_get_with(key, async move {
-                            let permit = sem
-                                .acquire_owned()
-                                .await
-                                .map_err(|_| AgError::Tiff("decode semaphore closed".into()))?;
-                            let arr = tokio::task::spawn_blocking(move || {
-                                let _permit = permit;
-                                crate::io::decode::decode_one(tile)
-                            })
-                            .await
-                            .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
-                            Ok(DecodedBlock::new(arr))
-                        })
-                        .await?;
-                    Ok::<(usize, Arc<DecodedBlock>), AgError>((mi, block))
-                });
+            // Claim each missing block. This caller fetches the blocks it owns;
+            // blocks a concurrent request is already fetching are awaited via
+            // their in-flight channel instead of being fetched again. This
+            // single-flights the network range GET across requests, not just the
+            // decode (which moka already coalesces).
+            let mut to_fetch: Vec<(usize, (usize, usize), InflightGuard)> = Vec::new();
+            let mut pending: Vec<(usize, PendingBlock)> = Vec::new();
+            for (&mi, &coord) in miss_idx.iter().zip(miss_coords.iter()) {
+                match self.block_cache.claim(&keys[mi]) {
+                    Claim::Owned(guard) => to_fetch.push((mi, coord, guard)),
+                    Claim::Pending(rx) => pending.push((mi, rx)),
+                }
             }
-            while let Some(res) = set.join_next().await {
-                let (mi, block) = res.map_err(|e| AgError::Tiff(format!("decode task: {e}")))??;
-                resolved[mi] = Some(block);
+
+            if !to_fetch.is_empty() {
+                // One coalesced fetch for only the blocks we own (object_store
+                // merges adjacent ranges). On error, the guards drop → waiters
+                // observe cancellation and retry.
+                let fetch_coords: Vec<(usize, usize)> =
+                    to_fetch.iter().map(|(_, c, _)| *c).collect();
+                self.block_cache.record_fetched(fetch_coords.len() as u64);
+                let tiles = ifd
+                    .fetch_tiles(&fetch_coords, &self.reader)
+                    .await
+                    .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
+                // Decode owned misses CONCURRENTLY (bounded by the CPU limiter).
+                // `try_get_with` single-flights each block's decode + insert;
+                // the guard then publishes the result to any waiters.
+                let mut set = tokio::task::JoinSet::new();
+                for ((mi, _coord, guard), tile) in to_fetch.into_iter().zip(tiles.into_iter()) {
+                    let key = keys[mi].clone();
+                    let sem = self.cpu.clone();
+                    let cache = Arc::clone(&self.block_cache);
+                    set.spawn(async move {
+                        let block_res: AgResult<Arc<DecodedBlock>> = cache
+                            .try_get_with(key, async move {
+                                let permit = sem.acquire().await?;
+                                let arr = tokio::task::spawn_blocking(move || {
+                                    let _permit = permit;
+                                    crate::io::decode::decode_one(tile)
+                                })
+                                .await
+                                .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+                                Ok(DecodedBlock::new(arr))
+                            })
+                            .await;
+                        // Publish to concurrent waiters (Arc-wrap the error since
+                        // AgError isn't Clone), then return to this caller.
+                        let forward: BlockResult = match &block_res {
+                            Ok(b) => Ok(Arc::clone(b)),
+                            Err(e) => Err(Arc::new(AgError::Tiff(format!("block fetch: {e}")))),
+                        };
+                        guard.resolve(forward);
+                        block_res.map(|b| (mi, b))
+                    });
+                }
+                while let Some(res) = set.join_next().await {
+                    let (mi, block) =
+                        res.map_err(|e| AgError::Tiff(format!("decode task: {e}")))??;
+                    resolved[mi] = Some(block);
+                }
+            }
+
+            // INVARIANT (deadlock-freedom): every owned guard above is resolved
+            // (inside the drained JoinSet) BEFORE we await any pending block.
+            // This breaks cross-request wait cycles — e.g. request A owns {1,2}
+            // and waits on {3} while request B owns {3} and waits on {1,2}: both
+            // publish their owned results before blocking on the other's, so
+            // neither stalls. Do NOT move pending awaits before the JoinSet drain.
+            for (mi, rx) in pending {
+                resolved[mi] = Some(BlockCache::await_pending(rx).await?);
             }
         }
         resolved
@@ -900,6 +951,49 @@ mod tests {
         assert!(
             nb > na,
             "different source ids must add separate block entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_cold_reads_single_flight_the_fetch() {
+        use crate::io::block_cache::BlockCache;
+        use crate::io::cache::CacheConfig;
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("data/cog_uint8_rgb_nodata.tif");
+        if !tif.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
+        let r = std::sync::Arc::new(open_local_for_test(&tif, "src-sf", cache.clone()).await);
+
+        // Two requests race the SAME cold window. `claim` is synchronous, so the
+        // first to enter the miss path owns every block's fetch; the second sees
+        // the in-flight entries and awaits them instead of re-fetching.
+        let r1 = std::sync::Arc::clone(&r);
+        let r2 = std::sync::Arc::clone(&r);
+        let (a, b) = tokio::join!(
+            async move { r1.read_window(0, 0, 0, 64, 64).await },
+            async move { r2.read_window(0, 0, 0, 64, 64).await },
+        );
+        let a = a.unwrap();
+        let b = b.unwrap();
+        assert_eq!(
+            a.pixels.to_f64(),
+            b.pixels.to_f64(),
+            "both racing readers must observe identical pixels"
+        );
+
+        let blocks = cache.sync_count().await;
+        let fetched = cache.stats().fetched;
+        assert!(blocks > 0, "cold reads must populate the cache");
+        // Single-flight: each cold block is fetched exactly once across the two
+        // concurrent requests. Without dedup the loser would re-fetch every
+        // block, driving `fetched` up to 2× the number of cached blocks.
+        assert_eq!(
+            fetched, blocks,
+            "each cold block must be fetched exactly once despite the race"
         );
     }
 
