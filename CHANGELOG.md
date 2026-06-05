@@ -11,6 +11,8 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-06-05
+
 ### Added
 
 - WebP and JPEG tile output, behind the `webp` and `jpeg` cargo features (PNG is
@@ -245,7 +247,8 @@ can land in any release** and are called out explicitly under a
 - PNG output; example axum server with MapLibre / OpenLayers / Leaflet
   viewers and a local `data/*.tif` dataset picker.
 
-[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.7
 [0.0.2]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.2
 
 <!-- 0.0.1 predates tagging; no release tag exists. -->
