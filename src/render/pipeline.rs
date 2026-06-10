@@ -8,11 +8,13 @@
 //!
 //! Validity mask is applied as a single `Zip` over the alpha channel.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
-use ndarray::{s, Array2, Array3, ArrayView3, Zip};
+use ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, Axis, Zip};
 
 use crate::error::{AgError, AgResult};
-use crate::pixel::ImageData;
+use crate::pixel::{ImageData, PixelData};
 use crate::render::color_formula::Op;
 use crate::render::composite::{Composite, HandleGet};
 use crate::render::encode::{encode, TileFormat};
@@ -22,6 +24,22 @@ use crate::warp::resampler::Resampling;
 // `tile_size` and `resampling` on CompiledTileStyle are kept for callers
 // (style/params.rs), but the render pipeline assumes warp has already produced
 // an `image` matching `style.tile_size` exactly — no resize happens here.
+
+/// Lazily-built lookup tables for u16 sources, hanging off the compiled style
+/// behind an `Arc`. All tiles sharing one effective style (via `compile_cached`
+/// or the `Tiler`'s effective-style memo) build each table once and then
+/// replace per-pixel float rescale math with an indexed load. Code that clones
+/// a `CompiledTileStyle` and CHANGES `rescale`/`vmin`/`vmax` must install a
+/// fresh `Arc<RenderLuts>` — a shared cell with different ranges would render
+/// wrong colors.
+#[derive(Debug, Default)]
+pub struct RenderLuts {
+    /// Per-channel 65536-entry u16→u8 rescale tables for the 3-band RGB path.
+    rgb_u16: std::sync::OnceLock<Arc<[Vec<u8>; 3]>>,
+    /// 65536-entry u16→RGBA table fusing rescale + colormap for the
+    /// single-band Gradient path.
+    grad_u16: std::sync::OnceLock<Arc<Vec<[u8; 4]>>>,
+}
 
 /// Precompiled render plan for the hot path.
 #[derive(Debug, Clone)]
@@ -38,6 +56,9 @@ pub struct CompiledTileStyle {
     pub auto_rgb: bool,
     /// Output encoding selected by the request.
     pub format: TileFormat,
+    /// See [`RenderLuts`]. Reset to a fresh `Arc` whenever `rescale`/vmin/vmax
+    /// are rewritten on a clone.
+    pub luts: Arc<RenderLuts>,
 }
 
 pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
@@ -57,6 +78,15 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
         return encode(&rgba, style.format);
     }
 
+    // u16 RGB via per-band LUT: bakes the float rescale into three 65536-entry
+    // tables (built once per effective style, shared across tiles), turning the
+    // per-pixel `(v - lo) * inv → clamp → cast` chain into an indexed load.
+    // This is the dominant path for 16-bit satellite imagery (Sentinel-2 L2A,
+    // Landsat C2) browsed with a stats- or user-supplied stretch.
+    if let Some(rgba) = try_u16_rgb_lut_fastpath(image, style, auto_rgb, h, w) {
+        return encode(&rgba, style.format);
+    }
+
     // Expression path: evaluate band-math RPN per-pixel → synthetic single band.
     if !style.expression.is_empty() {
         // Promote to f64 only on this path; `as_f64` borrows when the source is
@@ -69,7 +99,7 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
         } else {
             Some(valid)
         };
-        let rgba = render_single_band(&band, valid_opt.as_ref(), style);
+        let rgba = render_single_band(&band.view(), valid_opt.as_ref(), style);
         return encode(&rgba, style.format);
     }
 
@@ -97,36 +127,106 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
     }
 
     let _ = n;
-    // Materialise only the SELECTED bands as f64 — avoids converting the whole
-    // (possibly many-band) image up front. `band_to_f64` copies a single band;
-    // for an F64 source it copies just that band, not the full cube. `bidx`
-    // is range-checked above, so indexing is safe.
-    let band_views: Vec<Array2<f64>> = bidx.iter().map(|&b| image.pixels.band_to_f64(b)).collect();
-
+    // Render selected bands through typed views; bidx is range-checked above.
     let nodata = style.nodata.or(image.nodata);
-    let valid: Option<Array2<bool>> = compute_valid_mask(image, &band_views, nodata, h, w);
-
-    let rgba: Array3<u8> = match band_views.len() {
-        1 => render_single_band(&band_views[0], valid.as_ref(), style),
-        3 => render_three_band(
-            &band_views[0],
-            &band_views[1],
-            &band_views[2],
-            valid.as_ref(),
-            style,
-            auto_rgb,
-        )?,
-        other => {
-            return Err(AgError::UnsupportedPixel(format!(
-                "expected 1 or 3 bands after bidx, got {other}"
-            )))
-        }
-    };
+    let rgba = render_typed_bands(
+        &image.pixels,
+        &bidx,
+        image.mask.as_ref(),
+        nodata,
+        style,
+        auto_rgb,
+    )?;
 
     // Render assumes the warp stage has already produced an image at
     // `style.tile_size`; if not, the encoded PNG simply matches input dims.
     let _ = style.tile_size;
     encode(&rgba, style.format)
+}
+
+trait RenderSample: Copy {
+    fn to_f64(self) -> f64;
+}
+
+macro_rules! impl_render_sample {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl RenderSample for $ty {
+                #[inline]
+                fn to_f64(self) -> f64 {
+                    self as f64
+                }
+            }
+        )+
+    };
+}
+
+impl_render_sample!(u8, u16, i16, u32, i32, f32, f64);
+
+fn render_typed_bands(
+    pixels: &PixelData,
+    bidx: &[usize],
+    mask: Option<&Array2<bool>>,
+    nodata: Option<f64>,
+    style: &CompiledTileStyle,
+    auto_rgb: bool,
+) -> AgResult<Array3<u8>> {
+    match pixels {
+        PixelData::U8(a) => render_typed_array(a.view(), bidx, mask, nodata, style, auto_rgb),
+        PixelData::U16(a) => {
+            // Fused rescale+colormap LUT for the single-band Gradient case
+            // (DEM/single-band 16-bit rasters); other shapes use the generic
+            // typed path below.
+            if let Some(rgba) = try_u16_single_gradient_lut(a, bidx, mask, nodata, style) {
+                return Ok(rgba);
+            }
+            render_typed_array(a.view(), bidx, mask, nodata, style, auto_rgb)
+        }
+        PixelData::I16(a) => render_typed_array(a.view(), bidx, mask, nodata, style, auto_rgb),
+        PixelData::U32(a) => render_typed_array(a.view(), bidx, mask, nodata, style, auto_rgb),
+        PixelData::I32(a) => render_typed_array(a.view(), bidx, mask, nodata, style, auto_rgb),
+        PixelData::F32(a) => render_typed_array(a.view(), bidx, mask, nodata, style, auto_rgb),
+        PixelData::F64(a) => render_typed_array(a.view(), bidx, mask, nodata, style, auto_rgb),
+    }
+}
+
+fn render_typed_array<T: RenderSample>(
+    src: ArrayView3<'_, T>,
+    bidx: &[usize],
+    mask: Option<&Array2<bool>>,
+    nodata: Option<f64>,
+    style: &CompiledTileStyle,
+    auto_rgb: bool,
+) -> AgResult<Array3<u8>> {
+    let h = src.shape()[1];
+    let w = src.shape()[2];
+    match bidx {
+        [b0] => {
+            let bands = [src.index_axis(Axis(0), *b0)];
+            let valid = compute_valid_mask(mask, &bands, nodata, h, w);
+            Ok(render_single_band(&bands[0], valid.as_ref(), style))
+        }
+        [b0, b1, b2] => {
+            let bands = [
+                src.index_axis(Axis(0), *b0),
+                src.index_axis(Axis(0), *b1),
+                src.index_axis(Axis(0), *b2),
+            ];
+            let valid = compute_valid_mask(mask, &bands, nodata, h, w);
+            render_three_band(
+                &bands[0],
+                &bands[1],
+                &bands[2],
+                valid.as_ref(),
+                style,
+                auto_rgb,
+            )
+        }
+        other => Err(AgError::UnsupportedPixel(format!(
+            "expected 1 or 3 bands after bidx, got {}",
+            other.len()
+        ))),
+    }
 }
 
 /// Returns Some(rgba) when the u8 RGB fast path applies. Conditions:
@@ -222,24 +322,174 @@ fn try_u8_rgb_fastpath(
     Some(rgba)
 }
 
+/// One channel's u16→u8 rescale table — exactly the generic path's
+/// `((v - lo) * (255 / span)).clamp(0, 255) as u8` evaluated for every
+/// possible sample value, so LUT output is bit-identical to the scalar math.
+fn build_u16_rescale_lut((lo, hi): (f64, f64)) -> Vec<u8> {
+    let inv = 255.0 / (hi - lo).max(1e-12);
+    (0..=u16::MAX as u32)
+        .map(|v| ((v as f64 - lo) * inv).clamp(0.0, 255.0) as u8)
+        .collect()
+}
+
+/// u16 nodata sentinel: only an exactly-representable integral value can ever
+/// match a u16 sample under the generic path's `|x - nd| < 1e-9` test.
+fn u16_nodata(nodata: Option<f64>) -> Option<u16> {
+    nodata.and_then(|nd| {
+        (nd.is_finite() && nd.fract() == 0.0 && (0.0..=f64::from(u16::MAX)).contains(&nd))
+            .then_some(nd as u16)
+    })
+}
+
+/// Returns Some(rgba) when the u16 3-band LUT path applies. Mirrors
+/// [`try_u8_rgb_fastpath`]'s gating (U16 source, three selected bands, RGB
+/// composite or auto_rgb, no formula/expression); unlike the u8 path it
+/// accepts ANY rescale because the ranges are baked into the LUTs.
+fn try_u16_rgb_lut_fastpath(
+    image: &ImageData,
+    style: &CompiledTileStyle,
+    auto_rgb: bool,
+    h: usize,
+    w: usize,
+) -> Option<Array3<u8>> {
+    use crate::render::composite::CompositeKind;
+
+    let src = match &image.pixels {
+        PixelData::U16(a) => a,
+        _ => return None,
+    };
+    if !style.formula.is_empty() || !style.expression.is_empty() {
+        return None;
+    }
+    let bands = src.shape()[0];
+    let bidx: [usize; 3] = if style.bidx.is_empty() {
+        let want_rgb =
+            (auto_rgb || matches!(style.composite.kind, CompositeKind::Rgb)) && bands >= 3;
+        if !want_rgb {
+            return None;
+        }
+        [0, 1, 2]
+    } else if style.bidx.len() == 3 && style.bidx.iter().all(|&b| b < bands) {
+        [style.bidx[0], style.bidx[1], style.bidx[2]]
+    } else {
+        return None;
+    };
+
+    let luts = style.luts.rgb_u16.get_or_init(|| {
+        let ranges = rgb_ranges(style);
+        Arc::new([
+            build_u16_rescale_lut(ranges[0]),
+            build_u16_rescale_lut(ranges[1]),
+            build_u16_rescale_lut(ranges[2]),
+        ])
+    });
+
+    let nodata = style.nodata.or(image.nodata);
+    let nd_u16 = u16_nodata(nodata);
+    let mut rgba = Array3::<u8>::from_elem((h, w, 4), 0u8);
+    let stride = h * w;
+    let src_standard = src.as_standard_layout();
+    let src_slice = src_standard
+        .as_slice()
+        .expect("standard-layout u16 PixelData must be contiguous");
+    let r_band = &src_slice[bidx[0] * stride..][..stride];
+    let g_band = &src_slice[bidx[1] * stride..][..stride];
+    let b_band = &src_slice[bidx[2] * stride..][..stride];
+    let mask_slice: Option<&[bool]> = image.mask.as_ref().and_then(|m| m.as_slice());
+    let dst = rgba
+        .as_slice_mut()
+        .expect("freshly-allocated Array3 standard layout");
+    let [lut_r, lut_g, lut_b] = &**luts;
+
+    for i in 0..stride {
+        let r_val = r_band[i];
+        let g_val = g_band[i];
+        let b_val = b_band[i];
+        let masked = matches!(mask_slice, Some(m) if !m[i]);
+        // Per-band nodata: invalid when ANY selected band reads the sentinel,
+        // matching `compute_valid_mask` on the generic path.
+        let nd_hit = matches!(nd_u16, Some(nd) if r_val == nd || g_val == nd || b_val == nd);
+        let alpha: u8 = if masked || nd_hit { 0 } else { 255 };
+        let base = i * 4;
+        dst[base] = lut_r[r_val as usize];
+        dst[base + 1] = lut_g[g_val as usize];
+        dst[base + 2] = lut_b[b_val as usize];
+        dst[base + 3] = alpha;
+    }
+    Some(rgba)
+}
+
+/// Single-band u16 Gradient path: one 65536-entry table fuses the
+/// normalise-to-index step AND the 256-entry colormap, so each pixel becomes
+/// a single indexed 4-byte copy. Returns None when the composite isn't a
+/// Gradient (discrete/rgb fall back to the generic per-pixel path).
+fn try_u16_single_gradient_lut(
+    src: &Array3<u16>,
+    bidx: &[usize],
+    mask: Option<&Array2<bool>>,
+    nodata: Option<f64>,
+    style: &CompiledTileStyle,
+) -> Option<Array3<u8>> {
+    use crate::render::composite::CompositeKind;
+    let &[b0] = bidx else { return None };
+    if !matches!(style.composite.kind, CompositeKind::Gradient) {
+        return None;
+    }
+    let comp = &style.composite;
+    let lut = style.luts.grad_u16.get_or_init(|| {
+        let cmap = comp.lut.unwrap_or([[0u8; 4]; 256]);
+        let (lo, hi) = match (&comp.vmin, &comp.vmax) {
+            (Some(a), Some(b)) => (a[0], b[0]),
+            _ => (0.0, 1.0),
+        };
+        let scale = 255.0 / (hi - lo).max(1e-12);
+        Arc::new(
+            (0..=u16::MAX as u32)
+                .map(|v| cmap[(((v as f64 - lo) * scale).clamp(0.0, 255.0)) as u8 as usize])
+                .collect(),
+        )
+    });
+
+    let h = src.shape()[1];
+    let w = src.shape()[2];
+    let band = src.index_axis(Axis(0), b0);
+    let valid = compute_valid_mask(mask, &[band], nodata, h, w);
+
+    let mut rgba = Array3::<u8>::zeros((h, w, 4));
+    {
+        let band_standard = band.as_standard_layout();
+        let band_slice = band_standard
+            .as_slice()
+            .expect("standard-layout u16 band must be contiguous");
+        let dst = rgba
+            .as_slice_mut()
+            .expect("freshly-allocated Array3 standard layout");
+        for (i, &v) in band_slice.iter().enumerate() {
+            dst[i * 4..i * 4 + 4].copy_from_slice(&lut[v as usize]);
+        }
+    }
+    apply_valid_to_alpha(&mut rgba, valid.as_ref());
+    Some(rgba)
+}
+
 /// Build a `(h, w)` validity mask. Returns `None` if every pixel is valid so
 /// the caller can skip the mask check entirely.
 ///
 /// Implemented as a sequence of `Zip` reductions over the input `Array2`s —
 /// pure ndarray broadcasting, no manual indexing.
-fn compute_valid_mask(
-    image: &ImageData,
-    bands: &[Array2<f64>],
+fn compute_valid_mask<T: RenderSample>(
+    mask: Option<&Array2<bool>>,
+    bands: &[ArrayView2<'_, T>],
     nodata: Option<f64>,
     h: usize,
     w: usize,
 ) -> Option<Array2<bool>> {
-    let mask_present = image.mask.is_some();
+    let mask_present = mask.is_some();
     if !mask_present && nodata.is_none() {
         return None;
     }
     let mut valid = Array2::<bool>::from_elem((h, w), true);
-    if let Some(m) = &image.mask {
+    if let Some(m) = mask {
         valid.assign(m);
     }
     if let Some(nd) = nodata {
@@ -247,13 +497,13 @@ fn compute_valid_mask(
         for band in bands {
             if is_nan {
                 Zip::from(&mut valid).and(band).for_each(|v, &x| {
-                    if x.is_nan() {
+                    if x.to_f64().is_nan() {
                         *v = false;
                     }
                 });
             } else {
                 Zip::from(&mut valid).and(band).for_each(|v, &x| {
-                    if (x - nd).abs() < 1e-9 {
+                    if (x.to_f64() - nd).abs() < 1e-9 {
                         *v = false;
                     }
                 });
@@ -277,8 +527,8 @@ fn apply_valid_to_alpha(rgba: &mut Array3<u8>, valid: Option<&Array2<bool>>) {
 }
 
 /// Single-band path: matrix-style rescale → LUT index Array2<u8> → fill RGBA.
-fn render_single_band(
-    band: &Array2<f64>,
+fn render_single_band<T: RenderSample>(
+    band: &ArrayView2<'_, T>,
     valid: Option<&Array2<bool>>,
     style: &CompiledTileStyle,
 ) -> Array3<u8> {
@@ -296,7 +546,7 @@ fn render_single_band(
             let scale = 255.0 / (hi - lo).max(1e-12);
 
             // Matrix-style normalise: out = clamp((band - lo) * scale, 0, 255) as u8
-            let idx = band.mapv(|v| (((v - lo) * scale).clamp(0.0, 255.0)) as u8);
+            let idx = band.mapv(|v| (((v.to_f64() - lo) * scale).clamp(0.0, 255.0)) as u8);
 
             let mut rgba = Array3::<u8>::zeros((h, w, 4));
             interleave_lut(&idx, &lut, &mut rgba);
@@ -307,7 +557,7 @@ fn render_single_band(
             // Discrete / single-band-rgb fallback: per-pixel composite.get.
             let mut rgba = Array3::<u8>::zeros((h, w, 4));
             Zip::indexed(band).for_each(|(r, c), &v| {
-                let px = comp.get(&[v], None);
+                let px = comp.get(&[v.to_f64()], None);
                 rgba.slice_mut(s![r, c, ..])
                     .iter_mut()
                     .zip(px.iter())
@@ -320,10 +570,10 @@ fn render_single_band(
 }
 
 /// Three-band RGB path: per-band matrix rescale → channel `assign()` into RGBA.
-fn render_three_band(
-    r_band: &Array2<f64>,
-    g_band: &Array2<f64>,
-    b_band: &Array2<f64>,
+fn render_three_band<T: RenderSample>(
+    r_band: &ArrayView2<'_, T>,
+    g_band: &ArrayView2<'_, T>,
+    b_band: &ArrayView2<'_, T>,
     valid: Option<&Array2<bool>>,
     style: &CompiledTileStyle,
     auto_rgb: bool,
@@ -338,9 +588,9 @@ fn render_three_band(
         Zip::indexed(r_band).for_each(|(r_idx, c_idx), &rv| {
             let gv = g_band[[r_idx, c_idx]];
             let bv = b_band[[r_idx, c_idx]];
-            let r = normalize(rv, ranges[0]);
-            let g = normalize(gv, ranges[1]);
-            let b = normalize(bv, ranges[2]);
+            let r = normalize(rv.to_f64(), ranges[0]);
+            let g = normalize(gv.to_f64(), ranges[1]);
+            let b = normalize(bv.to_f64(), ranges[2]);
             let (r, g, b) = crate::render::color_formula::apply(&style.formula, r, g, b);
             rgba[[r_idx, c_idx, 0]] = unit_to_u8(r);
             rgba[[r_idx, c_idx, 1]] = unit_to_u8(g);
@@ -388,9 +638,9 @@ fn render_three_band(
         let inv_b = 255.0 / (hi_b - lo_b).max(1e-12);
         for i in 0..n {
             // Pre-scale: (v - lo) * (255 / span), then clamp+cast.
-            let r_u8 = ((r_slice[i] - lo_r) * inv_r).clamp(0.0, 255.0) as u8;
-            let g_u8 = ((g_slice[i] - lo_g) * inv_g).clamp(0.0, 255.0) as u8;
-            let b_u8 = ((b_slice[i] - lo_b) * inv_b).clamp(0.0, 255.0) as u8;
+            let r_u8 = ((r_slice[i].to_f64() - lo_r) * inv_r).clamp(0.0, 255.0) as u8;
+            let g_u8 = ((g_slice[i].to_f64() - lo_g) * inv_g).clamp(0.0, 255.0) as u8;
+            let b_u8 = ((b_slice[i].to_f64() - lo_b) * inv_b).clamp(0.0, 255.0) as u8;
             let alpha = match mask_slice {
                 Some(m) if !m[i] => 0,
                 _ => 255,
@@ -409,7 +659,9 @@ fn render_three_band(
     Zip::indexed(r_band).for_each(|(r_idx, c_idx), &rv| {
         let gv = g_band[[r_idx, c_idx]];
         let bv = b_band[[r_idx, c_idx]];
-        let px = style.composite.get(&[rv, gv, bv], None);
+        let px = style
+            .composite
+            .get(&[rv.to_f64(), gv.to_f64(), bv.to_f64()], None);
         rgba.slice_mut(s![r_idx, c_idx, ..])
             .iter_mut()
             .zip(px.iter())
@@ -585,6 +837,92 @@ mod tests {
         assert!(valid[[0, 1]]);
     }
 
+    /// The u16 LUT fast paths must be BIT-IDENTICAL to the generic typed path.
+    /// We render the same pixel values once as U16 (LUT path) and once as F64
+    /// (generic path) and require equal encoded bytes.
+    #[test]
+    fn u16_rgb_lut_matches_generic_path() {
+        let vals: Vec<u16> = vec![
+            0, 100, 5000, 65535, // R
+            1, 200, 30000, 4242, // G
+            7, 999, 60000, 12345, // B
+        ];
+        let arr_u16 = Array3::from_shape_vec((3, 2, 2), vals.clone()).unwrap();
+        let arr_f64 =
+            Array3::from_shape_vec((3, 2, 2), vals.iter().map(|&v| v as f64).collect()).unwrap();
+        let mk_img = |pixels: PixelData| ImageData {
+            pixels,
+            mask: None,
+            bbox: Bbox::new(0.0, 0.0, 2.0, 2.0),
+            crs: Crs::epsg(3857),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 2.0, 0.0, -1.0]),
+            nodata: Some(100.0), // hits one R sample → that pixel transparent
+        };
+        let comp = Composite::from_definition(
+            &ColourDefinition::Rgb([0.0, 0.0, 0.0], [255.0, 255.0, 255.0]),
+            None,
+            None,
+        )
+        .unwrap();
+        let style = CompiledTileStyle {
+            composite: comp,
+            rescale: vec![(0.0, 10000.0), (50.0, 30000.0), (0.0, 65535.0)],
+            formula: vec![],
+            expression: vec![],
+            bidx: vec![],
+            nodata: None,
+            tile_size: 2,
+            resampling: Resampling::Nearest,
+            auto_rgb: true,
+            format: TileFormat::Png,
+            luts: Default::default(),
+        };
+        let via_lut = render(&mk_img(PixelData::U16(arr_u16)), &style).unwrap();
+        let generic = render(&mk_img(PixelData::F64(arr_f64)), &style).unwrap();
+        assert_eq!(via_lut, generic, "u16 LUT RGB path must match generic path");
+    }
+
+    #[test]
+    fn u16_single_band_gradient_lut_matches_generic_path() {
+        let vals: Vec<u16> = vec![0, 1000, 32768, 65535, 500, 9999];
+        let arr_u16 = Array3::from_shape_vec((1, 2, 3), vals.clone()).unwrap();
+        let arr_f64 =
+            Array3::from_shape_vec((1, 2, 3), vals.iter().map(|&v| v as f64).collect()).unwrap();
+        let mk_img = |pixels: PixelData| ImageData {
+            pixels,
+            mask: None,
+            bbox: Bbox::new(0.0, 0.0, 3.0, 2.0),
+            crs: Crs::epsg(3857),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 2.0, 0.0, -1.0]),
+            nodata: Some(500.0),
+        };
+        let comp = Composite::from_definition(
+            &ColourDefinition::Named("viridis".into()),
+            Some(vec![0.0]),
+            Some(vec![40000.0]),
+        )
+        .unwrap();
+        let style = CompiledTileStyle {
+            composite: comp,
+            rescale: vec![],
+            formula: vec![],
+            expression: vec![],
+            bidx: vec![],
+            nodata: None,
+            tile_size: 2,
+            resampling: Resampling::Nearest,
+            auto_rgb: false,
+            format: TileFormat::Png,
+            luts: Default::default(),
+        };
+        let via_lut = render(&mk_img(PixelData::U16(arr_u16)), &style).unwrap();
+        let generic = render(&mk_img(PixelData::F64(arr_f64)), &style).unwrap();
+        assert_eq!(
+            via_lut, generic,
+            "u16 gradient LUT path must match generic path"
+        );
+    }
+
     #[test]
     fn render_single_band_gradient_to_png() {
         let mut arr = Array3::<f64>::zeros((1, 16, 16));
@@ -618,6 +956,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
             format: TileFormat::Png,
+            luts: Default::default(),
         };
         let bytes = render(&img, &style).unwrap();
         assert!(bytes.starts_with(b"\x89PNG"));
@@ -652,6 +991,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
             format: TileFormat::Webp,
+            luts: Default::default(),
         };
         let bytes = render(&img, &style).unwrap();
         assert!(bytes.starts_with(b"RIFF"));
@@ -688,6 +1028,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
             format: TileFormat::Png,
+            luts: Default::default(),
         };
         let bytes = render(&img, &style).unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap();
@@ -722,6 +1063,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
             format: TileFormat::Png,
+            luts: Default::default(),
         };
         let bytes = render(&img, &style).unwrap();
         let rgba = image::load_from_memory(&bytes).unwrap().to_rgba8();
@@ -757,6 +1099,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
             format: TileFormat::Png,
+            luts: Default::default(),
         };
         assert!(render(&img, &style).is_err());
     }
@@ -789,6 +1132,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: false,
             format: TileFormat::Png,
+            luts: Default::default(),
         };
 
         let bytes = render(&img, &style).unwrap();
@@ -824,6 +1168,7 @@ mod tests {
             resampling: Resampling::Nearest,
             auto_rgb: true,
             format: TileFormat::Png,
+            luts: Default::default(),
         };
 
         let bytes = render(&img, &style).unwrap();
