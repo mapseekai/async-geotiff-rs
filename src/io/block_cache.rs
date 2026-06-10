@@ -215,21 +215,28 @@ impl BlockCache {
     }
 
     /// Await an in-flight block another caller is fetching.
+    ///
+    /// Returns `Ok(Some(block))` on success, `Ok(None)` when the owner aborted
+    /// without publishing (caller should retry with a fresh `claim`), or `Err`
+    /// for decode errors forwarded by the owner.
     pub(crate) async fn await_pending(
         mut rx: PendingBlock,
-    ) -> Result<Arc<DecodedBlock>, AgError> {
-        // The value may already be published.
+    ) -> Result<Option<Arc<DecodedBlock>>, AgError> {
         if let Some(v) = rx.borrow().clone() {
-            return v.map_err(|e| AgError::Tiff(format!("block decode: {e}")));
+            return v
+                .map(Some)
+                .map_err(|e| AgError::Tiff(format!("block decode: {e}")));
         }
         loop {
             if rx.changed().await.is_err() {
-                // Sender dropped without publishing: owner's fetch/decode failed
-                // or was aborted. Surface as an error; the next request retries.
-                return Err(AgError::Tiff("in-flight block fetch canceled".into()));
+                // Sender dropped without publishing: owner was aborted (client
+                // disconnect or task cancellation). Signal caller to retry.
+                return Ok(None);
             }
             if let Some(v) = rx.borrow().clone() {
-                return v.map_err(|e| AgError::Tiff(format!("block decode: {e}")));
+                return v
+                    .map(Some)
+                    .map_err(|e| AgError::Tiff(format!("block decode: {e}")));
             }
         }
     }
@@ -280,6 +287,13 @@ impl BlockCache {
             })
             .await
             .map_err(|e: Arc<AgError>| AgError::Tiff(format!("block decode: {e}")))
+    }
+
+    /// Existence check that does NOT touch the hit/miss counters. Used by the
+    /// background prefetcher, whose probes would otherwise skew the cache
+    /// stats that operators tune capacity against.
+    pub(crate) fn peek(&self, key: &BlockKey) -> bool {
+        self.inner.contains_key(key)
     }
 
     /// Probe the cache without populating it. Records a hit or miss.
@@ -515,8 +529,11 @@ mod tests {
         guard.resolve(Ok(Arc::clone(&block)));
 
         // The waiter receives the exact Arc the owner produced.
-        let got = BlockCache::await_pending(pending).await.unwrap();
-        assert!(Arc::ptr_eq(&got, &block), "waiter must get the owner's block");
+        let got = BlockCache::await_pending(pending).await.unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&got, &block),
+            "waiter must get the owner's block"
+        );
 
         // Slot is freed after resolve → a later claim owns again.
         assert!(
@@ -540,8 +557,8 @@ mod tests {
         // Owner gives up without resolving (e.g. fetch error / task abort).
         drop(guard);
         assert!(
-            BlockCache::await_pending(pending).await.is_err(),
-            "waiter must observe cancellation when owner drops"
+            BlockCache::await_pending(pending).await.unwrap().is_none(),
+            "waiter must observe Ok(None) when owner drops (signal to retry)"
         );
         assert!(
             matches!(cache.claim(&key), Claim::Owned(_)),

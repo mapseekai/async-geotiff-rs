@@ -301,6 +301,7 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
         resampling: style.resampling,
         auto_rgb,
         format: style.format,
+        luts: Default::default(),
     })
 }
 

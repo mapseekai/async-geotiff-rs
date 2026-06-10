@@ -1,6 +1,10 @@
 use std::io::SeekFrom;
 use std::path::PathBuf;
+#[cfg(feature = "perf-tracing")]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+#[cfg(feature = "perf-tracing")]
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -9,15 +13,126 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{routing::get, Router};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tracing::Instrument;
 
 use async_geotiff::error::{AgError, AgResult};
-use async_geotiff::io::{BlockCache, CogReader, ReaderConfig};
+use async_geotiff::io::{BlockCache, BlockCacheStats, CogReader, ReaderConfig};
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
 use async_geotiff::style::{TileFormat, TileStyle};
-use async_geotiff::tiler::Tiler;
+use async_geotiff::tiler::{Tiler, TilerConfig};
 use async_geotiff::tms::TileMatrixSet;
 
 const MAX_DATA_RESPONSE_BYTES: u64 = 32 << 20;
+#[cfg(feature = "perf-tracing")]
+static NEXT_TILE_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "perf-tracing")]
+fn next_tile_trace_id() -> u64 {
+    NEXT_TILE_TRACE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(feature = "perf-tracing")]
+struct TileTraceFields<'a> {
+    route: &'static str,
+    tms: &'a str,
+    tile_matrix_set: TileMatrixSet,
+    z: u8,
+    x: u32,
+    y: u32,
+    format: &'a TileFormat,
+    dataset: Option<&'a str>,
+}
+
+#[cfg(feature = "perf-tracing")]
+fn tile_trace_span(fields: TileTraceFields<'_>) -> tracing::Span {
+    tracing::info_span!(
+        "tile",
+        tile_id = next_tile_trace_id(),
+        route = fields.route,
+        tms = %fields.tms,
+        tile_matrix_set = ?fields.tile_matrix_set,
+        z = fields.z,
+        x = fields.x,
+        y = fields.y,
+        format = ?fields.format,
+        dataset = fields.dataset.unwrap_or("")
+    )
+}
+
+#[cfg(feature = "perf-tracing")]
+struct StageTimer {
+    label: &'static str,
+    started: Instant,
+    last: Instant,
+    stages: Vec<(&'static str, Duration)>,
+}
+
+#[cfg(feature = "perf-tracing")]
+impl StageTimer {
+    fn new(label: &'static str) -> Self {
+        let now = Instant::now();
+        Self {
+            label,
+            started: now,
+            last: now,
+            stages: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.stages.push((name, now.duration_since(self.last)));
+        self.last = now;
+    }
+
+    fn finish(self, outcome: &str, slow_tile_ms: Option<u64>) {
+        let stages = self
+            .stages
+            .iter()
+            .map(|(name, duration)| format!("{name}={:.2}ms", duration.as_secs_f64() * 1000.0))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let total_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+
+        if slow_tile_ms.is_some_and(|threshold| total_ms >= threshold as f64) {
+            tracing::info!(
+                label = self.label,
+                stages = %stages,
+                total_ms,
+                outcome,
+                "tile timing"
+            );
+        } else {
+            tracing::debug!(
+                label = self.label,
+                stages = %stages,
+                total_ms,
+                outcome,
+                "tile timing"
+            );
+        }
+    }
+
+    fn finish_ok_bytes(self, bytes: &bytes::Bytes, slow_tile_ms: Option<u64>) {
+        self.finish(&format!("ok {} bytes", bytes.len()), slow_tile_ms);
+    }
+}
+
+#[cfg(not(feature = "perf-tracing"))]
+struct StageTimer;
+
+#[cfg(not(feature = "perf-tracing"))]
+impl StageTimer {
+    fn new(_label: &'static str) -> Self {
+        Self
+    }
+
+    fn mark(&mut self, _name: &'static str) {}
+
+    fn finish(self, _outcome: &str, _slow_tile_ms: Option<u64>) {}
+
+    fn finish_ok_bytes(self, _bytes: &bytes::Bytes, _slow_tile_ms: Option<u64>) {}
+}
 
 /// Shared HTTP state.
 ///
@@ -40,6 +155,9 @@ pub struct AppState {
     /// One decoded-block cache shared by every per-dataset reader, so the
     /// total decode-memory budget is bounded once instead of per dataset.
     block_cache: Arc<BlockCache>,
+    max_decode_tasks: usize,
+    max_tile_tasks: usize,
+    slow_tile_ms: Option<u64>,
 }
 
 impl AppState {
@@ -58,7 +176,22 @@ impl AppState {
             http_base: http_base.into(),
             tilers: moka::future::Cache::new(64),
             block_cache,
+            max_decode_tasks: ReaderConfig::default().max_decode_tasks,
+            max_tile_tasks: TilerConfig::default().max_blocking_tasks,
+            slow_tile_ms: None,
         }
+    }
+
+    pub fn with_runtime_tuning(
+        mut self,
+        max_decode_tasks: usize,
+        max_tile_tasks: usize,
+        slow_tile_ms: Option<u64>,
+    ) -> Self {
+        self.max_decode_tasks = max_decode_tasks.max(1);
+        self.max_tile_tasks = max_tile_tasks.max(1);
+        self.slow_tile_ms = slow_tile_ms;
+        self
     }
 
     /// Attach a MosaicJSON-backed mosaic, exposed at `/mosaic/tiles/...`.
@@ -82,11 +215,15 @@ impl AppState {
             let mut cfg = ReaderConfig::default();
             cfg.source_id = name.to_string();
             cfg.block_cache = Arc::clone(&self.block_cache);
+            cfg.max_decode_tasks = self.max_decode_tasks;
+            let tiler_config = TilerConfig {
+                max_blocking_tasks: self.max_tile_tasks,
+            };
             return self
                 .tilers
                 .try_get_with(name.to_string(), async move {
                     let reader = CogReader::open_http_with_config_default(&url, cfg).await?;
-                    Ok::<_, AgError>(Arc::new(Tiler::new(Arc::new(reader))))
+                    Ok::<_, AgError>(Arc::new(Tiler::with_config(Arc::new(reader), tiler_config)))
                 })
                 .await
                 .map_err(|e: Arc<AgError>| AgError::Tiff(format!("open dataset {name}: {e}")));
@@ -118,6 +255,7 @@ pub fn router(state: AppState) -> Router {
             get(mosaic_tile_handler).options(cors_preflight),
         )
         .route("/datasets", get(datasets_handler))
+        .route("/cache/stats", get(cache_stats_handler))
         .route("/formats", get(formats_handler))
         .route("/bounds", get(bounds_handler))
         .route(
@@ -134,6 +272,7 @@ pub async fn tile_handler(
     Path((tms, z, x, ye)): Path<(String, u8, u32, String)>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let mut timer = StageTimer::new("tile");
     let (y_str, ext) = ye.split_once('.').unwrap_or((ye.as_str(), "png"));
     let path_format = match tile_format_from_extension(ext) {
         Ok(format) => format,
@@ -166,21 +305,50 @@ pub async fn tile_handler(
         Ok(s) => s,
         Err(e) => return error_response(e),
     };
+    timer.mark("parse");
 
-    let tiler = match state.tiler_for(dataset.as_deref()).await {
-        Ok(t) => t,
-        Err(e) => return error_response(e),
-    };
+    #[cfg(feature = "perf-tracing")]
+    let span = tile_trace_span(TileTraceFields {
+        route: "tile",
+        tms: &tms,
+        tile_matrix_set,
+        z,
+        x,
+        y,
+        format: &style.format,
+        dataset: dataset.as_deref(),
+    });
+    #[cfg(not(feature = "perf-tracing"))]
+    let span = tracing::Span::none();
+    async move {
+        let tiler = match state.tiler_for(dataset.as_deref()).await {
+            Ok(t) => t,
+            Err(e) => return error_response(e),
+        };
+        timer.mark("select_tiler");
 
-    match tiler.tile(tile_matrix_set, z, x, y, &style).await {
-        Ok(Some(bytes)) => {
-            with_cors(([("content-type", style.format.content_type())], bytes).into_response())
+        let result = tiler.tile(tile_matrix_set, z, x, y, &style).await;
+        timer.mark("render");
+
+        match result {
+            Ok(Some(bytes)) => {
+                timer.finish_ok_bytes(&bytes, state.slow_tile_ms);
+                with_cors(([("content-type", style.format.content_type())], bytes).into_response())
+            }
+            // Tile fully outside the dataset -> no content, so the map draws nothing
+            // there (a black JPEG would otherwise cover out-of-range areas).
+            Ok(None) => {
+                timer.finish("no_content", state.slow_tile_ms);
+                with_cors(StatusCode::NO_CONTENT.into_response())
+            }
+            Err(e) => {
+                timer.finish("error", state.slow_tile_ms);
+                error_response(e)
+            }
         }
-        // Tile fully outside the dataset → no content, so the map draws nothing
-        // there (a black JPEG would otherwise cover out-of-range areas).
-        Ok(None) => with_cors(StatusCode::NO_CONTENT.into_response()),
-        Err(e) => error_response(e),
     }
+    .instrument(span)
+    .await
 }
 
 fn parse_pixel_selection(s: &str) -> Option<PixelSelection> {
@@ -203,6 +371,7 @@ pub async fn mosaic_tile_handler(
     Path((tms, z, x, ye)): Path<(String, u8, u32, String)>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let mut timer = StageTimer::new("mosaic_tile");
     let Some(mosaic) = state.mosaic.clone() else {
         return with_cors(
             (
@@ -256,18 +425,45 @@ pub async fn mosaic_tile_handler(
         Ok(s) => s,
         Err(e) => return error_response(e),
     };
+    timer.mark("parse");
 
-    match mosaic
-        .tile(tile_matrix_set, z, x, y, selection, &style)
-        .await
-    {
-        Ok(Some(bytes)) => {
-            with_cors(([("content-type", style.format.content_type())], bytes).into_response())
+    #[cfg(feature = "perf-tracing")]
+    let span = tile_trace_span(TileTraceFields {
+        route: "mosaic_tile",
+        tms: &tms,
+        tile_matrix_set,
+        z,
+        x,
+        y,
+        format: &style.format,
+        dataset: None,
+    });
+    #[cfg(not(feature = "perf-tracing"))]
+    let span = tracing::Span::none();
+    async move {
+        let result = mosaic
+            .tile(tile_matrix_set, z, x, y, selection, &style)
+            .await;
+        timer.mark("render");
+
+        match result {
+            Ok(Some(bytes)) => {
+                timer.finish_ok_bytes(&bytes, state.slow_tile_ms);
+                with_cors(([("content-type", style.format.content_type())], bytes).into_response())
+            }
+            // No asset covers this tile -> no content (map draws nothing here).
+            Ok(None) => {
+                timer.finish("no_content", state.slow_tile_ms);
+                with_cors(StatusCode::NO_CONTENT.into_response())
+            }
+            Err(e) => {
+                timer.finish("error", state.slow_tile_ms);
+                error_response(e)
+            }
         }
-        // No asset covers this tile → no content (map draws nothing here).
-        Ok(None) => with_cors(StatusCode::NO_CONTENT.into_response()),
-        Err(e) => error_response(e),
     }
+    .instrument(span)
+    .await
 }
 
 fn tile_format_from_extension(ext: &str) -> AgResult<TileFormat> {
@@ -320,6 +516,29 @@ pub async fn datasets_handler(State(state): State<AppState>) -> Response {
                 .into_response(),
         ),
     }
+}
+
+/// `GET /cache/stats` -> current decoded-block cache counters.
+pub async fn cache_stats_handler(State(state): State<AppState>) -> Response {
+    with_cors(
+        (
+            [("content-type", "application/json")],
+            cache_stats_json(&state.block_cache.stats()),
+        )
+            .into_response(),
+    )
+}
+
+fn cache_stats_json(stats: &BlockCacheStats) -> String {
+    serde_json::json!({
+        "decoded": stats.decoded,
+        "entries": stats.entries,
+        "fetched": stats.fetched,
+        "hits": stats.hits,
+        "misses": stats.misses,
+        "resident_bytes": stats.resident_bytes,
+    })
+    .to_string()
 }
 
 /// `GET /formats` -> JSON array of the tile output formats this build can
@@ -572,6 +791,32 @@ mod tests {
         let block_cache = Arc::new(BlockCache::new(async_geotiff::io::CacheConfig::default()));
         let state = AppState::new(None, None, Vec::new(), "http://127.0.0.1:0", block_cache);
         let _router = router(state);
+    }
+
+    #[test]
+    fn cache_stats_json_exposes_hit_miss_and_resident_bytes() {
+        let body = cache_stats_json(&async_geotiff::io::BlockCacheStats {
+            hits: 10,
+            misses: 4,
+            decoded: 3,
+            fetched: 3,
+            entries: 2,
+            resident_bytes: 4096,
+        });
+
+        assert_eq!(
+            body,
+            r#"{"decoded":3,"entries":2,"fetched":3,"hits":10,"misses":4,"resident_bytes":4096}"#
+        );
+    }
+
+    #[cfg(feature = "perf-tracing")]
+    #[test]
+    fn tile_trace_ids_increase_monotonically() {
+        let first = next_tile_trace_id();
+        let second = next_tile_trace_id();
+
+        assert_eq!(second, first + 1);
     }
 
     #[test]

@@ -5,14 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
+#[cfg(feature = "perf-tracing")]
+use std::time::Instant;
 
-use async_tiff::metadata::{cache::ReadaheadMetadataCache, TiffMetadataReader};
-use async_tiff::reader::ObjectReader;
-use async_tiff::tags::PhotometricInterpretation;
-use async_tiff::{ImageFileDirectory, TIFF};
-use object_store::http::HttpBuilder;
-use object_store::path::Path;
-use object_store::{ClientOptions, ObjectStore};
 use crate::blocking::{default_blocking_permits, CpuLimiter};
 use crate::bounds::{Bbox, GeoTransform};
 use crate::crs::Crs;
@@ -22,13 +17,35 @@ use crate::io::block_cache::{
 };
 use crate::io::cache::CacheConfig;
 use crate::io::window::{tile_range_for_window, validate_window_shape, IfdInfo};
+#[cfg(feature = "perf-tracing")]
+use crate::perf::duration_ms;
 use crate::pixel::{ImageData, PixelData};
+use async_tiff::metadata::{cache::ReadaheadMetadataCache, TiffMetadataReader};
+use async_tiff::reader::ObjectReader;
+use async_tiff::tags::PhotometricInterpretation;
+use async_tiff::{ImageFileDirectory, TIFF};
 use ndarray::Array2;
+use object_store::http::HttpBuilder;
+use object_store::path::Path;
+use object_store::{ClientOptions, ObjectStore};
 
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 const TEST_OVERVIEW_PYRAMID: [f64; 4] = [10.0, 20.0, 40.0, 80.0];
+
+/// Stitched outputs at or below this size are assembled inline on the async
+/// thread instead of through `spawn_blocking`. Stitching is memcpy-bound and
+/// output-size-proportional; for tile-size windows (a 256×256×3 u16 window +
+/// mask is ~460 KiB) the copy costs tens of microseconds — less than the
+/// dispatch + CPU-permit round-trip it would otherwise pay. 1 MiB keeps the
+/// worst inline stall around ~100 µs, well under Tokio's blocking guidance.
+const INLINE_STITCH_MAX_BYTES: u64 = 1 << 20;
+
+/// Max concurrent background prefetch tasks per reader. When the budget is
+/// exhausted, new windows simply skip prefetching — the foreground path is
+/// never delayed by speculation.
+const MAX_PREFETCH_TASKS: usize = 2;
 
 /// Runtime limits for a [`CogReader`].
 ///
@@ -52,6 +69,16 @@ pub struct ReaderConfig {
     /// (and their [`Tiler`]s) to bound the whole process/mosaic to one CPU
     /// budget — see [`crate::blocking::CpuLimiter`]. [`Tiler`]: crate::tiler::Tiler
     pub cpu_limiter: Option<CpuLimiter>,
+    /// Speculative block prefetch radius, in native COG blocks. After each
+    /// `read_window`, the blocks in a ring of this width around the window
+    /// are fetched + decoded into the shared block cache in the background —
+    /// map-browsing patterns make those exactly the blocks the neighbouring
+    /// XYZ tiles need next, turning their cold misses into warm hits.
+    ///
+    /// `0` (the default) disables prefetch. Each ring step issues extra
+    /// object-store GETs, so leave it off for pay-per-request storage unless
+    /// the latency win is worth it; `1` is the sweet spot for tile serving.
+    pub prefetch_ring: u8,
 }
 
 impl Default for ReaderConfig {
@@ -61,6 +88,7 @@ impl Default for ReaderConfig {
             source_id: format!("cog-{}", NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed)),
             block_cache: Arc::new(BlockCache::new(CacheConfig::default())),
             cpu_limiter: None,
+            prefetch_ring: 0,
         }
     }
 }
@@ -92,6 +120,10 @@ pub struct CogReader {
     /// Shared CPU-job limiter, covering decode + stitch here and warp + render
     /// in the [`Tiler`] built from this reader. [`Tiler`]: crate::tiler::Tiler
     cpu: CpuLimiter,
+    /// Ring width (in blocks) for speculative neighbour prefetch; 0 = off.
+    prefetch_ring: u8,
+    /// Number of live background prefetch tasks; bounds prefetch fan-out.
+    prefetch_inflight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CogReader {
@@ -226,6 +258,8 @@ impl CogReader {
                 .cpu_limiter
                 .clone()
                 .unwrap_or_else(|| CpuLimiter::new(config.decode_task_limit())),
+            prefetch_ring: config.prefetch_ring,
+            prefetch_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -393,6 +427,8 @@ impl CogReader {
         width: u64,
         height: u64,
     ) -> AgResult<Arc<ImageData>> {
+        #[cfg(feature = "perf-tracing")]
+        let started = Instant::now();
         validate_window_shape(width, height)?;
         checked_window_end(col_off, width, "column")?;
         checked_window_end(row_off, height, "row")?;
@@ -400,12 +436,19 @@ impl CogReader {
         let ifd = self.data_ifd(level)?;
         let ((tx0, tx1), (ty0, ty1)) = tile_range_for_window(ifd, col_off, row_off, width, height)
             .ok_or_else(|| AgError::Tiff("ifd lacks tile dims".into()))?;
-        let coords: Vec<(usize, usize)> = (tx0..=tx1)
-            .flat_map(|x| (ty0..=ty1).map(move |y| (x as usize, y as usize)))
-            .collect();
+        let tile_cols = (tx1 - tx0 + 1) as usize;
+        let tile_rows = (ty1 - ty0 + 1) as usize;
+        let mut coords = Vec::with_capacity(tile_cols.saturating_mul(tile_rows));
+        for x in tx0..=tx1 {
+            for y in ty0..=ty1 {
+                coords.push((x as usize, y as usize));
+            }
+        }
         let data_info = IfdInfo::from(ifd);
 
         let mask_ifd = self.mask_ifd(level)?;
+        #[cfg(feature = "perf-tracing")]
+        let plan_done = started.elapsed();
         let (data_blocks, mask_blocks) = if let Some(mask_ifd) = mask_ifd {
             let mask_info = IfdInfo::from(mask_ifd);
             let data_blocks = self.blocks_for(level, BlockKind::Data, ifd, &coords);
@@ -419,45 +462,227 @@ impl CogReader {
                 None,
             )
         };
-        let stitched = {
+        // Foreground blocks are resolved — speculatively warm the surrounding
+        // block ring in the background. It overlaps the stitch/warp/render
+        // below and turns the neighbouring XYZ tiles' cold misses into hits.
+        self.maybe_spawn_prefetch(level, (tx0, tx1), (ty0, ty1));
+        #[cfg(feature = "perf-tracing")]
+        let blocks_done = started.elapsed();
+        #[cfg(feature = "perf-tracing")]
+        let data_stitch_started = Instant::now();
+        #[cfg(feature = "perf-tracing")]
+        let mut data_stitch_cpu_wait_ms = Duration::ZERO;
+        // Fused stitch: ONE pass builds both the data and the mask windows.
+        // Previously this was two sequential spawn_blocking jobs, each paying
+        // its own dispatch latency and CPU-permit wait. Additionally, tile-size
+        // windows are memcpy-bound and cost less than the spawn_blocking
+        // dispatch itself, so small outputs stitch inline on the async thread.
+        // Estimated stitched output footprint: planar data + 1-byte mask cells.
+        let elem_bytes = data_blocks
+            .first()
+            .and_then(|b| b.array().data_type())
+            .map(|dt| dt.size() as u64)
+            .unwrap_or(8);
+        let est_out_bytes = (data_info.bands as u64)
+            .saturating_mul(width)
+            .saturating_mul(height)
+            .saturating_mul(elem_bytes)
+            .saturating_add(if mask_blocks.is_some() {
+                width.saturating_mul(height)
+            } else {
+                0
+            });
+        let stitch_all = {
             let coords2 = coords.clone();
             let info = data_info;
             let (w, h) = (width, height);
             let (co, ro) = (col_off, row_off);
+            move || -> AgResult<(PixelData, Option<Array2<bool>>)> {
+                let refs: Vec<&async_tiff::Array> = data_blocks.iter().map(|b| b.array()).collect();
+                let stitched =
+                    crate::io::window::stitch_with_info(&refs, &coords2, &info, co, ro, w, h)?;
+                let mask = match &mask_blocks {
+                    Some((mask_blocks, mask_info)) => {
+                        let refs: Vec<&async_tiff::Array> =
+                            mask_blocks.iter().map(|b| b.array()).collect();
+                        Some(crate::io::window::stitch_mask_with_info(
+                            &refs, &coords2, mask_info, co, ro, w, h,
+                        )?)
+                    }
+                    None => None,
+                };
+                Ok((stitched, mask))
+            }
+        };
+        let (stitched, mask) = if est_out_bytes <= INLINE_STITCH_MAX_BYTES {
+            // Small window (typical 256/512 px tile): the copy is cheaper than
+            // a spawn_blocking round-trip + permit wait — run it inline.
+            stitch_all()?
+        } else {
+            #[cfg(feature = "perf-tracing")]
+            let wait_started = Instant::now();
             let permit = self.cpu.acquire().await?;
-            // Move the Arc<DecodedBlock> handles (no pixel copy) into the
-            // blocking job and stitch from references built INSIDE the closure.
+            crate::perf_trace! {
+                data_stitch_cpu_wait_ms = wait_started.elapsed();
+            }
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let refs: Vec<&async_tiff::Array> = data_blocks.iter().map(|b| b.array()).collect();
-                crate::io::window::stitch_with_info(&refs, &coords2, &info, co, ro, w, h)
+                stitch_all()
             })
             .await
             .map_err(|e| AgError::Tiff(format!("join: {e}")))??
         };
+        #[cfg(feature = "perf-tracing")]
+        let data_stitch_ms = data_stitch_started.elapsed();
+        #[cfg(feature = "perf-tracing")]
+        let data_stitch_job_ms = data_stitch_ms.saturating_sub(data_stitch_cpu_wait_ms);
+        #[cfg(feature = "perf-tracing")]
+        let mask_stitch_ms = Duration::ZERO;
+        #[cfg(feature = "perf-tracing")]
+        let mask_stitch_cpu_wait_ms = Duration::ZERO;
+        #[cfg(feature = "perf-tracing")]
+        let mask_stitch_job_ms = Duration::ZERO;
 
-        let mask = if let Some((mask_blocks, mask_info)) = mask_blocks {
-            let coords2 = coords.clone();
-            let (w, h) = (width, height);
-            let (co, ro) = (col_off, row_off);
-            let permit = self.cpu.acquire().await?;
-            let m = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let refs: Vec<&async_tiff::Array> = mask_blocks.iter().map(|b| b.array()).collect();
-                crate::io::window::stitch_mask_with_info(&refs, &coords2, &mask_info, co, ro, w, h)
-            })
-            .await
-            .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
-            Some(m)
-        } else {
-            None
-        };
-
+        #[cfg(feature = "perf-tracing")]
+        let assemble_started = Instant::now();
         let image = self.assemble_image(level, stitched, mask, col_off, row_off, width, height)?;
-        tracing::debug!(level, tiles = coords.len(), "read_window (block cache)");
+        #[cfg(feature = "perf-tracing")]
+        let assemble_ms = assemble_started.elapsed();
+        crate::perf_trace! {
+            tracing::debug!(
+                level,
+                tiles = coords.len(),
+                plan_ms = duration_ms(plan_done),
+                blocks_ms = duration_ms(blocks_done - plan_done),
+                data_stitch_ms = duration_ms(data_stitch_ms),
+                data_stitch_cpu_wait_ms = duration_ms(data_stitch_cpu_wait_ms),
+                data_stitch_job_ms = duration_ms(data_stitch_job_ms),
+                mask_stitch_ms = duration_ms(mask_stitch_ms),
+                mask_stitch_cpu_wait_ms = duration_ms(mask_stitch_cpu_wait_ms),
+                mask_stitch_job_ms = duration_ms(mask_stitch_job_ms),
+                assemble_ms = duration_ms(assemble_ms),
+                total_ms = duration_ms(started.elapsed()),
+                "read_window timing"
+            );
+        }
         Ok(Arc::new(image))
     }
+}
 
+/// Block coordinates of the `ring`-wide frame around the inclusive tile range
+/// `(tx0..=tx1, ty0..=ty1)`, clamped to the IFD's tile grid and excluding the
+/// inner (already-read) rectangle.
+fn ring_coords(
+    info: &IfdInfo,
+    (tx0, tx1): (u32, u32),
+    (ty0, ty1): (u32, u32),
+    ring: i64,
+) -> Vec<(usize, usize)> {
+    if info.tile_width == 0 || info.tile_height == 0 {
+        return Vec::new();
+    }
+    let max_tx = i64::from((info.image_width.saturating_sub(1)) / info.tile_width);
+    let max_ty = i64::from((info.image_height.saturating_sub(1)) / info.tile_height);
+    let (itx0, itx1) = (i64::from(tx0), i64::from(tx1));
+    let (ity0, ity1) = (i64::from(ty0), i64::from(ty1));
+    let x0 = (itx0 - ring).max(0);
+    let x1 = (itx1 + ring).min(max_tx);
+    let y0 = (ity0 - ring).max(0);
+    let y1 = (ity1 + ring).min(max_ty);
+    let mut out = Vec::new();
+    for x in x0..=x1 {
+        for y in y0..=y1 {
+            let inside = (itx0..=itx1).contains(&x) && (ity0..=ity1).contains(&y);
+            if !inside {
+                out.push((x as usize, y as usize));
+            }
+        }
+    }
+    out
+}
+
+/// Best-effort fetch + decode of `coords` into the shared block cache.
+///
+/// Already-cached blocks are skipped via a non-counting [`BlockCache::peek`]
+/// (so prefetch probes don't skew hit/miss stats), and blocks another caller is
+/// already fetching are skipped via [`BlockCache::claim`] dedup. One coalesced
+/// `fetch_tiles` covers all claimed blocks; decodes run one at a time under the
+/// shared CPU limiter so speculation never floods the foreground decode budget.
+/// All errors are logged at debug and swallowed — a failed prefetch must never
+/// surface anywhere; dropped claim guards let foreground waiters retry fresh.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_blocks(
+    ifd: &ImageFileDirectory,
+    kind: BlockKind,
+    level: usize,
+    coords: &[(usize, usize)],
+    source: &Arc<str>,
+    cache: &Arc<BlockCache>,
+    cpu: &CpuLimiter,
+    reader: &ObjectReader,
+) {
+    let mut owned: Vec<(BlockKey, InflightGuard)> = Vec::new();
+    let mut fetch_coords: Vec<(usize, usize)> = Vec::new();
+    for &(tx, ty) in coords {
+        let key = BlockKey {
+            source: Arc::clone(source),
+            level: level as u32,
+            kind,
+            tx: tx as u32,
+            ty: ty as u32,
+        };
+        if cache.peek(&key) {
+            continue;
+        }
+        match cache.claim(&key) {
+            Claim::Owned(guard) => {
+                owned.push((key, guard));
+                fetch_coords.push((tx, ty));
+            }
+            // A foreground request (or another prefetch) is on it already.
+            Claim::Pending(_) => {}
+        }
+    }
+    if owned.is_empty() {
+        return;
+    }
+    cache.record_fetched(fetch_coords.len() as u64);
+    let tiles = match ifd.fetch_tiles(&fetch_coords, reader).await {
+        Ok(t) => t,
+        Err(e) => {
+            // Guards drop unresolved → any waiters observe a cancel and retry.
+            tracing::debug!(error = %e, kind = ?kind, "block prefetch fetch failed");
+            return;
+        }
+    };
+    for ((key, guard), tile) in owned.into_iter().zip(tiles.into_iter()) {
+        let cpu = cpu.clone();
+        let res: AgResult<Arc<DecodedBlock>> = cache
+            .try_get_with(key, async move {
+                let permit = cpu.acquire().await?;
+                let arr = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    crate::io::decode::decode_one(tile)
+                })
+                .await
+                .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+                Ok(DecodedBlock::new(arr))
+            })
+            .await;
+        match res {
+            Ok(block) => guard.resolve(Ok(block)),
+            Err(e) => {
+                // Same error-forwarding semantics as the foreground path: a
+                // decode error is deterministic for this block, so publishing
+                // it to waiters matches what their own decode would produce.
+                tracing::debug!(error = %e, kind = ?kind, "block prefetch decode failed");
+                guard.resolve(Err(Arc::new(e)));
+            }
+        }
+    }
+}
+
+impl CogReader {
     /// Resolve every `(tx, ty)` in `coords` to a decoded block. Probes the
     /// shared cache first, issues ONE coalesced `fetch_tiles` for the misses,
     /// then decodes each miss exactly once via the cache's single-flight.
@@ -468,19 +693,21 @@ impl CogReader {
         ifd: &ImageFileDirectory,
         coords: &[(usize, usize)],
     ) -> AgResult<Vec<Arc<DecodedBlock>>> {
-        let keys: Vec<BlockKey> = coords
-            .iter()
-            .map(|&(tx, ty)| BlockKey {
+        #[cfg(feature = "perf-tracing")]
+        let started = Instant::now();
+        let mut keys = Vec::with_capacity(coords.len());
+        for &(tx, ty) in coords {
+            keys.push(BlockKey {
                 source: Arc::clone(&self.source_id),
                 level: level as u32,
                 kind,
                 tx: tx as u32,
                 ty: ty as u32,
-            })
-            .collect();
+            });
+        }
         let mut resolved: Vec<Option<Arc<DecodedBlock>>> = Vec::with_capacity(keys.len());
-        let mut miss_idx: Vec<usize> = Vec::new();
-        let mut miss_coords: Vec<(usize, usize)> = Vec::new();
+        let mut miss_idx: Vec<usize> = Vec::with_capacity(keys.len());
+        let mut miss_coords: Vec<(usize, usize)> = Vec::with_capacity(keys.len());
         for (i, k) in keys.iter().enumerate() {
             match self.block_cache.get(k).await {
                 Some(b) => resolved.push(Some(b)),
@@ -491,50 +718,112 @@ impl CogReader {
                 }
             }
         }
-        if !miss_coords.is_empty() {
-            // Claim each missing block. This caller fetches the blocks it owns;
-            // blocks a concurrent request is already fetching are awaited via
-            // their in-flight channel instead of being fetched again. This
-            // single-flights the network range GET across requests, not just the
-            // decode (which moka already coalesces).
+        #[cfg(feature = "perf-tracing")]
+        let cache_probe_done = started.elapsed();
+        #[cfg(feature = "perf-tracing")]
+        let cache_hits = keys.len().saturating_sub(miss_idx.len());
+        #[cfg(feature = "perf-tracing")]
+        let mut owned_count = 0usize;
+        #[cfg(feature = "perf-tracing")]
+        let mut pending_count = 0usize;
+        #[cfg(feature = "perf-tracing")]
+        let mut fetch_ms = Duration::ZERO;
+        #[cfg(feature = "perf-tracing")]
+        let mut decode_ms = Duration::ZERO;
+        #[cfg(feature = "perf-tracing")]
+        let mut pending_wait_ms = Duration::ZERO;
+
+        // Retry loop: claim → fetch+resolve owned → await pending.
+        // Pending waiters that observe Ok(None) (owner aborted) re-enter the
+        // next pass with a fresh claim instead of propagating a 500 to the caller.
+        // Each pass preserves the deadlock-freedom invariant: all owned guards are
+        // resolved (JoinSet drained) before any pending awaits begin.
+        const MAX_CANCEL_RETRIES: u8 = 3;
+        let mut retry: Vec<(usize, (usize, usize))> = miss_idx
+            .iter()
+            .zip(miss_coords.iter())
+            .map(|(&mi, &coord)| (mi, coord))
+            .collect();
+        let mut cancel_attempts: u8 = 0;
+
+        while !retry.is_empty() {
             let mut to_fetch: Vec<(usize, (usize, usize), InflightGuard)> = Vec::new();
-            let mut pending: Vec<(usize, PendingBlock)> = Vec::new();
-            for (&mi, &coord) in miss_idx.iter().zip(miss_coords.iter()) {
+            let mut pending: Vec<(usize, (usize, usize), PendingBlock)> = Vec::new();
+            for &(mi, coord) in &retry {
                 match self.block_cache.claim(&keys[mi]) {
                     Claim::Owned(guard) => to_fetch.push((mi, coord, guard)),
-                    Claim::Pending(rx) => pending.push((mi, rx)),
+                    Claim::Pending(rx) => pending.push((mi, coord, rx)),
                 }
+            }
+            crate::perf_trace! {
+                owned_count += to_fetch.len();
+                pending_count += pending.len();
             }
 
             if !to_fetch.is_empty() {
                 // One coalesced fetch for only the blocks we own (object_store
                 // merges adjacent ranges). On error, the guards drop → waiters
-                // observe cancellation and retry.
+                // observe Ok(None) and retry.
                 let fetch_coords: Vec<(usize, usize)> =
                     to_fetch.iter().map(|(_, c, _)| *c).collect();
                 self.block_cache.record_fetched(fetch_coords.len() as u64);
+                #[cfg(feature = "perf-tracing")]
+                let fetch_started = Instant::now();
                 let tiles = ifd
                     .fetch_tiles(&fetch_coords, &self.reader)
                     .await
                     .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
+                crate::perf_trace! {
+                    fetch_ms += fetch_started.elapsed();
+                }
                 // Decode owned misses CONCURRENTLY (bounded by the CPU limiter).
                 // `try_get_with` single-flights each block's decode + insert;
                 // the guard then publishes the result to any waiters.
                 let mut set = tokio::task::JoinSet::new();
                 for ((mi, _coord, guard), tile) in to_fetch.into_iter().zip(tiles.into_iter()) {
                     let key = keys[mi].clone();
+                    #[cfg(feature = "perf-tracing")]
+                    let log_level = key.level;
+                    #[cfg(feature = "perf-tracing")]
+                    let log_kind = key.kind;
+                    #[cfg(feature = "perf-tracing")]
+                    let log_tx = key.tx;
+                    #[cfg(feature = "perf-tracing")]
+                    let log_ty = key.ty;
                     let sem = self.cpu.clone();
                     let cache = Arc::clone(&self.block_cache);
                     set.spawn(async move {
                         let block_res: AgResult<Arc<DecodedBlock>> = cache
                             .try_get_with(key, async move {
+                                #[cfg(feature = "perf-tracing")]
+                                let decode_started = Instant::now();
+                                #[cfg(feature = "perf-tracing")]
+                                let wait_started = Instant::now();
                                 let permit = sem.acquire().await?;
+                                #[cfg(feature = "perf-tracing")]
+                                let cpu_wait_ms = wait_started.elapsed();
+                                #[cfg(feature = "perf-tracing")]
+                                let job_started = Instant::now();
                                 let arr = tokio::task::spawn_blocking(move || {
                                     let _permit = permit;
                                     crate::io::decode::decode_one(tile)
                                 })
                                 .await
                                 .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
+                                #[cfg(feature = "perf-tracing")]
+                                let decode_job_ms = job_started.elapsed();
+                                crate::perf_trace! {
+                                    tracing::debug!(
+                                        level = log_level,
+                                        kind = ?log_kind,
+                                        tx = log_tx,
+                                        ty = log_ty,
+                                        cpu_wait_ms = duration_ms(cpu_wait_ms),
+                                        decode_job_ms = duration_ms(decode_job_ms),
+                                        total_ms = duration_ms(decode_started.elapsed()),
+                                        "decode_block timing"
+                                    );
+                                }
                                 Ok(DecodedBlock::new(arr))
                             })
                             .await;
@@ -548,10 +837,15 @@ impl CogReader {
                         block_res.map(|b| (mi, b))
                     });
                 }
+                #[cfg(feature = "perf-tracing")]
+                let decode_started = Instant::now();
                 while let Some(res) = set.join_next().await {
                     let (mi, block) =
                         res.map_err(|e| AgError::Tiff(format!("decode task: {e}")))??;
                     resolved[mi] = Some(block);
+                }
+                crate::perf_trace! {
+                    decode_ms += decode_started.elapsed();
                 }
             }
 
@@ -561,14 +855,110 @@ impl CogReader {
             // and waits on {3} while request B owns {3} and waits on {1,2}: both
             // publish their owned results before blocking on the other's, so
             // neither stalls. Do NOT move pending awaits before the JoinSet drain.
-            for (mi, rx) in pending {
-                resolved[mi] = Some(BlockCache::await_pending(rx).await?);
+            #[cfg(feature = "perf-tracing")]
+            let pending_started = Instant::now();
+            let mut next_retry: Vec<(usize, (usize, usize))> = Vec::new();
+            for (mi, coord, rx) in pending {
+                match BlockCache::await_pending(rx).await {
+                    Ok(Some(block)) => {
+                        resolved[mi] = Some(block);
+                    }
+                    Ok(None) => {
+                        // Owner aborted (disconnect/cancellation): re-claim next pass.
+                        next_retry.push((mi, coord));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
+            crate::perf_trace! {
+                pending_wait_ms += pending_started.elapsed();
+            }
+
+            if !next_retry.is_empty() {
+                cancel_attempts += 1;
+                if cancel_attempts >= MAX_CANCEL_RETRIES {
+                    return Err(AgError::Tiff(
+                        "in-flight block fetch canceled after retries".into(),
+                    ));
+                }
+            }
+            retry = next_retry;
+        }
+        crate::perf_trace! {
+            tracing::debug!(
+                level,
+                kind = ?kind,
+                requested = keys.len(),
+                cache_hits,
+                cache_misses = miss_idx.len(),
+                owned = owned_count,
+                pending = pending_count,
+                cache_probe_ms = duration_ms(cache_probe_done),
+                fetch_ms = duration_ms(fetch_ms),
+                decode_ms = duration_ms(decode_ms),
+                pending_wait_ms = duration_ms(pending_wait_ms),
+                total_ms = duration_ms(started.elapsed()),
+                "blocks_for timing"
+            );
         }
         resolved
             .into_iter()
             .map(|b| b.ok_or_else(|| AgError::Tiff("block unresolved after fetch".into())))
             .collect()
+    }
+
+    /// Spawn (at most [`MAX_PREFETCH_TASKS`] concurrently) a detached task that
+    /// fetches + decodes the block ring around the window just read. Best-effort
+    /// by design: it never blocks or fails the foreground request, dedups with
+    /// in-flight foreground fetches via [`BlockCache::claim`], decodes one block
+    /// at a time (gentle on the shared CPU budget), and skips entirely when the
+    /// task budget is exhausted.
+    fn maybe_spawn_prefetch(&self, level: usize, tx_range: (u32, u32), ty_range: (u32, u32)) {
+        use std::sync::atomic::AtomicUsize;
+        if self.prefetch_ring == 0 {
+            return;
+        }
+        if self
+            .prefetch_inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < MAX_PREFETCH_TASKS).then_some(n + 1)
+            })
+            .is_err()
+        {
+            return;
+        }
+        /// Decrements the in-flight counter however the task ends.
+        struct Slot(Arc<AtomicUsize>);
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let slot = Slot(Arc::clone(&self.prefetch_inflight));
+
+        let ring = i64::from(self.prefetch_ring);
+        let mut targets: Vec<(BlockKind, ImageFileDirectory)> = Vec::with_capacity(2);
+        match self.data_ifd(level) {
+            Ok(ifd) => targets.push((BlockKind::Data, ifd.clone())),
+            Err(_) => return, // slot decrements via drop
+        }
+        if let Ok(Some(mask_ifd)) = self.mask_ifd(level) {
+            targets.push((BlockKind::Mask, mask_ifd.clone()));
+        }
+        let reader = self.reader.clone();
+        let cache = Arc::clone(&self.block_cache);
+        let cpu = self.cpu.clone();
+        let source = Arc::clone(&self.source_id);
+        tokio::spawn(async move {
+            let _slot = slot;
+            for (kind, ifd) in targets {
+                let coords = ring_coords(&IfdInfo::from(&ifd), tx_range, ty_range, ring);
+                if coords.is_empty() {
+                    continue;
+                }
+                prefetch_blocks(&ifd, kind, level, &coords, &source, &cache, &cpu, &reader).await;
+            }
+        });
     }
 
     /// Build the `ImageData` from a stitched window: applies alpha-band → mask
@@ -902,6 +1292,95 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[test]
+    fn ring_coords_clamps_to_grid_and_excludes_inner_rect() {
+        use crate::io::window::IfdInfo;
+        use async_tiff::tags::PlanarConfiguration;
+        // 4×4 block grid (1024/256), window = block (0,0), ring = 1.
+        let info = IfdInfo {
+            tile_width: 256,
+            tile_height: 256,
+            bands: 3,
+            planar: PlanarConfiguration::Planar,
+            image_width: 1024,
+            image_height: 1024,
+        };
+        let mut got = super::ring_coords(&info, (0, 0), (0, 0), 1);
+        got.sort_unstable();
+        // Corner window: only the 3 in-grid neighbours; (−1, *) clamped away.
+        assert_eq!(got, vec![(0, 1), (1, 0), (1, 1)]);
+
+        // Interior window gets the full 8-neighbour ring.
+        let mut got = super::ring_coords(&info, (1, 1), (1, 1), 1);
+        got.sort_unstable();
+        assert_eq!(got.len(), 8);
+        assert!(!got.contains(&(1, 1)), "inner rect must be excluded");
+
+        // Window already covering the whole grid → nothing to prefetch.
+        assert!(super::ring_coords(&info, (0, 3), (0, 3), 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn prefetch_ring_warms_neighbor_blocks() {
+        use crate::io::block_cache::BlockCache;
+        use crate::io::cache::CacheConfig;
+        use crate::io::window::IfdInfo;
+        use async_tiff::reader::ObjectReader;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as OsPath;
+
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("data/cog_uint8_rgb_nodata.tif");
+        if !tif.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
+        let os_path = OsPath::from_filesystem_path(&tif).unwrap();
+        let reader = ObjectReader::new(std::sync::Arc::new(LocalFileSystem::new()), os_path);
+        let cog = CogReader::open_with_reader_and_config(
+            reader,
+            ReaderConfig {
+                source_id: "prefetch-test".into(),
+                block_cache: std::sync::Arc::clone(&cache),
+                prefetch_ring: 1,
+                ..ReaderConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Need at least a 2-block grid at level 0 for a ring to exist.
+        let info = IfdInfo::from(cog.data_ifd(0).unwrap());
+        let ring = super::ring_coords(&info, (0, 0), (0, 0), 1);
+        if ring.is_empty() {
+            eprintln!("fixture is single-block at level 0, skipping");
+            return;
+        }
+
+        // Read a window inside block (0, 0) only.
+        cog.read_window(0, 0, 0, 16, 16).await.unwrap();
+
+        // The detached prefetch task should eventually decode the ring blocks
+        // (data kind at minimum). Poll with a deadline; no decode budget
+        // contention exists in this test so it resolves in milliseconds.
+        let want = 1 + ring.len() as u64; // foreground block + its ring
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let stats = cache.stats();
+            if stats.decoded >= want {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prefetch did not warm ring blocks in time: decoded={} want>={want}",
+                stats.decoded
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

@@ -17,22 +17,160 @@ use std::sync::Arc;
 use async_geotiff::crs::Crs;
 use async_geotiff::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler};
-use async_geotiff::tiler::Tiler;
+use async_geotiff::tiler::{Tiler, TilerConfig};
 use async_geotiff::warp::Projector;
 use axum::{response::Html, routing::get};
 
 #[path = "serve/server.rs"]
 mod server;
 
+struct ServerRuntimeConfig {
+    block_cache: CacheConfig,
+    reader: ReaderConfig,
+    tiler: TilerConfig,
+    slow_tile_ms: Option<u64>,
+}
+
+impl ServerRuntimeConfig {
+    fn from_env() -> Result<Self, String> {
+        Self::from_env_values(|key| std::env::var(key).ok())
+    }
+
+    fn from_env_values(mut get: impl FnMut(&str) -> Option<String>) -> Result<Self, String> {
+        let mut block_cache = CacheConfig::default();
+        let mut reader = ReaderConfig::default();
+        let mut tiler = TilerConfig::default();
+
+        if let Some(mb) = parse_positive_u64_env(
+            "ASYNC_GEOTIFF_BLOCK_CACHE_MB",
+            get("ASYNC_GEOTIFF_BLOCK_CACHE_MB"),
+        )? {
+            block_cache.max_bytes = mb
+                .checked_shl(20)
+                .ok_or_else(|| "ASYNC_GEOTIFF_BLOCK_CACHE_MB is too large".to_string())?;
+        }
+        if let Some(tasks) = parse_positive_usize_env(
+            "ASYNC_GEOTIFF_MAX_DECODE_TASKS",
+            get("ASYNC_GEOTIFF_MAX_DECODE_TASKS"),
+        )? {
+            reader.max_decode_tasks = tasks;
+        }
+        if let Some(tasks) = parse_positive_usize_env(
+            "ASYNC_GEOTIFF_MAX_TILE_TASKS",
+            get("ASYNC_GEOTIFF_MAX_TILE_TASKS"),
+        )? {
+            tiler.max_blocking_tasks = tasks;
+        }
+        // Speculative neighbour-block prefetch radius. Defaults to 1 in the
+        // example server: browsing patterns make the surrounding ring exactly
+        // what the next tile requests need. Set 0 to disable (e.g. when object
+        // storage GETs are billed per request).
+        match get("ASYNC_GEOTIFF_PREFETCH_RING") {
+            Some(raw) => {
+                reader.prefetch_ring = raw
+                    .parse::<u8>()
+                    .map_err(|_| "ASYNC_GEOTIFF_PREFETCH_RING must be 0-255".to_string())?;
+            }
+            None => reader.prefetch_ring = 1,
+        }
+        let slow_tile_ms = parse_positive_u64_env(
+            "ASYNC_GEOTIFF_SLOW_TILE_MS",
+            get("ASYNC_GEOTIFF_SLOW_TILE_MS"),
+        )?;
+
+        Ok(Self {
+            block_cache,
+            reader,
+            tiler,
+            slow_tile_ms,
+        })
+    }
+
+    fn reader_config(&self, source_id: String, block_cache: Arc<BlockCache>) -> ReaderConfig {
+        let mut cfg = ReaderConfig::default();
+        cfg.source_id = source_id;
+        cfg.block_cache = block_cache;
+        cfg.max_decode_tasks = self.reader.max_decode_tasks;
+        cfg.prefetch_ring = self.reader.prefetch_ring;
+        cfg
+    }
+
+    fn tiler_config(&self) -> TilerConfig {
+        TilerConfig {
+            max_blocking_tasks: self.tiler.max_blocking_tasks,
+        }
+    }
+}
+
+fn parse_positive_usize_env(name: &str, value: Option<String>) -> Result<Option<usize>, String> {
+    value
+        .map(|raw| {
+            let parsed = raw
+                .parse::<usize>()
+                .map_err(|_| format!("{name} must be a positive integer"))?;
+            if parsed == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+            Ok(parsed)
+        })
+        .transpose()
+}
+
+fn parse_positive_u64_env(name: &str, value: Option<String>) -> Result<Option<u64>, String> {
+    value
+        .map(|raw| {
+            let parsed = raw
+                .parse::<u64>()
+                .map_err(|_| format!("{name} must be a positive integer"))?;
+            if parsed == 0 {
+                return Err(format!("{name} must be greater than zero"));
+            }
+            Ok(parsed)
+        })
+        .transpose()
+}
+
+#[cfg(any(feature = "tokio-console", test))]
+fn tokio_console_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|raw| {
+        matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("async_geotiff=debug,warn"))
+}
+
+fn init_tracing() {
+    use tracing_subscriber::prelude::*;
+
+    #[cfg(feature = "tokio-console")]
+    {
+        if tokio_console_enabled(std::env::var("ASYNC_GEOTIFF_TOKIO_CONSOLE").ok().as_deref()) {
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_filter(env_filter());
+            tracing_subscriber::registry()
+                .with(console_subscriber::spawn())
+                .with(fmt_layer)
+                .init();
+            return;
+        }
+    }
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_filter(env_filter());
+    tracing_subscriber::registry().with(fmt_layer).init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("async_geotiff=debug,warn")),
-        )
-        .with_target(false)
-        .init();
+    init_tracing();
 
     // Optional CLI arg: a single COG URL served when no ?dataset= is given.
     let url = std::env::args().nth(1);
@@ -55,19 +193,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // One decoded-block cache shared by the default reader, every per-dataset
     // reader, and (indirectly) the mosaic — so the whole server runs under a
     // single bounded decode-memory budget instead of one cache per COG.
-    let block_cache = Arc::new(BlockCache::new(CacheConfig::default()));
+    let runtime = ServerRuntimeConfig::from_env()?;
+    let block_cache = Arc::new(BlockCache::new(runtime.block_cache));
 
     let (default_tiler, view) = if let Some(u) = url.as_deref() {
-        let mut cfg = ReaderConfig::default();
-        cfg.source_id = u.to_string();
-        cfg.block_cache = Arc::clone(&block_cache);
+        let cfg = runtime.reader_config(u.to_string(), Arc::clone(&block_cache));
         let reader = CogReader::open_http_with_config_default(u, cfg).await?;
         let v = default_view(&reader).unwrap_or(DefaultView {
             center_lon: 0.0,
             center_lat: 0.0,
             zoom: 2.0,
         });
-        (Some(Arc::new(Tiler::new(Arc::new(reader)))), v)
+        (
+            Some(Arc::new(Tiler::with_config(
+                Arc::new(reader),
+                runtime.tiler_config(),
+            ))),
+            v,
+        )
     } else {
         (
             None,
@@ -89,6 +232,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         datasets,
         http_base.clone(),
         Arc::clone(&block_cache),
+    )
+    .with_runtime_tuning(
+        runtime.reader.max_decode_tasks,
+        runtime.tiler.max_blocking_tasks,
+        runtime.slow_tile_ms,
     );
     let mut mosaic_loaded = false;
     if let Ok(path) = std::env::var("ASYNC_GEOTIFF_MOSAIC") {
@@ -214,6 +362,57 @@ fn bind_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
     Ok(std::env::var("ASYNC_GEOTIFF_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
         .parse()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl FnMut(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find_map(|(k, v)| (*k == key).then(|| (*v).to_string()))
+        }
+    }
+
+    #[test]
+    fn runtime_config_overrides_cache_and_cpu_tuning_from_env() {
+        let cfg = ServerRuntimeConfig::from_env_values(env(&[
+            ("ASYNC_GEOTIFF_BLOCK_CACHE_MB", "1024"),
+            ("ASYNC_GEOTIFF_MAX_DECODE_TASKS", "3"),
+            ("ASYNC_GEOTIFF_MAX_TILE_TASKS", "5"),
+            ("ASYNC_GEOTIFF_SLOW_TILE_MS", "150"),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.block_cache.max_bytes, 1024 << 20);
+        assert_eq!(cfg.reader.max_decode_tasks, 3);
+        assert_eq!(cfg.tiler.max_blocking_tasks, 5);
+        assert_eq!(cfg.slow_tile_ms, Some(150));
+    }
+
+    #[test]
+    fn runtime_config_rejects_zero_tuning_values() {
+        let err = match ServerRuntimeConfig::from_env_values(env(&[(
+            "ASYNC_GEOTIFF_MAX_DECODE_TASKS",
+            "0",
+        )])) {
+            Ok(_) => panic!("zero decode task count should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("ASYNC_GEOTIFF_MAX_DECODE_TASKS"));
+    }
+
+    #[test]
+    fn tokio_console_env_accepts_common_truthy_values() {
+        assert!(tokio_console_enabled(Some("1")));
+        assert!(tokio_console_enabled(Some("true")));
+        assert!(tokio_console_enabled(Some("yes")));
+        assert!(!tokio_console_enabled(Some("0")));
+        assert!(!tokio_console_enabled(None));
+    }
 }
 
 fn local_http_base(bind_addr: SocketAddr) -> String {

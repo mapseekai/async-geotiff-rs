@@ -1,6 +1,8 @@
 //! Top-level orchestrator: HTTP request → tile bytes.
 
 use std::sync::Arc;
+#[cfg(feature = "perf-tracing")]
+use std::time::Instant;
 
 use bytes::Bytes;
 
@@ -9,6 +11,8 @@ use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::io::stats::{load_dataset_stats, DatasetStats};
 use crate::io::CogReader;
+#[cfg(feature = "perf-tracing")]
+use crate::perf::duration_ms;
 use crate::pixel::{ImageData, PixelData};
 use crate::render::pipeline::{render, CompiledTileStyle};
 use crate::style::params::compile_cached;
@@ -20,10 +24,19 @@ use tokio::sync::OnceCell;
 
 const PASSTHROUGH_PIXEL_TOLERANCE: f64 = 1e-3;
 
+/// Bounded memo of stats-derived effective styles, keyed by
+/// `"{style:?}|{dtype}"`. Only deterministic (dataset-stats based) results are
+/// inserted — per-tile fallback/expression stretches never enter it.
+type EffectiveMemo = moka::sync::Cache<String, Arc<CompiledTileStyle>>;
+
 pub struct Tiler {
     reader: Arc<CogReader>,
     cpu: CpuLimiter,
     stats: OnceCell<Option<Arc<DatasetStats>>>,
+    /// See [`EffectiveMemo`]. Shared into the fused CPU job per tile; reused
+    /// across tiles so per-style work (rescale resolution, render LUT builds
+    /// hanging off the compiled style) amortizes instead of repeating per tile.
+    effective_memo: Arc<EffectiveMemo>,
 }
 
 /// Runtime limits for a [`Tiler`].
@@ -49,6 +62,39 @@ impl TilerConfig {
     }
 }
 
+/// Resolved read/warp plan for one output tile (see [`Tiler::plan_tile`]).
+struct ReadyPlan {
+    level: usize,
+    col: i64,
+    row: i64,
+    w: u64,
+    h: u64,
+    /// The window is an exact integer-aligned identity crop — skip the warp.
+    passthrough: bool,
+    dst_crs: crate::crs::Crs,
+    dst_bbox: Bbox,
+}
+
+/// Result of the fused warp+style+render CPU job in [`Tiler::tile`].
+enum FusedOut {
+    /// Encoded tile bytes — the common case.
+    Bytes(Bytes),
+    /// Tile fell outside the projection's valid domain during warp.
+    NoTile,
+    /// The effective style needs dataset stats that were not prefetched
+    /// (the warp changed the pixel dtype, e.g. a boundary tile upcast to
+    /// f64). Carries the warped image so the caller re-renders without
+    /// repeating the warp.
+    NeedStats(Arc<ImageData>),
+}
+
+/// Outcome of the synchronous effective-style resolution.
+enum EffectiveOutcome {
+    Ready(Arc<CompiledTileStyle>),
+    /// Dataset stats are required but were not provided by the caller.
+    NeedStats,
+}
+
 impl Tiler {
     /// Build a `Tiler` that shares the reader's [`CpuLimiter`], so decode,
     /// stitch, warp and render all draw from one CPU budget. In a mosaic, where
@@ -61,6 +107,7 @@ impl Tiler {
             reader,
             cpu,
             stats: OnceCell::new(),
+            effective_memo: Arc::new(EffectiveMemo::new(32)),
         }
     }
 
@@ -72,6 +119,7 @@ impl Tiler {
             reader,
             cpu: CpuLimiter::new(config.blocking_task_limit()),
             stats: OnceCell::new(),
+            effective_memo: Arc::new(EffectiveMemo::new(32)),
         }
     }
 
@@ -92,96 +140,23 @@ impl Tiler {
             .cloned()
     }
 
-    /// Resolve the effective rescale and inject it into a cloned
-    /// `CompiledTileStyle`. Priority: explicit `rescale` (Custom) →
-    /// `?stretch=` mode → default StdDev k=2.0 (u8 keeps its fast path).
-    /// Sets BOTH `rescale` (RGB path / fast-path identity) and
-    /// `composite.vmin/vmax` (single-band Gradient path).
-    async fn effective_compiled(
-        &self,
-        style: &TileStyle,
-        compiled: &Arc<CompiledTileStyle>,
-        image: &ImageData,
-    ) -> AgResult<Arc<CompiledTileStyle>> {
-        if !style.rescale.is_empty() {
-            return Ok(Arc::clone(compiled));
-        }
-        // Band-math expression: stretch from the synthetic index's own value
-        // range, NOT dataset_stats (which are per-source-band raw DN and
-        // meaningless for an index like NDVI). Explicit `rescale` already
-        // returned above and wins.
-        if style.expression.is_some() {
-            // Match render's nodata source (`style.nodata.or(image.nodata)`) so
-            // the stretch is computed over the same pixel set that renders.
-            let nodata = compiled.nodata.or(image.nodata);
-            let (lo, hi) =
-                expression_rescale(image, &compiled.expression, nodata).unwrap_or((-1.0, 1.0));
-            let mut next = (**compiled).clone();
-            next.rescale = vec![(lo, hi)];
-            next.composite.vmin = Some(vec![lo]);
-            next.composite.vmax = Some(vec![hi]);
-            next.auto_rgb = false;
-            return Ok(std::sync::Arc::new(next));
-        }
-        let spec: Stretch = match style.resolved_stretch()? {
-            Some(s) => s,
-            None => {
-                if matches!(image.pixels, PixelData::U8(_)) {
-                    return Ok(Arc::clone(compiled));
-                }
-                Stretch::DEFAULT
-            }
-        };
+    // `effective_compiled` was an async method here; it is now the free
+    // function [`effective_compiled_sync`] so the fused warp+render CPU job
+    // can resolve the style without leaving the blocking context. Dataset
+    // stats are awaited by the caller and passed in.
 
-        let bands = image.pixels.bands();
-        let bidx: Vec<usize> = if compiled.bidx.is_empty() {
-            if bands >= 3 && compiled.composite.bands >= 3 {
-                vec![0, 1, 2]
-            } else {
-                vec![0]
-            }
-        } else {
-            compiled.bidx.clone()
-        };
-
-        let ranges = match self.dataset_stats().await? {
-            Some(stats) => {
-                let r = resolve_rescale(&spec, &stats, &bidx);
-                // Empty → malformed stats (no bands); degrade gracefully.
-                if r.is_empty() {
-                    fallback_rescale(&image.pixels, image.nodata, &bidx)
-                } else {
-                    r
-                }
-            }
-            None => fallback_rescale(&image.pixels, image.nodata, &bidx),
-        };
-
-        let ranges = if style.unscale {
-            unscale_ranges(&ranges, &bidx, self.reader.band_scale_offset())
-        } else {
-            ranges
-        };
-        let mut next = (**compiled).clone();
-        next.rescale = ranges.clone();
-        next.composite.vmin = Some(ranges.iter().map(|r| r.0).collect());
-        next.composite.vmax = Some(ranges.iter().map(|r| r.1).collect());
-        next.auto_rgb = false;
-        Ok(Arc::new(next))
-    }
-
-    /// Read + warp the source COG onto the destination tile grid. Returns
-    /// `None` when the tile is fully outside the COG or outside the
-    /// projection's valid domain — [`Tiler::tile`] turns that into "no tile"
-    /// (HTTP 204). This is the per-asset primitive the mosaic layer reuses.
-    pub async fn warp_tile(
+    /// Pure planning: destination grid → overview level + clamped pixel window.
+    /// Returns `None` when the tile is fully outside the COG or outside the
+    /// projection's valid domain. Shared by [`Self::warp_tile`] (mosaic
+    /// per-asset path) and the fused [`Self::tile`] path.
+    fn plan_tile(
         &self,
         tile_matrix_set: TileMatrixSet,
         z: u8,
         x: u32,
         y: u32,
         style: &TileStyle,
-    ) -> AgResult<Option<ImageData>> {
+    ) -> AgResult<Option<ReadyPlan>> {
         let tms = Tms::new(tile_matrix_set)?;
         let dst_bbox = tms.tile_bbox(z, x, y)?;
         let dst_crs = tms.crs();
@@ -211,7 +186,7 @@ impl Tiler {
         let ts = style.tilesize as usize;
 
         // L2 passthrough: exact integer-aligned ts×ts window → skip warp.
-        if same_crs && res_matches {
+        if aligned {
             if let Some((pc, pr)) = Self::passthrough_window(&level_tr, &dst_bbox, ts) {
                 if let Ok((iw, ih)) = self.reader.level_dimensions(level) {
                     let in_bounds = pc >= 0
@@ -219,11 +194,16 @@ impl Tiler {
                         && (pc as u64 + ts as u64) <= iw as u64
                         && (pr as u64 + ts as u64) <= ih as u64;
                     if in_bounds {
-                        let src: Arc<ImageData> = self
-                            .reader
-                            .read_window(level, pc, pr, ts as u64, ts as u64)
-                            .await?;
-                        return Ok(Some((*src).clone()));
+                        return Ok(Some(ReadyPlan {
+                            level,
+                            col: pc,
+                            row: pr,
+                            w: ts as u64,
+                            h: ts as u64,
+                            passthrough: true,
+                            dst_crs,
+                            dst_bbox,
+                        }));
                     }
                 }
             }
@@ -238,13 +218,69 @@ impl Tiler {
         if w == 0 || h == 0 {
             return Ok(None);
         }
-        let src: Arc<ImageData> = self.reader.read_window(level, col, row, w, h).await?;
+        Ok(Some(ReadyPlan {
+            level,
+            col,
+            row,
+            w,
+            h,
+            passthrough: false,
+            dst_crs,
+            dst_bbox,
+        }))
+    }
 
-        let resampling = if src.crs == dst_crs {
+    /// Read + warp the source COG onto the destination tile grid. Returns
+    /// `None` when the tile is fully outside the COG or outside the
+    /// projection's valid domain — [`Tiler::tile`] turns that into "no tile"
+    /// (HTTP 204). This is the per-asset primitive the mosaic layer reuses.
+    pub async fn warp_tile(
+        &self,
+        tile_matrix_set: TileMatrixSet,
+        z: u8,
+        x: u32,
+        y: u32,
+        style: &TileStyle,
+    ) -> AgResult<Option<Arc<ImageData>>> {
+        #[cfg(feature = "perf-tracing")]
+        let started = Instant::now();
+        let Some(plan) = self.plan_tile(tile_matrix_set, z, x, y, style)? else {
+            return Ok(None);
+        };
+        #[cfg(feature = "perf-tracing")]
+        let planned = started.elapsed();
+        let src: Arc<ImageData> = self
+            .reader
+            .read_window(plan.level, plan.col, plan.row, plan.w, plan.h)
+            .await?;
+        #[cfg(feature = "perf-tracing")]
+        let read_done = started.elapsed();
+        if plan.passthrough {
+            crate::perf_trace! {
+                tracing::debug!(
+                    level = plan.level,
+                    col = plan.col,
+                    row = plan.row,
+                    width = plan.w,
+                    height = plan.h,
+                    plan_ms = duration_ms(planned),
+                    read_window_ms = duration_ms(read_done - planned),
+                    warp_cpu_ms = 0.0,
+                    total_ms = duration_ms(read_done),
+                    "warp_tile timing"
+                );
+            }
+            return Ok(Some(src));
+        }
+
+        let ts = style.tilesize as usize;
+        let resampling = if src.crs == plan.dst_crs {
             style.resampling
         } else {
             style.reproject
         };
+        let dst_crs = plan.dst_crs.clone();
+        let dst_bbox = plan.dst_bbox;
         let warped: ImageData = match self
             .run_tile_cpu("warp", move || {
                 warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
@@ -255,7 +291,23 @@ impl Tiler {
             Err(AgError::ProjectionDomain(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        Ok(Some(warped))
+        #[cfg(feature = "perf-tracing")]
+        let warp_done = started.elapsed();
+        crate::perf_trace! {
+            tracing::debug!(
+                level = plan.level,
+                col = plan.col,
+                row = plan.row,
+                width = plan.w,
+                height = plan.h,
+                plan_ms = duration_ms(planned),
+                read_window_ms = duration_ms(read_done - planned),
+                warp_cpu_ms = duration_ms(warp_done - read_done),
+                total_ms = duration_ms(warp_done),
+                "warp_tile timing"
+            );
+        }
+        Ok(Some(Arc::new(warped)))
     }
 
     /// Render one tile. Returns `Ok(None)` when the tile lies fully outside
@@ -265,11 +317,11 @@ impl Tiler {
     /// would otherwise cover the map where PNG/WebP stay transparent).
     /// In-range tiles that happen to be all-nodata still render normally
     /// (transparent for PNG/WebP).
-    #[tracing::instrument(
+    #[cfg_attr(feature = "perf-tracing", tracing::instrument(
         skip(self, style),
         fields(tms = tile_matrix_set.name(), z, x, y, format = ?style.format),
         err
-    )]
+    ))]
     pub async fn tile(
         &self,
         tile_matrix_set: TileMatrixSet,
@@ -278,21 +330,122 @@ impl Tiler {
         y: u32,
         style: &TileStyle,
     ) -> AgResult<Option<Bytes>> {
-        let warped = match self.warp_tile(tile_matrix_set, z, x, y, style).await? {
-            Some(img) => img,
-            None => return Ok(None),
+        #[cfg(feature = "perf-tracing")]
+        let started = Instant::now();
+        let Some(plan) = self.plan_tile(tile_matrix_set, z, x, y, style)? else {
+            crate::perf_trace! {
+                tracing::debug!(
+                    total_ms = duration_ms(started.elapsed()),
+                    "tile internals timing: no tile"
+                );
+            }
+            return Ok(None);
         };
-        let warped = if style.unscale {
-            unscale_image(&warped, self.reader.band_scale_offset())
-        } else {
-            warped
-        };
-        let compiled = compile_cached(style).await?;
-        let compiled = self.effective_compiled(style, &compiled, &warped).await?;
-        let img = warped;
-        let bytes = self
-            .run_tile_cpu("render", move || render(&img, &compiled))
+        #[cfg(feature = "perf-tracing")]
+        let planned = started.elapsed();
+        let src: Arc<ImageData> = self
+            .reader
+            .read_window(plan.level, plan.col, plan.row, plan.w, plan.h)
             .await?;
+        #[cfg(feature = "perf-tracing")]
+        let read_done = started.elapsed();
+
+        let compiled = compile_cached(style).await?;
+        // Prefetch dataset stats (memoized after the first tile) whenever the
+        // effective style may need them, so the fused CPU job below resolves
+        // the style synchronously. The u8-no-stretch default never loads them
+        // — exactly as before the fusion.
+        let want_stats = style.rescale.is_empty()
+            && style.expression.is_none()
+            && (style.resolved_stretch()?.is_some()
+                || style.unscale
+                || !matches!(src.pixels, PixelData::U8(_)));
+        let stats: Option<Option<Arc<DatasetStats>>> = if want_stats {
+            Some(self.dataset_stats().await?)
+        } else {
+            None
+        };
+
+        // ONE blocking hop (one CPU permit) for warp + unscale + effective
+        // style + render + encode. The intermediate tile buffer stays hot in
+        // cache instead of crossing two spawn_blocking boundaries.
+        let ts = style.tilesize as usize;
+        let style_owned = style.clone();
+        let compiled2 = Arc::clone(&compiled);
+        let scale_offset = self.reader.band_scale_offset().to_vec();
+        let memo = Arc::clone(&self.effective_memo);
+        let fused = self
+            .run_tile_cpu("tile", move || {
+                let img: Arc<ImageData> = if plan.passthrough {
+                    src
+                } else {
+                    let resampling = if src.crs == plan.dst_crs {
+                        style_owned.resampling
+                    } else {
+                        style_owned.reproject
+                    };
+                    match warp::warp(&src, &plan.dst_crs, plan.dst_bbox, ts, ts, resampling) {
+                        Ok(w) => Arc::new(w),
+                        Err(AgError::ProjectionDomain(_)) => return Ok(FusedOut::NoTile),
+                        Err(e) => return Err(e),
+                    }
+                };
+                let img = if style_owned.unscale {
+                    Arc::new(unscale_image(&img, &scale_offset))
+                } else {
+                    img
+                };
+                let effective = match effective_compiled_sync(
+                    &style_owned,
+                    &compiled2,
+                    &img,
+                    stats.as_ref(),
+                    &scale_offset,
+                    &memo,
+                )? {
+                    EffectiveOutcome::Ready(c) => c,
+                    EffectiveOutcome::NeedStats => return Ok(FusedOut::NeedStats(img)),
+                };
+                Ok(FusedOut::Bytes(render(&img, &effective)?))
+            })
+            .await?;
+        let bytes = match fused {
+            FusedOut::Bytes(bytes) => bytes,
+            FusedOut::NoTile => return Ok(None),
+            FusedOut::NeedStats(img) => {
+                // Rare: the warp changed the pixel dtype (boundary tile upcast
+                // to f64) so stats weren't prefetched. Load them and re-render
+                // — the warp is NOT repeated, only the style+render hop.
+                let stats = self.dataset_stats().await?;
+                let effective = match effective_compiled_sync(
+                    style,
+                    &compiled,
+                    &img,
+                    Some(&stats),
+                    self.reader.band_scale_offset(),
+                    &self.effective_memo,
+                )? {
+                    EffectiveOutcome::Ready(c) => c,
+                    EffectiveOutcome::NeedStats => {
+                        return Err(AgError::Warp("effective style demanded stats twice".into()))
+                    }
+                };
+                self.run_tile_cpu("render", move || render(&img, &effective))
+                    .await?
+            }
+        };
+        #[cfg(feature = "perf-tracing")]
+        let done = started.elapsed();
+        crate::perf_trace! {
+            tracing::debug!(
+                plan_ms = duration_ms(planned),
+                read_window_ms = duration_ms(read_done - planned),
+                fused_cpu_ms = duration_ms(done - read_done),
+                total_ms = duration_ms(done),
+                bytes = bytes.len(),
+                "tile internals timing"
+            );
+        }
         Ok(Some(bytes))
     }
 
@@ -394,6 +547,130 @@ impl Tiler {
         let w = (col_end - col).max(0) as u64;
         let h = (row_end - row).max(0) as u64;
         Ok((col, row, w, h))
+    }
+}
+
+/// Resolve the effective rescale and inject it into a cloned
+/// `CompiledTileStyle`. Priority: explicit `rescale` (Custom) →
+/// `?stretch=` mode → default StdDev k=2.0 (u8 keeps its fast path).
+/// Sets BOTH `rescale` (RGB path / fast-path identity) and
+/// `composite.vmin/vmax` (single-band Gradient path).
+///
+/// Pure CPU: dataset stats are passed in (`stats`), not awaited. `None` means
+/// the caller did not prefetch them; if this style+image actually needs them
+/// the function returns [`EffectiveOutcome::NeedStats`] and the caller falls
+/// back to the unfused path. Stats-derived results (deterministic per
+/// style+dtype) are memoized in `memo`; per-tile results (expression stretch,
+/// pixel-fallback stretch) are computed fresh each call by design.
+fn effective_compiled_sync(
+    style: &TileStyle,
+    compiled: &Arc<CompiledTileStyle>,
+    image: &ImageData,
+    stats: Option<&Option<Arc<DatasetStats>>>,
+    scale_offset: &[(f64, f64)],
+    memo: &EffectiveMemo,
+) -> AgResult<EffectiveOutcome> {
+    use EffectiveOutcome::{NeedStats, Ready};
+    if !style.rescale.is_empty() {
+        return Ok(Ready(Arc::clone(compiled)));
+    }
+    // Band-math expression: stretch from the synthetic index's own value
+    // range, NOT dataset_stats (which are per-source-band raw DN and
+    // meaningless for an index like NDVI). Explicit `rescale` already
+    // returned above and wins.
+    if style.expression.is_some() {
+        // Match render's nodata source (`style.nodata.or(image.nodata)`) so
+        // the stretch is computed over the same pixel set that renders.
+        let nodata = compiled.nodata.or(image.nodata);
+        let (lo, hi) =
+            expression_rescale(image, &compiled.expression, nodata).unwrap_or((-1.0, 1.0));
+        let mut next = (**compiled).clone();
+        next.rescale = vec![(lo, hi)];
+        next.composite.vmin = Some(vec![lo]);
+        next.composite.vmax = Some(vec![hi]);
+        next.auto_rgb = false;
+        // Rescale changed → the clone must not share the parent's render LUTs.
+        next.luts = Default::default();
+        return Ok(Ready(Arc::new(next)));
+    }
+    let spec: Stretch = match style.resolved_stretch()? {
+        Some(s) => s,
+        None => {
+            if matches!(image.pixels, PixelData::U8(_)) {
+                return Ok(Ready(Arc::clone(compiled)));
+            }
+            Stretch::DEFAULT
+        }
+    };
+
+    // Stats-derived results are deterministic per (style, pixel dtype): the
+    // memo turns the per-tile clone + range resolution into a pointer fetch
+    // and lets render-side LUTs hanging off the compiled style amortize.
+    let memo_key = format!("{style:?}|{}", dtype_code(&image.pixels));
+    if let Some(hit) = memo.get(&memo_key) {
+        return Ok(Ready(hit));
+    }
+
+    let bands = image.pixels.bands();
+    let bidx: Vec<usize> = if compiled.bidx.is_empty() {
+        if bands >= 3 && compiled.composite.bands >= 3 {
+            vec![0, 1, 2]
+        } else {
+            vec![0]
+        }
+    } else {
+        compiled.bidx.clone()
+    };
+
+    let Some(stats) = stats else {
+        return Ok(NeedStats);
+    };
+    let mut from_stats = false;
+    let ranges = match stats {
+        Some(stats) => {
+            let r = resolve_rescale(&spec, stats, &bidx);
+            // Empty → malformed stats (no bands); degrade gracefully.
+            if r.is_empty() {
+                fallback_rescale(&image.pixels, image.nodata, &bidx)
+            } else {
+                from_stats = true;
+                r
+            }
+        }
+        None => fallback_rescale(&image.pixels, image.nodata, &bidx),
+    };
+
+    let ranges = if style.unscale {
+        unscale_ranges(&ranges, &bidx, scale_offset)
+    } else {
+        ranges
+    };
+    let mut next = (**compiled).clone();
+    next.rescale = ranges.clone();
+    next.composite.vmin = Some(ranges.iter().map(|r| r.0).collect());
+    next.composite.vmax = Some(ranges.iter().map(|r| r.1).collect());
+    next.auto_rgb = false;
+    // Rescale changed → the clone must not share the parent's render LUTs.
+    next.luts = Default::default();
+    let next = Arc::new(next);
+    if from_stats {
+        // Only deterministic results enter the memo — the pixel-fallback
+        // branch above depends on this tile's pixels and must stay per-tile.
+        memo.insert(memo_key, Arc::clone(&next));
+    }
+    Ok(Ready(next))
+}
+
+/// Stable per-variant tag for memo keys.
+fn dtype_code(p: &PixelData) -> &'static str {
+    match p {
+        PixelData::U8(_) => "u8",
+        PixelData::U16(_) => "u16",
+        PixelData::I16(_) => "i16",
+        PixelData::U32(_) => "u32",
+        PixelData::I32(_) => "i32",
+        PixelData::F32(_) => "f32",
+        PixelData::F64(_) => "f64",
     }
 }
 

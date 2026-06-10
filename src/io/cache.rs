@@ -12,7 +12,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            max_bytes: 256 << 20,
+            max_bytes: 512 << 20,
             ttl: None,
         }
     }
