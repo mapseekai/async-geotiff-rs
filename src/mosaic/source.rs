@@ -9,6 +9,11 @@ use crate::tms::TileMatrixSet;
 /// (quadkey index needs none; STAC Items carry it).
 #[derive(Debug, Clone)]
 pub struct AssetRef {
+    /// Address of the COG. Interpretation depends on how the `MosaicTiler` was
+    /// built: by default (HTTP mode) this is an HTTP(S) URL; when the tiler is
+    /// constructed with `MosaicTiler::with_object_store`, it is instead a
+    /// *decoded object key* within the injected store (e.g. `"scenes/a.tif"`),
+    /// not a URL — no scheme/host, and not percent-encoded.
     pub url: String,
     /// Stable cache identity for this COG, supplied by the `MosaicSource`.
     /// Decoded blocks are keyed by it, so use the **same** `source_id` here and

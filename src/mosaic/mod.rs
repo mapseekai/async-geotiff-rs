@@ -90,6 +90,41 @@ impl<S: MosaicSource> MosaicTiler<S> {
         }
     }
 
+    /// Create a `MosaicTiler` whose assets are opened through one
+    /// caller-injected `object_store` backend (S3/MinIO/local/…) rather than
+    /// HTTP. Every [`AssetRef::url`] returned by `source` is then interpreted as
+    /// a *decoded object key* within that single store (single server, single
+    /// bucket), e.g. `"scenes/2026/tile.tif"`. The library holds no credentials:
+    /// configure endpoint/bucket/auth on `store` before injecting it.
+    pub fn with_object_store(source: S, store: Arc<dyn object_store::ObjectStore>) -> Self {
+        let cfg = MosaicConfig::default();
+        Self {
+            pool: ReaderPool::with_object_store(cfg.reader_capacity, store),
+            source,
+            cfg,
+        }
+    }
+
+    /// [`Self::with_object_store`] plus a caller-supplied shared [`BlockCache`],
+    /// so the object_store-backed mosaic shares one decode-memory budget with
+    /// the caller's other readers (see [`Self::with_block_cache`]).
+    pub fn with_object_store_and_block_cache(
+        source: S,
+        store: Arc<dyn object_store::ObjectStore>,
+        block_cache: Arc<BlockCache>,
+    ) -> Self {
+        let cfg = MosaicConfig::default();
+        Self {
+            pool: ReaderPool::with_object_store_and_block_cache(
+                cfg.reader_capacity,
+                store,
+                block_cache,
+            ),
+            source,
+            cfg,
+        }
+    }
+
     /// The shared block cache backing this mosaic's reader pool — poll
     /// [`BlockCache::stats`] on it for metrics.
     pub fn block_cache(&self) -> Arc<BlockCache> {
@@ -128,7 +163,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
                     let reader = self.pool.get_or_open(&url, &source_id).await?;
                     let tiler = Tiler::new(reader);
                     let img = tiler.warp_tile(tile_matrix_set, z, x, y, style).await?;
-                    Ok::<Option<ImageData>, AgError>(img)
+                    Ok::<Option<Arc<ImageData>>, AgError>(img)
                 }
             });
             let results = futures::future::join_all(futs).await;
@@ -268,6 +303,90 @@ mod tests {
         if let Ok(Some(b)) = mosaic {
             assert!(!b.is_empty());
         }
+    }
+
+    /// Source that returns one asset addressed by a decoded object key,
+    /// to exercise the injected-store (MinIO/S3/local) path.
+    struct OneKey {
+        key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl MosaicSource for OneKey {
+        async fn assets_for_tile(
+            &self,
+            _tile_matrix_set: TileMatrixSet,
+            _z: u8,
+            _x: u32,
+            _y: u32,
+        ) -> AgResult<Vec<AssetRef>> {
+            Ok(vec![AssetRef {
+                url: self.key.clone(),
+                source_id: self.key.clone(),
+                bbox: Bbox::new(-180.0, -90.0, 180.0, 90.0),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn object_store_mosaic_renders_via_injected_store() {
+        // The feature claim: with a store injected, the mosaic opens its asset
+        // through object_store (key = decoded object key, NOT an HTTP URL) and
+        // actually renders it. The `.expect(...must render...)` below is the
+        // anti-false-green guard: a silently-skipped asset leaves `fed == 0` and
+        // returns None, which would slip past a weaker assertion.
+        //
+        // We do not assert byte-equality with the single-source `Tiler::tile`
+        // path: the mosaic composites via `warp_tile` → Reducer → render and is
+        // intentionally not byte-identical to the fused single-source pipeline
+        // (the sibling `single_asset_mosaic_matches_single_source` makes the same
+        // choice). Store-level decode equivalence is covered in cog.rs by
+        // `open_object_store_matches_open_with_reader`.
+        let key = "data/cog_uint8_rgb_nodata.tif";
+        if !std::path::Path::new(key).exists() {
+            eprintln!("fixture missing, skipping object_store_mosaic_renders_via_injected_store");
+            return;
+        }
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+
+        // Bounds (over the same store+key) to derive a covering tile.
+        let reader = CogReader::open_object_store(store.clone(), key)
+            .await
+            .expect("open via object_store");
+        let style = TileStyle::from_query("").unwrap();
+        let [w, s, e, n] = Tiler::new(Arc::new(reader)).wgs84_bounds().unwrap();
+
+        // A tile that actually covers the fixture (slippy-map formula).
+        let z = 12u8;
+        let nz = 2f64.powi(z as i32);
+        let clon = (w + e) / 2.0;
+        let clat = (s + n) / 2.0;
+        let x = (((clon + 180.0) / 360.0 * nz).floor().clamp(0.0, nz - 1.0)) as u32;
+        let lat_rad = clat.to_radians();
+        let y = (((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0
+            * nz)
+            .floor()
+            .clamp(0.0, nz - 1.0)) as u32;
+
+        let src = OneKey {
+            key: key.to_string(),
+        };
+        let m = MosaicTiler::with_object_store(src, store.clone());
+        let mosaic = m
+            .tile(
+                TileMatrixSet::WebMercatorQuad,
+                z,
+                x,
+                y,
+                PixelSelection::First,
+                &style,
+            )
+            .await
+            .expect("mosaic tile")
+            .expect("object_store asset must render, not be skipped");
+
+        assert!(!mosaic.is_empty(), "rendered tile must be non-empty");
     }
 
     struct NoAssets;
