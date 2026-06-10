@@ -15,6 +15,25 @@ use crate::blocking::CpuLimiter;
 use crate::error::{AgError, AgResult};
 use crate::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 
+/// How the pool reaches its assets. The two modes are mutually exclusive per
+/// pool: HTTP (each key is an HTTP URL, the default) or one caller-injected
+/// `object_store` backend (each key is a *decoded object key* within that
+/// single store — single server, single bucket; credentials and endpoint are
+/// the caller's concern, never held by the library).
+#[derive(Clone)]
+enum Backend {
+    Http,
+    Store(Arc<dyn ObjectStore>),
+}
+
+/// Strip the query string from a URL for error messages and logs: presigned
+/// URLs and `?token=…` style auth carry live credentials that must not leak
+/// into log lines or error strings (which often end up in HTTP responses).
+/// Object keys have no query component, so this is a no-op for store mode.
+pub(crate) fn redact_query(addr: &str) -> &str {
+    &addr[..addr.find('?').unwrap_or(addr.len())]
+}
+
 pub struct ReaderPool {
     cache: moka::future::Cache<String, Arc<CogReader>>,
     block_cache: Arc<BlockCache>,
@@ -22,12 +41,7 @@ pub struct ReaderPool {
     /// mosaic (all assets + their tilers + the final composite render) is bound
     /// to a single CPU budget instead of N independent per-reader semaphores.
     cpu: CpuLimiter,
-    /// Backing store for assets. `None` = HTTP mode (each key is an HTTP URL,
-    /// the default, fully backward compatible). `Some(store)` = object_store
-    /// mode: every key is opened as a *decoded object key* against this one
-    /// caller-injected store (single server, single bucket — credentials and
-    /// endpoint are the caller's concern, never held by the library).
-    store: Option<Arc<dyn ObjectStore>>,
+    backend: Backend,
 }
 
 impl ReaderPool {
@@ -43,7 +57,7 @@ impl ReaderPool {
             cache: moka::future::Cache::new(capacity),
             block_cache,
             cpu: CpuLimiter::default(),
-            store: None,
+            backend: Backend::Http,
         }
     }
 
@@ -53,12 +67,11 @@ impl ReaderPool {
     /// that single store (e.g. `"scenes/2026/tile.tif"`), not an HTTP URL.
     /// The library never holds credentials — wire them into `store` yourself.
     pub fn with_object_store(capacity: u64, store: Arc<dyn ObjectStore>) -> Self {
-        Self {
-            cache: moka::future::Cache::new(capacity),
-            block_cache: Arc::new(BlockCache::new(CacheConfig::default())),
-            cpu: CpuLimiter::default(),
-            store: Some(store),
-        }
+        Self::with_object_store_and_block_cache(
+            capacity,
+            store,
+            Arc::new(BlockCache::new(CacheConfig::default())),
+        )
     }
 
     /// [`Self::with_object_store`] plus a caller-supplied shared [`BlockCache`],
@@ -73,7 +86,7 @@ impl ReaderPool {
             cache: moka::future::Cache::new(capacity),
             block_cache,
             cpu: CpuLimiter::default(),
-            store: Some(store),
+            backend: Backend::Store(store),
         }
     }
 
@@ -89,18 +102,23 @@ impl ReaderPool {
     }
 
     /// Get the cached reader for `key`, opening it on first use. In HTTP mode
-    /// (`store == None`) `key` is an HTTP URL; in object_store mode it is a
-    /// decoded object key within the injected store. Concurrent first-opens for
+    /// `key` is an HTTP URL; in object_store mode it is a decoded object key
+    /// within the injected store. Concurrent first-opens for
     /// the same `key` are coalesced by moka. The caller-supplied `source_id` is
     /// the block-cache identity for this COG — reuse the same string for the
     /// same COG (here and on any single-dataset reader) to share decoded blocks.
     /// All readers share the pool's single [`BlockCache`] and [`CpuLimiter`].
     pub async fn get_or_open(&self, key: &str, source_id: &str) -> AgResult<Arc<CogReader>> {
+        // Fast path: hits dominate in steady state (adjacent tiles reuse the
+        // same COG), so look up by borrowed key before allocating anything.
+        if let Some(r) = self.cache.get(key).await {
+            return Ok(r);
+        }
         let key_owned = key.to_string();
         let source_id = source_id.to_string();
         let block_cache = Arc::clone(&self.block_cache);
         let cpu = self.cpu.clone();
-        let store = self.store.clone();
+        let backend = self.backend.clone();
         self.cache
             .try_get_with(key_owned.clone(), async move {
                 let cfg = ReaderConfig {
@@ -109,22 +127,57 @@ impl ReaderPool {
                     cpu_limiter: Some(cpu),
                     ..ReaderConfig::default()
                 };
-                let r = match store {
-                    Some(store) => {
+                let r = match backend {
+                    Backend::Store(store) => {
                         CogReader::open_object_store_with_config(store, &key_owned, cfg).await?
                     }
-                    None => CogReader::open_http_with_config_default(&key_owned, cfg).await?,
+                    Backend::Http => {
+                        CogReader::open_http_with_config_default(&key_owned, cfg).await?
+                    }
                 };
                 Ok::<_, AgError>(Arc::new(r))
             })
             .await
-            .map_err(|e: Arc<AgError>| AgError::Mosaic(format!("open asset {key}: {e}")))
+            .map_err(|e: Arc<AgError>| {
+                AgError::Mosaic(format!("open asset {}: {e}", redact_query(key)))
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_query_strips_credentials() {
+        assert_eq!(
+            redact_query("https://h/x.tif?X-Amz-Signature=s3cr3t"),
+            "https://h/x.tif"
+        );
+        assert_eq!(redact_query("https://h/x.tif"), "https://h/x.tif");
+        assert_eq!(redact_query("scenes/a.tif"), "scenes/a.tif");
+        assert_eq!(redact_query(""), "");
+        assert_eq!(redact_query("?token=t"), "");
+    }
+
+    #[tokio::test]
+    async fn open_failure_redacts_query_string() {
+        // The query string (where presigned credentials live) must not appear
+        // in the error text; the path part must, for diagnosability.
+        let pool = ReaderPool::new(8);
+        let msg = match pool
+            .get_or_open("http://127.0.0.1:1/nope.tif?X-Amz-Signature=s3cr3t", "n")
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("unreachable URL must fail"),
+        };
+        assert!(
+            !msg.contains("s3cr3t"),
+            "credentials leaked into error: {msg}"
+        );
+        assert!(msg.contains("nope.tif"), "path missing from error: {msg}");
+    }
 
     #[tokio::test]
     async fn open_failure_is_mosaic_error() {

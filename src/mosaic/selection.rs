@@ -18,9 +18,14 @@ pub enum PixelSelection {
     /// Per-pixel minimum on band 0 across ALL assets (global extremum). Reads
     /// every asset — does NOT short-circuit (see [`Self::Highest`]).
     Lowest,
-    /// Per-pixel mean over all valid asset samples; all assets are read (no short-circuit).
+    /// Per-pixel mean over all valid asset samples; all assets are read (no
+    /// short-circuit). Memory is O(1) in the number of assets (streaming sum).
     Mean,
-    /// Per-pixel median over all valid asset samples; all assets are read (no short-circuit).
+    /// Per-pixel median over all valid asset samples; all assets are read (no
+    /// short-circuit). **Memory is O(assets)**: every fed image is retained as
+    /// `bands × h × w` f64 plus its mask until `finish`. With many assets per
+    /// tile this grows unboundedly — bound the asset count in your
+    /// `MosaicSource` if tiles can be covered by arbitrarily many COGs.
     Median,
 }
 
@@ -56,10 +61,18 @@ pub struct Reducer {
     transform: Option<crate::bounds::GeoTransform>,
 }
 
-fn mask_of(img: &ImageData) -> Array2<bool> {
-    let (h, w) = (img.pixels.height(), img.pixels.width());
-    img.mask
-        .clone()
+/// `true` if pixel `(y, x)` is valid. `None` mask = everything valid, with no
+/// allocation — read-only paths never materialize an all-true array.
+#[inline]
+fn valid(m: Option<&Array2<bool>>, y: usize, x: usize) -> bool {
+    m.is_none_or(|m| m[[y, x]])
+}
+
+/// Materialize an owned mask only where the reducer must *store* one (first
+/// feed of First/Highest/Lowest, every Median feed). Clones the source mask if
+/// present; allocates all-true otherwise.
+fn owned_mask(m: Option<&Array2<bool>>, h: usize, w: usize) -> Array2<bool> {
+    m.cloned()
         .unwrap_or_else(|| Array2::from_elem((h, w), true))
 }
 
@@ -79,9 +92,14 @@ impl Reducer {
     }
 
     /// Feed one warped asset image (already on the destination tile grid).
+    ///
+    /// Pixels are widened to f64 here (8× the footprint of u8 imagery, like
+    /// rio-tiler) so every selection method reduces over one numeric type;
+    /// the composite is narrowed back at render time. The asset's mask is
+    /// borrowed — it is only copied where a method must retain it.
     pub fn feed(&mut self, img: &ImageData) -> AgResult<()> {
         let arr = img.pixels.to_f64(); // (bands, h, w)
-        let m = mask_of(img);
+        let m = img.mask.as_ref();
         if self.bbox.is_none() {
             self.bbox = Some(img.bbox);
             self.crs = Some(img.crs.clone());
@@ -100,27 +118,31 @@ impl Reducer {
                         "mosaic assets must be homogeneous (same shape)"
                     );
                 }
+                let (_, h, w) = arr.dim();
+                let m = owned_mask(m, h, w);
                 self.stack.push((arr, m));
                 Ok(())
             }
         }
     }
 
-    fn feed_first(&mut self, arr: Array3<f64>, m: Array2<bool>) -> AgResult<()> {
+    fn feed_first(&mut self, arr: Array3<f64>, m: Option<&Array2<bool>>) -> AgResult<()> {
         match (&mut self.acc, &mut self.acc_mask) {
             (None, _) => {
                 // Seed `remaining_invalid` from the first asset so `is_done`
-                // is O(1) thereafter (decremented as holes fill).
-                self.remaining_invalid = m.iter().filter(|&&v| !v).count();
+                // is O(1) thereafter (decremented as holes fill). A `None`
+                // mask means fully valid: zero holes, no mask scan.
+                let (_, h, w) = arr.dim();
+                self.remaining_invalid = m.map_or(0, |m| m.iter().filter(|&&v| !v).count());
+                self.acc_mask = Some(owned_mask(m, h, w));
                 self.acc = Some(arr);
-                self.acc_mask = Some(m);
             }
             (Some(acc), Some(am)) => {
                 let (bands, h, w) = acc.dim();
                 for y in 0..h {
                     for x in 0..w {
                         // fill only where acc is still invalid AND arr is valid
-                        if !am[[y, x]] && m[[y, x]] {
+                        if !am[[y, x]] && valid(m, y, x) {
                             for b in 0..bands {
                                 acc[[b, y, x]] = arr[[b, y, x]];
                             }
@@ -140,7 +162,7 @@ impl Reducer {
     /// the number of assets. A pixel is valid (`acc_mask`) if ANY asset marks it
     /// valid; per band, only finite samples contribute — matching the previous
     /// stack aggregation exactly.
-    fn feed_mean(&mut self, arr: Array3<f64>, m: Array2<bool>) -> AgResult<()> {
+    fn feed_mean(&mut self, arr: Array3<f64>, m: Option<&Array2<bool>>) -> AgResult<()> {
         let (bands, h, w) = arr.dim();
         let (sum, count, am) = match (&mut self.acc, &mut self.count, &mut self.acc_mask) {
             (Some(sum), Some(count), Some(am)) => {
@@ -164,7 +186,7 @@ impl Reducer {
         };
         for y in 0..h {
             for x in 0..w {
-                if !m[[y, x]] {
+                if !valid(m, y, x) {
                     continue;
                 }
                 am[[y, x]] = true;
@@ -180,17 +202,23 @@ impl Reducer {
         Ok(())
     }
 
-    fn feed_extreme(&mut self, arr: Array3<f64>, m: Array2<bool>, want_high: bool) -> AgResult<()> {
+    fn feed_extreme(
+        &mut self,
+        arr: Array3<f64>,
+        m: Option<&Array2<bool>>,
+        want_high: bool,
+    ) -> AgResult<()> {
         match (&mut self.acc, &mut self.acc_mask) {
             (None, _) => {
+                let (_, h, w) = arr.dim();
+                self.acc_mask = Some(owned_mask(m, h, w));
                 self.acc = Some(arr);
-                self.acc_mask = Some(m);
             }
             (Some(acc), Some(am)) => {
                 let (bands, h, w) = acc.dim();
                 for y in 0..h {
                     for x in 0..w {
-                        if !m[[y, x]] {
+                        if !valid(m, y, x) {
                             continue;
                         }
                         // compare on band 0; replace whole pixel stack

@@ -28,7 +28,7 @@ use crate::style::TileStyle;
 use crate::tiler::Tiler;
 use crate::tms::TileMatrixSet;
 
-use reader_pool::ReaderPool;
+use reader_pool::{redact_query, ReaderPool};
 use selection::Reducer;
 
 /// Tuning knobs for [`MosaicTiler`].
@@ -97,7 +97,16 @@ impl<S: MosaicSource> MosaicTiler<S> {
     /// bucket), e.g. `"scenes/2026/tile.tif"`. The library holds no credentials:
     /// configure endpoint/bucket/auth on `store` before injecting it.
     pub fn with_object_store(source: S, store: Arc<dyn object_store::ObjectStore>) -> Self {
-        let cfg = MosaicConfig::default();
+        Self::with_object_store_config(source, store, MosaicConfig::default())
+    }
+
+    /// [`Self::with_object_store`] with explicit tuning parameters — the
+    /// object_store counterpart of [`Self::with_config`].
+    pub fn with_object_store_config(
+        source: S,
+        store: Arc<dyn object_store::ObjectStore>,
+        cfg: MosaicConfig,
+    ) -> Self {
         Self {
             pool: ReaderPool::with_object_store(cfg.reader_capacity, store),
             source,
@@ -156,15 +165,11 @@ impl<S: MosaicSource> MosaicTiler<S> {
         let mut fed = 0usize;
 
         for chunk in assets.chunks(self.cfg.chunk_size) {
-            let futs = chunk.iter().map(|a| {
-                let url = a.url.clone();
-                let source_id = a.source_id.clone();
-                async move {
-                    let reader = self.pool.get_or_open(&url, &source_id).await?;
-                    let tiler = Tiler::new(reader);
-                    let img = tiler.warp_tile(tile_matrix_set, z, x, y, style).await?;
-                    Ok::<Option<Arc<ImageData>>, AgError>(img)
-                }
+            let futs = chunk.iter().map(|a| async move {
+                let reader = self.pool.get_or_open(&a.url, &a.source_id).await?;
+                let tiler = Tiler::new(reader);
+                let img = tiler.warp_tile(tile_matrix_set, z, x, y, style).await?;
+                Ok::<Option<Arc<ImageData>>, AgError>(img)
             });
             let results = futures::future::join_all(futs).await;
 
@@ -176,7 +181,14 @@ impl<S: MosaicSource> MosaicTiler<S> {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        tracing::warn!(asset = %asset.url, error = %e, "mosaic asset skipped");
+                        // Redacted: presigned/query-string credentials must not
+                        // reach the logs (the error text is already redacted at
+                        // its construction site in `ReaderPool::get_or_open`).
+                        tracing::warn!(
+                            asset = %redact_query(&asset.url),
+                            error = %e,
+                            "mosaic asset skipped"
+                        );
                     }
                 }
             }
