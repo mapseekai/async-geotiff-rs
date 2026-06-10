@@ -11,6 +11,33 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-06-10
+
+### Added
+
+- Object-store backed COG opening for mosaic assets, including injected `object_store`
+  support for MinIO/S3 deployments and updated server configuration examples.
+- `perf` timing helpers plus a reproducible tile benchmark script and benchmark
+  report covering cache capacity, output format cost, decode concurrency, and
+  CPU profile hotspots.
+
+### Changed
+
+- Raised the default decoded block cache budget to 512 MB and documented
+  practical cache sizing, ZSTD COG creation, tile concurrency, and in-flight
+  single-flight behavior.
+- Optimized mosaic and tile hot paths by reducing allocations, inlining
+  `read_window` stitching, fusing CPU handoffs, and adding integer/LUT render
+  fast paths for common stretch and color-ramp cases.
+- Updated mosaic reader pooling so assets opened through injected object stores
+  share cache and CPU-limiter behavior with HTTP-backed readers.
+
+### Fixed
+
+- Redacted URL credentials from mosaic asset errors and log output.
+- Made canceled foreground block owners retryable for concurrent waiters instead
+  of surfacing cancellation as a tile failure.
+
 ## [0.0.7] - 2026-06-05
 
 ### Added
@@ -247,7 +274,9 @@ can land in any release** and are called out explicitly under a
 - PNG output; example axum server with MapLibre / OpenLayers / Leaflet
   viewers and a local `data/*.tif` dataset picker.
 
-[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.0.8...HEAD
+
+[0.0.8]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.8
 [0.0.7]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.7
 [0.0.2]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.2
 

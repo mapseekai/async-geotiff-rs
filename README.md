@@ -183,12 +183,28 @@ warp/render concurrency. Defaults use the host's available parallelism and
 clamp zero to one permit.
 
 Decoded native tile blocks are cached in a shared `Arc<BlockCache>` under one
-byte budget. `ReaderConfig` carries a caller-supplied `source_id` (the cache
-key prefix) and the `block_cache`; pass the **same** `block_cache` with
-**distinct** `source_id`s to several readers (e.g. every dataset in a server,
-or every asset in a mosaic) to bound their combined decode memory to a single
-budget instead of one cache per reader. `MosaicTiler` does this automatically
-via its `ReaderPool`.
+byte budget (default **512 MB**). `ReaderConfig` carries a caller-supplied
+`source_id` (the cache key prefix) and the `block_cache`; pass the **same**
+`block_cache` with **distinct** `source_id`s to several readers (e.g. every
+dataset in a server, or every asset in a mosaic) to bound their combined decode
+memory to a single budget instead of one cache per reader. `MosaicTiler` does
+this automatically via its `ReaderPool`.
+
+### Performance notes
+
+- **Cache capacity is the strongest lever.** 512 MB holds a typical browsing
+  viewport for large RGB COGs; use 1024 MB for multi-dataset servers or wide
+  pan/zoom sessions.
+- **Prefer ZSTD over DEFLATE when creating COGs.** Benchmarks showed ZSTD
+  block decode at ~1.5 ms P50 vs ~4.5 ms P50 for DEFLATE (≈3× faster). Use
+  `gdal_translate -co COMPRESS=ZSTD -co ZSTD_LEVEL=1` for lowest read latency.
+- **`MAX_TILE_TASKS` should stay at its default (`available_parallelism()`).** Pinning
+  it lower inflates warp/encode P95 at high concurrency via scheduling queuing.
+  Only override after profiling confirms CPU contention at the default level.
+- **Concurrent in-flight single-flight.** When multiple requests race for the
+  same uncached block, only the first fetches and decodes it; the rest wait on
+  the result channel. If the owner is canceled (client disconnect), waiters
+  transparently retry with a fresh claim rather than surfacing a 500 error.
 
 ## Observability
 
