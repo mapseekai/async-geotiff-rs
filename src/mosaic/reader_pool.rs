@@ -15,14 +15,19 @@ use crate::blocking::CpuLimiter;
 use crate::error::{AgError, AgResult};
 use crate::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 
-/// How the pool reaches its assets. The two modes are mutually exclusive per
-/// pool: HTTP (each key is an HTTP URL, the default) or one caller-injected
-/// `object_store` backend (each key is a *decoded object key* within that
-/// single store — single server, single bucket; credentials and endpoint are
-/// the caller's concern, never held by the library).
-#[derive(Clone)]
-enum Backend {
+/// How a mosaic reaches its assets. The two modes are mutually exclusive per
+/// pool: HTTP (each asset key is an HTTP URL, the default) or one
+/// caller-injected `object_store` backend (each key is then a *decoded object
+/// key* within that single store — single server, single bucket; credentials
+/// and endpoint are the caller's concern, never held by the library).
+#[non_exhaustive]
+#[derive(Clone, Debug, Default)]
+pub enum Backend {
+    /// Open each asset over HTTP(S); asset keys are full URLs.
+    #[default]
     Http,
+    /// Open every asset through this `object_store` backend (S3/MinIO/local/…);
+    /// asset keys are decoded object keys, e.g. `"scenes/2026/tile.tif"`.
     Store(Arc<dyn ObjectStore>),
 }
 
@@ -44,49 +49,53 @@ pub struct ReaderPool {
     backend: Backend,
 }
 
-impl ReaderPool {
-    pub fn new(capacity: u64) -> Self {
-        Self::with_block_cache(capacity, Arc::new(BlockCache::new(CacheConfig::default())))
+/// Builds a [`ReaderPool`]. Both knobs are optional: the default backend is
+/// [`Backend::Http`] and the default block cache is a fresh
+/// `BlockCache::new(CacheConfig::default())` private to this pool.
+pub struct ReaderPoolBuilder {
+    capacity: u64,
+    block_cache: Option<Arc<BlockCache>>,
+    backend: Backend,
+}
+
+impl ReaderPoolBuilder {
+    /// Use a caller-supplied shared [`BlockCache`], so the pool's decoded
+    /// blocks live in (and are bounded by) the same cache the caller can
+    /// observe via [`BlockCache::stats`] and share with other readers
+    /// (keyed by `source_id`).
+    pub fn block_cache(mut self, block_cache: Arc<BlockCache>) -> Self {
+        self.block_cache = Some(block_cache);
+        self
     }
 
-    /// Like [`Self::new`] but uses a caller-supplied shared block cache, so the
-    /// pool's decoded blocks live in (and are bounded by) the same cache the
-    /// caller can observe via [`BlockCache::stats`] and share with other readers.
-    pub fn with_block_cache(capacity: u64, block_cache: Arc<BlockCache>) -> Self {
-        Self {
-            cache: moka::future::Cache::new(capacity),
-            block_cache,
+    /// How assets are opened — see [`Backend`]. With [`Backend::Store`], each
+    /// key passed to [`ReaderPool::get_or_open`] is a *decoded object key*
+    /// within that single store (e.g. `"scenes/2026/tile.tif"`), not an HTTP
+    /// URL. The library never holds credentials — wire them into the store.
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    pub fn build(self) -> ReaderPool {
+        ReaderPool {
+            cache: moka::future::Cache::new(self.capacity),
+            block_cache: self
+                .block_cache
+                .unwrap_or_else(|| Arc::new(BlockCache::new(CacheConfig::default()))),
             cpu: CpuLimiter::default(),
-            backend: Backend::Http,
+            backend: self.backend,
         }
     }
+}
 
-    /// Like [`Self::new`] but opens every asset through one caller-injected
-    /// `object_store` backend (S3/MinIO/local/…) instead of HTTP. Each key
-    /// passed to [`Self::get_or_open`] is then a *decoded object key* within
-    /// that single store (e.g. `"scenes/2026/tile.tif"`), not an HTTP URL.
-    /// The library never holds credentials — wire them into `store` yourself.
-    pub fn with_object_store(capacity: u64, store: Arc<dyn ObjectStore>) -> Self {
-        Self::with_object_store_and_block_cache(
+impl ReaderPool {
+    /// Start building a pool that keeps at most `capacity` opened readers.
+    pub fn builder(capacity: u64) -> ReaderPoolBuilder {
+        ReaderPoolBuilder {
             capacity,
-            store,
-            Arc::new(BlockCache::new(CacheConfig::default())),
-        )
-    }
-
-    /// [`Self::with_object_store`] plus a caller-supplied shared [`BlockCache`],
-    /// so object_store-backed assets share one decode-memory budget with the
-    /// caller's other readers (keyed by `source_id`).
-    pub fn with_object_store_and_block_cache(
-        capacity: u64,
-        store: Arc<dyn ObjectStore>,
-        block_cache: Arc<BlockCache>,
-    ) -> Self {
-        Self {
-            cache: moka::future::Cache::new(capacity),
-            block_cache,
-            cpu: CpuLimiter::default(),
-            backend: Backend::Store(store),
+            block_cache: None,
+            backend: Backend::Http,
         }
     }
 
@@ -127,13 +136,10 @@ impl ReaderPool {
                     cpu_limiter: Some(cpu),
                     ..ReaderConfig::default()
                 };
+                let builder = CogReader::builder().reader_config(cfg);
                 let r = match backend {
-                    Backend::Store(store) => {
-                        CogReader::open_object_store_with_config(store, &key_owned, cfg).await?
-                    }
-                    Backend::Http => {
-                        CogReader::open_http_with_config_default(&key_owned, cfg).await?
-                    }
+                    Backend::Store(store) => builder.open_object_store(store, &key_owned).await?,
+                    Backend::Http => builder.open_http(&key_owned).await?,
                 };
                 Ok::<_, AgError>(Arc::new(r))
             })
@@ -164,7 +170,7 @@ mod tests {
     async fn open_failure_redacts_query_string() {
         // The query string (where presigned credentials live) must not appear
         // in the error text; the path part must, for diagnosability.
-        let pool = ReaderPool::new(8);
+        let pool = ReaderPool::builder(8).build();
         let msg = match pool
             .get_or_open("http://127.0.0.1:1/nope.tif?X-Amz-Signature=s3cr3t", "n")
             .await
@@ -181,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_failure_is_mosaic_error() {
-        let pool = ReaderPool::new(8);
+        let pool = ReaderPool::builder(8).build();
         let result = pool
             .get_or_open("http://127.0.0.1:1/nope.tif", "nope")
             .await;
@@ -206,7 +212,9 @@ mod tests {
             return;
         }
         let store = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
-        let pool = ReaderPool::with_object_store(8, store);
+        let pool = ReaderPool::builder(8)
+            .backend(Backend::Store(store))
+            .build();
         let reader = pool
             .get_or_open(key, key)
             .await

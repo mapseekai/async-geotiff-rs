@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (default_tiler, view) = if let Some(u) = url.as_deref() {
         let cfg = runtime.reader_config(u.to_string(), Arc::clone(&block_cache));
-        let reader = CogReader::open_http_with_config_default(u, cfg).await?;
+        let reader = CogReader::builder().reader_config(cfg).open_http(u).await?;
         let v = default_view(&reader).unwrap_or(DefaultView {
             center_lon: 0.0,
             center_lat: 0.0,
@@ -244,7 +244,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let source = MosaicJsonSource::from_str(&json)?;
         // Share the one process-wide block cache with the mosaic too, so the
         // whole server (single datasets + mosaic) runs under a single budget.
-        let mosaic = MosaicTiler::with_block_cache(source, Arc::clone(&block_cache));
+        let mosaic = MosaicTiler::builder(source)
+            .block_cache(Arc::clone(&block_cache))
+            .build();
         state = state.with_mosaic(Arc::new(mosaic));
         mosaic_loaded = true;
         println!("Mosaic loaded from {path}");

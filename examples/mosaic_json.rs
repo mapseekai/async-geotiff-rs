@@ -13,7 +13,7 @@
 use async_geotiff::error::AgResult;
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
 use async_geotiff::style::TileStyle;
-use async_geotiff::tms::TileMatrixSet;
+use async_geotiff::tms::{TileCoord, TileMatrixSet};
 
 /// A minimal valid MosaicJSON. `quadkey_zoom` is 3, so the keys are
 /// length-3 quadkeys; each maps to the COG URLs covering that quadkey.
@@ -83,10 +83,12 @@ async fn main() -> AgResult<()> {
 
     match mosaic
         .tile(
-            TileMatrixSet::WebMercatorQuad,
-            z,
-            x,
-            y,
+            TileCoord {
+                tms: TileMatrixSet::WebMercatorQuad,
+                z,
+                x,
+                y,
+            },
             PixelSelection::First,
             &style,
         )

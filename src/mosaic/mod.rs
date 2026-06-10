@@ -26,7 +26,9 @@ use crate::render::pipeline::render;
 use crate::style::params::compile_cached;
 use crate::style::TileStyle;
 use crate::tiler::Tiler;
-use crate::tms::TileMatrixSet;
+use crate::tms::TileCoord;
+
+pub use reader_pool::Backend;
 
 use reader_pool::{redact_query, ReaderPool};
 use selection::Reducer;
@@ -62,76 +64,139 @@ pub struct MosaicTiler<S: MosaicSource> {
     cfg: MosaicConfig,
 }
 
+/// Builds a [`MosaicTiler`]. Every knob is optional — `build()` always
+/// succeeds:
+///
+/// ```no_run
+/// # use async_geotiff::mosaic::{Backend, MosaicConfig, MosaicTiler, MosaicJsonSource};
+/// # fn demo(source: MosaicJsonSource, store: std::sync::Arc<dyn object_store::ObjectStore>) {
+/// let mosaic = MosaicTiler::builder(source)
+///     .backend(Backend::Store(store))
+///     .config(MosaicConfig { chunk_size: 4, ..MosaicConfig::default() })
+///     .build();
+/// # }
+/// ```
+pub struct MosaicTilerBuilder<S: MosaicSource> {
+    source: S,
+    cfg: MosaicConfig,
+    block_cache: Option<Arc<BlockCache>>,
+    backend: Backend,
+}
+
+impl<S: MosaicSource> MosaicTilerBuilder<S> {
+    /// Explicit tuning parameters (chunk size, reader-pool capacity).
+    pub fn config(mut self, cfg: MosaicConfig) -> Self {
+        self.cfg = cfg;
+        self
+    }
+
+    /// Draw decoded blocks from a caller-supplied shared [`BlockCache`].
+    /// Inject the same `Arc<BlockCache>` here and into your other readers to
+    /// bound the whole process to one decode memory budget and to observe it
+    /// via [`BlockCache::stats`].
+    pub fn block_cache(mut self, block_cache: Arc<BlockCache>) -> Self {
+        self.block_cache = Some(block_cache);
+        self
+    }
+
+    /// How assets are opened — see [`Backend`]. With [`Backend::Store`],
+    /// every [`AssetRef::url`] returned by the source is interpreted as a
+    /// *decoded object key* within that single store (single server, single
+    /// bucket), e.g. `"scenes/2026/tile.tif"`. The library holds no
+    /// credentials: configure endpoint/bucket/auth on the store first.
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    pub fn build(self) -> MosaicTiler<S> {
+        let mut pool = ReaderPool::builder(self.cfg.reader_capacity).backend(self.backend);
+        if let Some(block_cache) = self.block_cache {
+            pool = pool.block_cache(block_cache);
+        }
+        MosaicTiler {
+            pool: pool.build(),
+            source: self.source,
+            cfg: self.cfg,
+        }
+    }
+}
+
 impl<S: MosaicSource> MosaicTiler<S> {
     /// Create a new `MosaicTiler` with default [`MosaicConfig`].
     pub fn new(source: S) -> Self {
-        Self::with_config(source, MosaicConfig::default())
+        Self::builder(source).build()
+    }
+
+    /// Start building a `MosaicTiler` — see [`MosaicTilerBuilder`].
+    pub fn builder(source: S) -> MosaicTilerBuilder<S> {
+        MosaicTilerBuilder {
+            source,
+            cfg: MosaicConfig::default(),
+            block_cache: None,
+            backend: Backend::Http,
+        }
     }
 
     /// Create a `MosaicTiler` with explicit tuning parameters.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `MosaicTiler::builder(source).config(cfg).build()`"
+    )]
     pub fn with_config(source: S, cfg: MosaicConfig) -> Self {
-        Self {
-            pool: ReaderPool::new(cfg.reader_capacity),
-            source,
-            cfg,
-        }
+        Self::builder(source).config(cfg).build()
     }
 
     /// Create a `MosaicTiler` that draws its decoded blocks from a
-    /// caller-supplied shared [`BlockCache`]. Inject the same `Arc<BlockCache>`
-    /// here and into your other readers to bound the whole process to one decode
-    /// memory budget and to observe it via [`BlockCache::stats`].
+    /// caller-supplied shared [`BlockCache`].
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `MosaicTiler::builder(source).block_cache(cache).build()`"
+    )]
     pub fn with_block_cache(source: S, block_cache: Arc<BlockCache>) -> Self {
-        let cfg = MosaicConfig::default();
-        Self {
-            pool: ReaderPool::with_block_cache(cfg.reader_capacity, block_cache),
-            source,
-            cfg,
-        }
+        Self::builder(source).block_cache(block_cache).build()
     }
 
     /// Create a `MosaicTiler` whose assets are opened through one
-    /// caller-injected `object_store` backend (S3/MinIO/local/…) rather than
-    /// HTTP. Every [`AssetRef::url`] returned by `source` is then interpreted as
-    /// a *decoded object key* within that single store (single server, single
-    /// bucket), e.g. `"scenes/2026/tile.tif"`. The library holds no credentials:
-    /// configure endpoint/bucket/auth on `store` before injecting it.
+    /// caller-injected `object_store` backend rather than HTTP.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `MosaicTiler::builder(source).backend(Backend::Store(store)).build()`"
+    )]
     pub fn with_object_store(source: S, store: Arc<dyn object_store::ObjectStore>) -> Self {
-        Self::with_object_store_config(source, store, MosaicConfig::default())
+        Self::builder(source).backend(Backend::Store(store)).build()
     }
 
-    /// [`Self::with_object_store`] with explicit tuning parameters — the
-    /// object_store counterpart of [`Self::with_config`].
+    /// [`Self::with_object_store`] with explicit tuning parameters.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `MosaicTiler::builder(source).backend(Backend::Store(store)).config(cfg).build()`"
+    )]
     pub fn with_object_store_config(
         source: S,
         store: Arc<dyn object_store::ObjectStore>,
         cfg: MosaicConfig,
     ) -> Self {
-        Self {
-            pool: ReaderPool::with_object_store(cfg.reader_capacity, store),
-            source,
-            cfg,
-        }
+        Self::builder(source)
+            .backend(Backend::Store(store))
+            .config(cfg)
+            .build()
     }
 
-    /// [`Self::with_object_store`] plus a caller-supplied shared [`BlockCache`],
-    /// so the object_store-backed mosaic shares one decode-memory budget with
-    /// the caller's other readers (see [`Self::with_block_cache`]).
+    /// [`Self::with_object_store`] plus a caller-supplied shared [`BlockCache`].
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `MosaicTiler::builder(source).backend(Backend::Store(store)).block_cache(cache).build()`"
+    )]
     pub fn with_object_store_and_block_cache(
         source: S,
         store: Arc<dyn object_store::ObjectStore>,
         block_cache: Arc<BlockCache>,
     ) -> Self {
-        let cfg = MosaicConfig::default();
-        Self {
-            pool: ReaderPool::with_object_store_and_block_cache(
-                cfg.reader_capacity,
-                store,
-                block_cache,
-            ),
-            source,
-            cfg,
-        }
+        Self::builder(source)
+            .backend(Backend::Store(store))
+            .block_cache(block_cache)
+            .build()
     }
 
     /// The shared block cache backing this mosaic's reader pool — poll
@@ -146,17 +211,11 @@ impl<S: MosaicSource> MosaicTiler<S> {
     /// (rescale/colormap/color_formula/tilesize) once on the composite.
     pub async fn tile(
         &self,
-        tile_matrix_set: TileMatrixSet,
-        z: u8,
-        x: u32,
-        y: u32,
+        coord: TileCoord,
         selection: PixelSelection,
         style: &TileStyle,
     ) -> AgResult<Option<Bytes>> {
-        let assets = self
-            .source
-            .assets_for_tile(tile_matrix_set, z, x, y)
-            .await?;
+        let assets = self.source.assets_for_tile(coord).await?;
         if assets.is_empty() {
             return Ok(None);
         }
@@ -168,7 +227,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
             let futs = chunk.iter().map(|a| async move {
                 let reader = self.pool.get_or_open(&a.url, &a.source_id).await?;
                 let tiler = Tiler::new(reader);
-                let img = tiler.warp_tile(tile_matrix_set, z, x, y, style).await?;
+                let img = tiler.warp_tile(coord, style).await?;
                 Ok::<Option<Arc<ImageData>>, AgError>(img)
             });
             let results = futures::future::join_all(futs).await;
@@ -234,13 +293,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MosaicSource for OneLocal {
-        async fn assets_for_tile(
-            &self,
-            _tile_matrix_set: TileMatrixSet,
-            _z: u8,
-            _x: u32,
-            _y: u32,
-        ) -> AgResult<Vec<AssetRef>> {
+        async fn assets_for_tile(&self, _coord: TileCoord) -> AgResult<Vec<AssetRef>> {
             Ok(vec![AssetRef {
                 url: self.abspath.clone(),
                 source_id: self.abspath.clone(),
@@ -282,24 +335,19 @@ mod tests {
             * nz)
             .floor()
             .clamp(0.0, nz - 1.0)) as u32;
-        let single = tiler
-            .tile(TileMatrixSet::WebMercatorQuad, z, x, y, &style)
-            .await;
+        let coord = TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z,
+            x,
+            y,
+        };
+        let single = tiler.tile(coord, &style).await;
 
         let src = OneLocal {
             abspath: tif.to_string_lossy().into_owned(),
         };
         let m = MosaicTiler::new(src);
-        let mosaic = m
-            .tile(
-                TileMatrixSet::WebMercatorQuad,
-                z,
-                x,
-                y,
-                PixelSelection::First,
-                &style,
-            )
-            .await;
+        let mosaic = m.tile(coord, PixelSelection::First, &style).await;
 
         let _ = bounds;
         // The single-source path is the assertion: an in-bounds tile renders.
@@ -325,13 +373,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MosaicSource for OneKey {
-        async fn assets_for_tile(
-            &self,
-            _tile_matrix_set: TileMatrixSet,
-            _z: u8,
-            _x: u32,
-            _y: u32,
-        ) -> AgResult<Vec<AssetRef>> {
+        async fn assets_for_tile(&self, _coord: TileCoord) -> AgResult<Vec<AssetRef>> {
             Ok(vec![AssetRef {
                 url: self.key.clone(),
                 source_id: self.key.clone(),
@@ -384,13 +426,17 @@ mod tests {
         let src = OneKey {
             key: key.to_string(),
         };
-        let m = MosaicTiler::with_object_store(src, store.clone());
+        let m = MosaicTiler::builder(src)
+            .backend(Backend::Store(store.clone()))
+            .build();
         let mosaic = m
             .tile(
-                TileMatrixSet::WebMercatorQuad,
-                z,
-                x,
-                y,
+                TileCoord {
+                    tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+                    z,
+                    x,
+                    y,
+                },
                 PixelSelection::First,
                 &style,
             )
@@ -405,13 +451,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MosaicSource for NoAssets {
-        async fn assets_for_tile(
-            &self,
-            _tile_matrix_set: TileMatrixSet,
-            _z: u8,
-            _x: u32,
-            _y: u32,
-        ) -> AgResult<Vec<AssetRef>> {
+        async fn assets_for_tile(&self, _coord: TileCoord) -> AgResult<Vec<AssetRef>> {
             Ok(vec![])
         }
     }
@@ -423,10 +463,12 @@ mod tests {
         let style = TileStyle::from_query("").unwrap();
         let out = m
             .tile(
-                TileMatrixSet::WebMercatorQuad,
-                1,
-                0,
-                0,
+                TileCoord {
+                    tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+                    z: 1,
+                    x: 0,
+                    y: 0,
+                },
                 PixelSelection::First,
                 &style,
             )
@@ -439,10 +481,12 @@ mod tests {
     fn injected_block_cache_is_shared() {
         use crate::io::CacheConfig;
         let cache = Arc::new(BlockCache::new(CacheConfig::default()));
-        let m = MosaicTiler::with_block_cache(NoAssets, Arc::clone(&cache));
+        let m = MosaicTiler::builder(NoAssets)
+            .block_cache(Arc::clone(&cache))
+            .build();
         assert!(
             Arc::ptr_eq(&m.block_cache(), &cache),
-            "with_block_cache must use the injected cache"
+            "builder block_cache must use the injected cache"
         );
     }
 }

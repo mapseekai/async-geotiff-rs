@@ -16,6 +16,7 @@ use crate::io::block_cache::{
     BlockCache, BlockKey, BlockKind, BlockResult, Claim, DecodedBlock, InflightGuard, PendingBlock,
 };
 use crate::io::cache::CacheConfig;
+use crate::io::scale_offset::ScaleOffset;
 use crate::io::window::{tile_range_for_window, validate_window_shape, IfdInfo};
 #[cfg(feature = "perf-tracing")]
 use crate::perf::duration_ms;
@@ -110,8 +111,8 @@ pub struct CogReader {
     /// Associated/UnassociatedAlpha. Mirrors rio-tiler's
     /// "alpha band > nodata > none" mask priority.
     alpha_bands: Vec<Option<usize>>,
-    /// Per-band `(scale, offset)` from GDAL metadata (identity where absent).
-    band_scale_offset: Vec<(f64, f64)>,
+    /// Per-band SCALE/OFFSET from GDAL metadata (identity where absent).
+    band_scale_offset: Vec<ScaleOffset>,
     /// Logical source id; combined with level/kind/tile to key the shared
     /// block cache so identical tiles from the same source are reused.
     source_id: Arc<str>,
@@ -126,58 +127,89 @@ pub struct CogReader {
     prefetch_inflight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl CogReader {
+/// Builds a [`CogReader`]. Setters mirror [`ReaderConfig`] fields (plus HTTP
+/// [`ClientOptions`]); the async terminal methods pick the source:
+/// [`Self::open_http`], [`Self::open_object_store`], or [`Self::open`] for an
+/// existing [`ObjectReader`].
+///
+/// ```no_run
+/// # async fn demo(cache: std::sync::Arc<async_geotiff::io::BlockCache>) -> async_geotiff::error::AgResult<()> {
+/// use async_geotiff::io::CogReader;
+/// let reader = CogReader::builder()
+///     .source_id("scene-42")
+///     .block_cache(cache)
+///     .prefetch_ring(1)
+///     .open_http("https://example.com/scene.tif")
+///     .await?;
+/// # Ok(()) }
+/// ```
+pub struct CogReaderBuilder {
+    config: ReaderConfig,
+    client_options: Option<ClientOptions>,
+}
+
+impl CogReaderBuilder {
+    /// Caller-supplied id for this logical source — same id ⇒ shared decoded
+    /// blocks in the block cache (see [`ReaderConfig::source_id`]).
+    pub fn source_id(mut self, id: impl Into<String>) -> Self {
+        self.config.source_id = id.into();
+        self
+    }
+
+    /// Shared decoded-block cache injected by the caller. Inject the same
+    /// `Arc<BlockCache>` into several readers (with distinct `source_id`s) to
+    /// bound them to one memory budget.
+    pub fn block_cache(mut self, block_cache: Arc<BlockCache>) -> Self {
+        self.config.block_cache = block_cache;
+        self
+    }
+
+    /// Size a fresh private decoded-block cache — shorthand for
+    /// [`Self::block_cache`] with a new [`BlockCache`] built from `cache`.
+    pub fn cache_config(mut self, cache: CacheConfig) -> Self {
+        self.config.block_cache = Arc::new(BlockCache::new(cache));
+        self
+    }
+
+    /// Shared CPU-job limiter — see [`ReaderConfig::cpu_limiter`].
+    pub fn cpu_limiter(mut self, cpu: CpuLimiter) -> Self {
+        self.config.cpu_limiter = Some(cpu);
+        self
+    }
+
+    /// Cap on concurrent CPU-heavy decode/stitch jobs — see
+    /// [`ReaderConfig::max_decode_tasks`]. Ignored when a shared
+    /// [`Self::cpu_limiter`] is injected.
+    pub fn max_decode_tasks(mut self, n: usize) -> Self {
+        self.config.max_decode_tasks = n;
+        self
+    }
+
+    /// Speculative block prefetch radius — see [`ReaderConfig::prefetch_ring`].
+    pub fn prefetch_ring(mut self, ring: u8) -> Self {
+        self.config.prefetch_ring = ring;
+        self
+    }
+
+    /// Replace the whole [`ReaderConfig`] at once. Setters called afterwards
+    /// still apply on top of it.
+    pub fn reader_config(mut self, config: ReaderConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// Override HTTP [`ClientOptions`] (timeouts, proxy, custom headers).
+    /// Only consulted by [`Self::open_http`]; the default is tuned for
+    /// tile-server workloads (large per-host idle pool, 30s timeout).
+    pub fn client_options(mut self, options: ClientOptions) -> Self {
+        self.client_options = Some(options);
+        self
+    }
+
     /// Open a remote COG over HTTPS (or any URL `object_store::http` supports).
-    ///
-    /// Uses tuned `ClientOptions` for tile-server workloads: large per-host
-    /// idle pool so concurrent tile requests reuse connections instead of
-    /// paying TLS handshake per fetch, and a 30s timeout.
-    pub async fn open_http(url: &str) -> AgResult<Self> {
-        Self::open_http_with_options(url, default_client_options()).await
-    }
-
-    /// Like [`Self::open_http`] but lets the caller override [`ClientOptions`]
-    /// (e.g. timeouts, proxy, custom headers).
-    pub async fn open_http_with_options(url: &str, options: ClientOptions) -> AgResult<Self> {
-        Self::open_http_with_cache(url, options, CacheConfig::default()).await
-    }
-
-    /// Like [`Self::open_http_with_options`] but also lets the caller size the
-    /// decoded-block cache.
-    pub async fn open_http_with_cache(
-        url: &str,
-        options: ClientOptions,
-        cache: CacheConfig,
-    ) -> AgResult<Self> {
-        Self::open_http_with_config(
-            url,
-            options,
-            ReaderConfig {
-                block_cache: Arc::new(crate::io::block_cache::BlockCache::new(cache)),
-                ..ReaderConfig::default()
-            },
-        )
-        .await
-    }
-
-    /// Like [`Self::open_http`] but lets the caller inject a full [`ReaderConfig`]
-    /// (shared block cache, stable source id, decode concurrency) while using
-    /// the default tuned [`ClientOptions`]. Use this to make several readers
-    /// share one `Arc<BlockCache>` (and one memory budget): give each a distinct
-    /// `source_id` and the same `block_cache`. `ReaderPool` does exactly this so
-    /// all mosaic asset readers share one budget.
-    pub async fn open_http_with_config_default(url: &str, config: ReaderConfig) -> AgResult<Self> {
-        Self::open_http_with_config(url, default_client_options(), config).await
-    }
-
-    /// Like [`Self::open_http_with_cache`] but lets callers configure both cache
-    /// capacity and CPU decode concurrency.
-    pub async fn open_http_with_config(
-        url: &str,
-        options: ClientOptions,
-        config: ReaderConfig,
-    ) -> AgResult<Self> {
+    pub async fn open_http(self, url: &str) -> AgResult<CogReader> {
         let (base, path) = split_http_url(url)?;
+        let options = self.client_options.unwrap_or_else(default_client_options);
         let store: Arc<dyn ObjectStore> = Arc::new(
             HttpBuilder::new()
                 .with_url(base)
@@ -191,36 +223,138 @@ impl CogReader {
         // making the loopback GET 404 → tile 500.
         let object_path = Path::from_url_path(&path)
             .map_err(|e| AgError::Tiff(format!("invalid object path {path:?}: {e}")))?;
-        let reader = ObjectReader::new(store, object_path);
-        Self::open_with_reader_and_config(reader, config).await
+        CogReader::open_impl(ObjectReader::new(store, object_path), self.config).await
     }
 
-    /// Open from an existing `ObjectReader` (lets callers wire any object_store).
+    /// Open a COG through any `object_store` backend (S3/MinIO, GCS, local, …).
+    ///
+    /// `key` must be a **decoded** object key (e.g. `"data/my file.tif"`),
+    /// not a URL-encoded string — it is passed verbatim to `Path::from`.
+    /// The library never holds credentials — wire them into `store` yourself.
+    pub async fn open_object_store(
+        self,
+        store: Arc<dyn ObjectStore>,
+        key: &str,
+    ) -> AgResult<CogReader> {
+        CogReader::open_impl(ObjectReader::new(store, Path::from(key)), self.config).await
+    }
+
+    /// Open from an existing [`ObjectReader`] (lets callers wire any
+    /// object_store themselves).
+    pub async fn open(self, reader: ObjectReader) -> AgResult<CogReader> {
+        CogReader::open_impl(reader, self.config).await
+    }
+}
+
+impl CogReader {
+    /// Start building a reader — see [`CogReaderBuilder`].
+    pub fn builder() -> CogReaderBuilder {
+        CogReaderBuilder {
+            config: ReaderConfig::default(),
+            client_options: None,
+        }
+    }
+
+    /// Open a remote COG over HTTPS (or any URL `object_store::http` supports)
+    /// with default configuration — shorthand for
+    /// `CogReader::builder().open_http(url)`.
+    ///
+    /// Uses tuned `ClientOptions` for tile-server workloads: large per-host
+    /// idle pool so concurrent tile requests reuse connections instead of
+    /// paying TLS handshake per fetch, and a 30s timeout.
+    pub async fn open_http(url: &str) -> AgResult<Self> {
+        Self::builder().open_http(url).await
+    }
+
+    /// Like [`Self::open_http`] but lets the caller override [`ClientOptions`]
+    /// (e.g. timeouts, proxy, custom headers).
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `CogReader::builder().client_options(options).open_http(url)`"
+    )]
+    pub async fn open_http_with_options(url: &str, options: ClientOptions) -> AgResult<Self> {
+        Self::builder().client_options(options).open_http(url).await
+    }
+
+    /// Like [`Self::open_http_with_options`] but also lets the caller size the
+    /// decoded-block cache.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `CogReader::builder().client_options(options).cache_config(cache).open_http(url)`"
+    )]
+    pub async fn open_http_with_cache(
+        url: &str,
+        options: ClientOptions,
+        cache: CacheConfig,
+    ) -> AgResult<Self> {
+        Self::builder()
+            .client_options(options)
+            .cache_config(cache)
+            .open_http(url)
+            .await
+    }
+
+    /// Like [`Self::open_http`] but lets the caller inject a full [`ReaderConfig`].
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `CogReader::builder().reader_config(config).open_http(url)`"
+    )]
+    pub async fn open_http_with_config_default(url: &str, config: ReaderConfig) -> AgResult<Self> {
+        Self::builder().reader_config(config).open_http(url).await
+    }
+
+    /// Like [`Self::open_http_with_cache`] but lets callers configure both cache
+    /// capacity and CPU decode concurrency.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `CogReader::builder().reader_config(config).client_options(options).open_http(url)`"
+    )]
+    pub async fn open_http_with_config(
+        url: &str,
+        options: ClientOptions,
+        config: ReaderConfig,
+    ) -> AgResult<Self> {
+        Self::builder()
+            .reader_config(config)
+            .client_options(options)
+            .open_http(url)
+            .await
+    }
+
+    /// Open from an existing `ObjectReader` with default configuration —
+    /// shorthand for `CogReader::builder().open(reader)`.
     pub async fn open_with_reader(reader: ObjectReader) -> AgResult<Self> {
-        Self::open_with_reader_and_cache(reader, CacheConfig::default()).await
+        Self::builder().open(reader).await
     }
 
     /// Open from an existing `ObjectReader` with an explicit cache config.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `CogReader::builder().cache_config(cache).open(reader)`"
+    )]
     pub async fn open_with_reader_and_cache(
         reader: ObjectReader,
         cache: CacheConfig,
     ) -> AgResult<Self> {
-        Self::open_with_reader_and_config(
-            reader,
-            ReaderConfig {
-                block_cache: Arc::new(crate::io::block_cache::BlockCache::new(cache)),
-                ..ReaderConfig::default()
-            },
-        )
-        .await
+        Self::builder().cache_config(cache).open(reader).await
     }
 
     /// Open from an existing `ObjectReader` with explicit cache and decode
     /// concurrency settings.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `CogReader::builder().reader_config(config).open(reader)`"
+    )]
     pub async fn open_with_reader_and_config(
         reader: ObjectReader,
         config: ReaderConfig,
     ) -> AgResult<Self> {
+        Self::builder().reader_config(config).open(reader).await
+    }
+
+    /// Shared open path: every builder terminal method and deprecated
+    /// constructor funnels through here.
+    async fn open_impl(reader: ObjectReader, config: ReaderConfig) -> AgResult<Self> {
         let md_cache = ReadaheadMetadataCache::new(reader.clone());
         let mut md = TiffMetadataReader::try_open(&md_cache)
             .await
@@ -264,42 +398,47 @@ impl CogReader {
     }
 
     /// Open a COG from an existing object store and key, building the
-    /// `ObjectReader` internally. Lets callers wire any `object_store`
-    /// backend (S3/MinIO, GCS, local, …) without naming `ObjectReader`.
+    /// `ObjectReader` internally, with default configuration — shorthand for
+    /// `CogReader::builder().open_object_store(store, key)`.
     ///
     /// `key` must be a **decoded** object key (e.g. `"data/my file.tif"`),
     /// not a URL-encoded string — it is passed verbatim to `Path::from`.
     pub async fn open_object_store(store: Arc<dyn ObjectStore>, key: &str) -> AgResult<Self> {
-        Self::open_object_store_with_config(store, key, ReaderConfig::default()).await
+        Self::builder().open_object_store(store, key).await
     }
 
     /// Like [`Self::open_object_store`] but lets the caller size the decoded-block
     /// cache.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `CogReader::builder().cache_config(cache).open_object_store(store, key)`"
+    )]
     pub async fn open_object_store_with_cache(
         store: Arc<dyn ObjectStore>,
         key: &str,
         cache: CacheConfig,
     ) -> AgResult<Self> {
-        Self::open_object_store_with_config(
-            store,
-            key,
-            ReaderConfig {
-                block_cache: Arc::new(crate::io::block_cache::BlockCache::new(cache)),
-                ..ReaderConfig::default()
-            },
-        )
-        .await
+        Self::builder()
+            .cache_config(cache)
+            .open_object_store(store, key)
+            .await
     }
 
     /// Like [`Self::open_object_store`] but lets callers configure cache capacity
     /// and CPU decode concurrency.
+    #[deprecated(
+        since = "0.0.9",
+        note = "use `CogReader::builder().reader_config(config).open_object_store(store, key)`"
+    )]
     pub async fn open_object_store_with_config(
         store: Arc<dyn ObjectStore>,
         key: &str,
         config: ReaderConfig,
     ) -> AgResult<Self> {
-        let reader = ObjectReader::new(store, Path::from(key));
-        Self::open_with_reader_and_config(reader, config).await
+        Self::builder()
+            .reader_config(config)
+            .open_object_store(store, key)
+            .await
     }
 
     /// The shared CPU-job limiter backing this reader. A [`Tiler`] built from
@@ -1010,9 +1149,9 @@ impl CogReader {
         })
     }
 
-    /// Per-band `(scale, offset)` from GDAL metadata; identity `(1.0, 0.0)`
+    /// Per-band [`ScaleOffset`] from GDAL metadata; [`ScaleOffset::IDENTITY`]
     /// where absent. Apply as `physical = raw * scale + offset` when unscaling.
-    pub fn band_scale_offset(&self) -> &[(f64, f64)] {
+    pub fn band_scale_offset(&self) -> &[ScaleOffset] {
         &self.band_scale_offset
     }
 
@@ -1231,7 +1370,7 @@ mod scale_offset_reader_tests {
         .unwrap();
         // RGB fixture without SCALE/OFFSET metadata → identity per band.
         let so = r.band_scale_offset();
-        assert!(so.iter().all(|&(s, o)| s == 1.0 && o == 0.0));
+        assert!(so.iter().all(|s| s.is_identity()));
         assert_eq!(so.len(), 3);
     }
 }
@@ -1282,16 +1421,12 @@ mod tests {
         use object_store::path::Path as OsPath;
         let os_path = OsPath::from_filesystem_path(tif).unwrap();
         let reader = ObjectReader::new(std::sync::Arc::new(LocalFileSystem::new()), os_path);
-        CogReader::open_with_reader_and_config(
-            reader,
-            ReaderConfig {
-                source_id: source_id.to_string(),
-                block_cache: cache,
-                ..ReaderConfig::default()
-            },
-        )
-        .await
-        .unwrap()
+        CogReader::builder()
+            .source_id(source_id)
+            .block_cache(cache)
+            .open(reader)
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1341,17 +1476,13 @@ mod tests {
         let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
         let os_path = OsPath::from_filesystem_path(&tif).unwrap();
         let reader = ObjectReader::new(std::sync::Arc::new(LocalFileSystem::new()), os_path);
-        let cog = CogReader::open_with_reader_and_config(
-            reader,
-            ReaderConfig {
-                source_id: "prefetch-test".into(),
-                block_cache: std::sync::Arc::clone(&cache),
-                prefetch_ring: 1,
-                ..ReaderConfig::default()
-            },
-        )
-        .await
-        .unwrap();
+        let cog = CogReader::builder()
+            .source_id("prefetch-test")
+            .block_cache(std::sync::Arc::clone(&cache))
+            .prefetch_ring(1)
+            .open(reader)
+            .await
+            .unwrap();
 
         // Need at least a 2-block grid at level 0 for a ring to exist.
         let info = IfdInfo::from(cog.data_ifd(0).unwrap());

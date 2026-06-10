@@ -11,6 +11,45 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-06-11
+
+### ⚠️ BREAKING
+
+- `tms::TileCoord` replaces the positional `(tile_matrix_set, z, x, y)`
+  parameter group: `Tiler::tile` / `Tiler::warp_tile`, `MosaicTiler::tile`,
+  and the `MosaicSource::assets_for_tile` trait method now take a single
+  `TileCoord { tms, z, x, y }`. Construct it with a struct literal so `x`/`y`
+  are named at the call site and cannot be swapped silently.
+- `CogReader::band_scale_offset()` now returns `&[io::ScaleOffset]`
+  (named `scale`/`offset` fields with `apply()` / `IDENTITY`) instead of
+  `&[(f64, f64)]`.
+
+### Added
+
+- `CogReader::builder()` — builder-style construction with setters mirroring
+  `ReaderConfig` (`source_id`, `block_cache`, `cache_config`, `cpu_limiter`,
+  `max_decode_tasks`, `prefetch_ring`, `reader_config`, `client_options`) and
+  async terminal methods `open_http(url)`, `open_object_store(store, key)`,
+  and `open(reader)`.
+- `MosaicTiler::builder(source)` — builder with `.config(cfg)`,
+  `.block_cache(cache)`, and `.backend(backend)`; covers combinations the old
+  constructors could not express (e.g. object_store + shared block cache +
+  custom `MosaicConfig`).
+- `mosaic::Backend` — public, `#[non_exhaustive]` enum selecting how mosaic
+  assets are opened: `Http` (default) or `Store(Arc<dyn ObjectStore>)`.
+
+### Deprecated
+
+- `MosaicTiler::with_config` / `with_block_cache` / `with_object_store` /
+  `with_object_store_config` / `with_object_store_and_block_cache` — use
+  `MosaicTiler::builder(source)`.
+- `CogReader::open_http_with_options` / `open_http_with_cache` /
+  `open_http_with_config_default` / `open_http_with_config` /
+  `open_with_reader_and_cache` / `open_with_reader_and_config` /
+  `open_object_store_with_cache` / `open_object_store_with_config` — use
+  `CogReader::builder()`. The zero-config shortcuts `open_http`,
+  `open_with_reader`, and `open_object_store` remain.
+
 ## [0.0.8] - 2026-06-10
 
 ### Added
@@ -274,7 +313,9 @@ can land in any release** and are called out explicitly under a
 - PNG output; example axum server with MapLibre / OpenLayers / Leaflet
   viewers and a local `data/*.tif` dataset picker.
 
-[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.0.9...HEAD
+
+[0.0.9]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.9
 
 [0.0.8]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.8
 [0.0.7]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.7

@@ -20,7 +20,7 @@ use stac_client::{Client, SearchBuilder};
 use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::mosaic::source::{AssetRef, MosaicSource};
-use crate::tms::{TileMatrixSet, Tms};
+use crate::tms::{TileCoord, Tms};
 
 /// A [`MosaicSource`] that discovers COG assets by querying a STAC API's
 /// `POST /search` endpoint for items intersecting the requested tile's bbox.
@@ -62,17 +62,11 @@ impl StacSource {
 
 #[async_trait::async_trait]
 impl MosaicSource for StacSource {
-    async fn assets_for_tile(
-        &self,
-        tile_matrix_set: TileMatrixSet,
-        z: u8,
-        x: u32,
-        y: u32,
-    ) -> AgResult<Vec<AssetRef>> {
+    async fn assets_for_tile(&self, coord: TileCoord) -> AgResult<Vec<AssetRef>> {
         // 1. Compute tile bbox in the requested TMS, then convert to
         //    WGS84 (EPSG:4326) for the STAC bbox filter.
-        let tms = Tms::new(tile_matrix_set)?;
-        let tb = tms.tile_bbox(z, x, y)?;
+        let tms = Tms::new(coord.tms)?;
+        let tb = tms.tile_bbox(coord.z, coord.x, coord.y)?;
 
         // Four corners of the tile in EPSG:3857.
         let mut corners = [

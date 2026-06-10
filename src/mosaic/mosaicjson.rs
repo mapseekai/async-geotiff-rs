@@ -10,7 +10,7 @@ use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::mosaic::quadkey::{lookup, QkLookup};
 use crate::mosaic::source::{AssetRef, MosaicSource};
-use crate::tms::TileMatrixSet;
+use crate::tms::{TileCoord, TileMatrixSet};
 
 // MosaicJson mirrors the MosaicJSON 0.0.3 schema. Some fields are not
 // interpreted by the renderer yet, but they are preserved so crate users can
@@ -207,14 +207,8 @@ fn validate_document(doc: &mut MosaicJson) -> AgResult<()> {
 
 #[async_trait::async_trait]
 impl MosaicSource for MosaicJsonSource {
-    async fn assets_for_tile(
-        &self,
-        tile_matrix_set: TileMatrixSet,
-        z: u8,
-        x: u32,
-        y: u32,
-    ) -> AgResult<Vec<AssetRef>> {
-        if tile_matrix_set != TileMatrixSet::WebMercatorQuad {
+    async fn assets_for_tile(&self, coord: TileCoord) -> AgResult<Vec<AssetRef>> {
+        if coord.tms != TileMatrixSet::WebMercatorQuad {
             return Err(AgError::query(
                 "tms",
                 "MosaicJSON quadkey indexes only support WebMercatorQuad",
@@ -222,7 +216,7 @@ impl MosaicSource for MosaicJsonSource {
         }
 
         let mut urls: Vec<String> = Vec::new();
-        match lookup(z, x, y, self.quadkey_zoom) {
+        match lookup(coord.z, coord.x, coord.y, self.quadkey_zoom) {
             QkLookup::Exact(key) => {
                 if let Some(v) = self.doc.tiles.get(&key) {
                     urls.extend(v.iter().cloned());
@@ -302,7 +296,12 @@ mod tests {
             }
         }
         let got = s
-            .assets_for_tile(TileMatrixSet::WebMercatorQuad, 7, tx, ty)
+            .assets_for_tile(TileCoord {
+                tms: TileMatrixSet::WebMercatorQuad,
+                z: 7,
+                x: tx,
+                y: ty,
+            })
             .await
             .unwrap();
         let urls: Vec<_> = got.iter().map(|a| a.url.as_str()).collect();
@@ -336,7 +335,12 @@ mod tests {
     async fn rejects_non_webmercator_tile_matrix_set() {
         let s = MosaicJsonSource::from_str(DOC).unwrap();
         let err = s
-            .assets_for_tile(TileMatrixSet::WorldCrs84Quad, 7, 0, 0)
+            .assets_for_tile(TileCoord {
+                tms: TileMatrixSet::WorldCrs84Quad,
+                z: 7,
+                x: 0,
+                y: 0,
+            })
             .await
             .unwrap_err();
         assert!(matches!(err, AgError::Query { name, .. } if name == "tms"));

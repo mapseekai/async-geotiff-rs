@@ -43,6 +43,25 @@ impl FromStr for TileMatrixSet {
     }
 }
 
+/// One XYZ-slippy tile address within a [`TileMatrixSet`].
+///
+/// Groups the four values that previously travelled as positional parameters
+/// (`tile_matrix_set, z, x, y`) through every tile-rendering signature.
+/// Construct with a struct literal so `x` and `y` are named at the call site
+/// and cannot be silently swapped:
+///
+/// ```
+/// # use async_geotiff::tms::{TileCoord, TileMatrixSet};
+/// let coord = TileCoord { tms: TileMatrixSet::WebMercatorQuad, z: 12, x: 3412, y: 1670 };
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileCoord {
+    pub tms: TileMatrixSet,
+    pub z: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
 pub struct Tms {
     tile_matrix_set: TileMatrixSet,
     inner: InnerTms,

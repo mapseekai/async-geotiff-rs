@@ -10,7 +10,7 @@ use crate::blocking::{default_blocking_permits, CpuLimiter};
 use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::io::stats::{load_dataset_stats, DatasetStats};
-use crate::io::CogReader;
+use crate::io::{CogReader, ScaleOffset};
 #[cfg(feature = "perf-tracing")]
 use crate::perf::duration_ms;
 use crate::pixel::{ImageData, PixelData};
@@ -18,7 +18,7 @@ use crate::render::pipeline::{render, CompiledTileStyle};
 use crate::style::params::compile_cached;
 use crate::style::stretch::{fallback_rescale, resolve_rescale, Stretch};
 use crate::style::TileStyle;
-use crate::tms::{TileMatrixSet, Tms};
+use crate::tms::{TileCoord, Tms};
 use crate::warp;
 use tokio::sync::OnceCell;
 
@@ -149,16 +149,9 @@ impl Tiler {
     /// Returns `None` when the tile is fully outside the COG or outside the
     /// projection's valid domain. Shared by [`Self::warp_tile`] (mosaic
     /// per-asset path) and the fused [`Self::tile`] path.
-    fn plan_tile(
-        &self,
-        tile_matrix_set: TileMatrixSet,
-        z: u8,
-        x: u32,
-        y: u32,
-        style: &TileStyle,
-    ) -> AgResult<Option<ReadyPlan>> {
-        let tms = Tms::new(tile_matrix_set)?;
-        let dst_bbox = tms.tile_bbox(z, x, y)?;
+    fn plan_tile(&self, coord: TileCoord, style: &TileStyle) -> AgResult<Option<ReadyPlan>> {
+        let tms = Tms::new(coord.tms)?;
+        let dst_bbox = tms.tile_bbox(coord.z, coord.x, coord.y)?;
         let dst_crs = tms.crs();
 
         let bbox_in_src = if self.reader.src_crs() == &dst_crs {
@@ -236,15 +229,12 @@ impl Tiler {
     /// (HTTP 204). This is the per-asset primitive the mosaic layer reuses.
     pub async fn warp_tile(
         &self,
-        tile_matrix_set: TileMatrixSet,
-        z: u8,
-        x: u32,
-        y: u32,
+        coord: TileCoord,
         style: &TileStyle,
     ) -> AgResult<Option<Arc<ImageData>>> {
         #[cfg(feature = "perf-tracing")]
         let started = Instant::now();
-        let Some(plan) = self.plan_tile(tile_matrix_set, z, x, y, style)? else {
+        let Some(plan) = self.plan_tile(coord, style)? else {
             return Ok(None);
         };
         #[cfg(feature = "perf-tracing")]
@@ -319,20 +309,13 @@ impl Tiler {
     /// (transparent for PNG/WebP).
     #[cfg_attr(feature = "perf-tracing", tracing::instrument(
         skip(self, style),
-        fields(tms = tile_matrix_set.name(), z, x, y, format = ?style.format),
+        fields(tms = coord.tms.name(), z = coord.z, x = coord.x, y = coord.y, format = ?style.format),
         err
     ))]
-    pub async fn tile(
-        &self,
-        tile_matrix_set: TileMatrixSet,
-        z: u8,
-        x: u32,
-        y: u32,
-        style: &TileStyle,
-    ) -> AgResult<Option<Bytes>> {
+    pub async fn tile(&self, coord: TileCoord, style: &TileStyle) -> AgResult<Option<Bytes>> {
         #[cfg(feature = "perf-tracing")]
         let started = Instant::now();
-        let Some(plan) = self.plan_tile(tile_matrix_set, z, x, y, style)? else {
+        let Some(plan) = self.plan_tile(coord, style)? else {
             crate::perf_trace! {
                 tracing::debug!(
                     total_ms = duration_ms(started.elapsed()),
@@ -567,7 +550,7 @@ fn effective_compiled_sync(
     compiled: &Arc<CompiledTileStyle>,
     image: &ImageData,
     stats: Option<&Option<Arc<DatasetStats>>>,
-    scale_offset: &[(f64, f64)],
+    scale_offset: &[ScaleOffset],
     memo: &EffectiveMemo,
 ) -> AgResult<EffectiveOutcome> {
     use EffectiveOutcome::{NeedStats, Ready};
@@ -727,13 +710,16 @@ fn expression_rescale(
 
 /// Apply per-band `physical = raw * scale + offset`, returning a new F64
 /// `ImageData`. Bands beyond `scale_offset.len()` use identity.
-fn unscale_image(img: &ImageData, scale_offset: &[(f64, f64)]) -> ImageData {
+fn unscale_image(img: &ImageData, scale_offset: &[ScaleOffset]) -> ImageData {
     use ndarray::Axis;
     let mut data = img.pixels.to_f64();
     for (b, mut band) in data.axis_iter_mut(Axis(0)).enumerate() {
-        let (scale, offset) = scale_offset.get(b).copied().unwrap_or((1.0, 0.0));
-        if scale != 1.0 || offset != 0.0 {
-            band.mapv_inplace(|v| v * scale + offset);
+        let so = scale_offset
+            .get(b)
+            .copied()
+            .unwrap_or(ScaleOffset::IDENTITY);
+        if !so.is_identity() {
+            band.mapv_inplace(|v| so.apply(v));
         }
     }
     // The nodata sentinel is compared by VALUE in render's compute_valid_mask.
@@ -741,8 +727,11 @@ fn unscale_image(img: &ImageData, scale_offset: &[(f64, f64)]) -> ImageData {
     // interior nodata pixels (for COGs without a mask IFD) render opaque.
     // GDAL stores one nodata value for all bands → use band 0's affine.
     let nodata_physical = img.nodata.map(|nd| {
-        let (s, o) = scale_offset.first().copied().unwrap_or((1.0, 0.0));
-        nd * s + o
+        scale_offset
+            .first()
+            .copied()
+            .unwrap_or(ScaleOffset::IDENTITY)
+            .apply(nd)
     });
     ImageData {
         pixels: PixelData::F64(data),
@@ -759,15 +748,18 @@ fn unscale_image(img: &ImageData, scale_offset: &[(f64, f64)]) -> ImageData {
 fn unscale_ranges(
     ranges: &[(f64, f64)],
     bidx: &[usize],
-    scale_offset: &[(f64, f64)],
+    scale_offset: &[ScaleOffset],
 ) -> Vec<(f64, f64)> {
     ranges
         .iter()
         .enumerate()
         .map(|(i, &(lo, hi))| {
             let b = bidx.get(i).copied().unwrap_or(i);
-            let (s, o) = scale_offset.get(b).copied().unwrap_or((1.0, 0.0));
-            (lo * s + o, hi * s + o)
+            let so = scale_offset
+                .get(b)
+                .copied()
+                .unwrap_or(ScaleOffset::IDENTITY);
+            (so.apply(lo), so.apply(hi))
         })
         .collect()
 }
@@ -776,6 +768,11 @@ fn unscale_ranges(
 mod tests {
     use super::{expression_rescale, unscale_image, unscale_ranges, Tiler, TilerConfig};
     use crate::bounds::{Bbox, GeoTransform};
+    use crate::io::ScaleOffset;
+
+    fn so(scale: f64, offset: f64) -> ScaleOffset {
+        ScaleOffset { scale, offset }
+    }
 
     #[test]
     fn tiler_type_compiles() {
@@ -798,7 +795,7 @@ mod tests {
     async fn tile_returns_none_outside_data_and_some_inside() {
         use crate::io::CogReader;
         use crate::style::TileStyle;
-        use crate::tms::TileMatrixSet;
+        use crate::tms::{TileCoord, TileMatrixSet};
         use async_tiff::reader::ObjectReader;
         use object_store::local::LocalFileSystem;
         use object_store::path::Path as OsPath;
@@ -826,7 +823,15 @@ mod tests {
         let z = 12u8;
         let (cx, cy) = lonlat_to_tile((w + e) / 2.0, (s + n) / 2.0, z);
         let inside = tiler
-            .tile(TileMatrixSet::WebMercatorQuad, z, cx, cy, &style)
+            .tile(
+                TileCoord {
+                    tms: TileMatrixSet::WebMercatorQuad,
+                    z,
+                    x: cx,
+                    y: cy,
+                },
+                &style,
+            )
             .await
             .unwrap();
         assert!(inside.is_some(), "in-bounds tile must produce bytes");
@@ -842,7 +847,15 @@ mod tests {
         };
         let (ax, ay) = lonlat_to_tile(anti_lon, -(s + n) / 2.0, z);
         let outside = tiler
-            .tile(TileMatrixSet::WebMercatorQuad, z, ax, ay, &style)
+            .tile(
+                TileCoord {
+                    tms: TileMatrixSet::WebMercatorQuad,
+                    z,
+                    x: ax,
+                    y: ay,
+                },
+                &style,
+            )
             .await
             .unwrap();
         assert!(
@@ -902,8 +915,7 @@ mod tests {
             nodata: Some(-9999.0),
             bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
         };
-        let so = [(0.1, 1.0), (2.0, 0.0)];
-        let out = unscale_image(&img, &so);
+        let out = unscale_image(&img, &[so(0.1, 1.0), so(2.0, 0.0)]);
         let f = out.pixels.to_f64();
         assert_eq!(f[[0, 0, 0]], 10.0 * 0.1 + 1.0);
         assert_eq!(f[[0, 0, 1]], 20.0 * 0.1 + 1.0);
@@ -924,7 +936,7 @@ mod tests {
             nodata: Some(-9999.0),
             bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
         };
-        let out = unscale_image(&img, &[(0.1, 1.0)]);
+        let out = unscale_image(&img, &[so(0.1, 1.0)]);
         let f = out.pixels.to_f64();
         // the transformed nodata pixel must still equal the transformed sentinel,
         // so render's value-based nodata masking keeps working.
@@ -937,8 +949,7 @@ mod tests {
     fn unscale_ranges_applies_source_band_affine() {
         let ranges = vec![(0.0, 1000.0), (10.0, 20.0)];
         let bidx = vec![0usize, 1];
-        let so = vec![(0.01, 5.0), (2.0, 0.0)];
-        let out = unscale_ranges(&ranges, &bidx, &so);
+        let out = unscale_ranges(&ranges, &bidx, &[so(0.01, 5.0), so(2.0, 0.0)]);
         assert_eq!(out[0], (0.0 * 0.01 + 5.0, 1000.0 * 0.01 + 5.0));
         assert_eq!(out[1], (10.0 * 2.0, 20.0 * 2.0));
     }

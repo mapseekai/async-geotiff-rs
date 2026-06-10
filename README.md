@@ -176,11 +176,11 @@ dependencies.
 
 CPU-heavy decode/stitch and warp/render work is dispatched with
 `spawn_blocking` behind async `Semaphore` limits. Use
-`CogReader::open_http_with_config` / `CogReader::open_with_reader_and_config`
-with `async_geotiff::io::ReaderConfig` to tune decode concurrency, and
-`Tiler::with_config` with `async_geotiff::tiler::TilerConfig` to tune
-warp/render concurrency. Defaults use the host's available parallelism and
-clamp zero to one permit.
+`CogReader::builder()` (e.g. `.max_decode_tasks(n)`, `.block_cache(cache)`,
+then `.open_http(url)` / `.open_object_store(store, key)` / `.open(reader)`)
+to tune decode concurrency, and `Tiler::with_config` with
+`async_geotiff::tiler::TilerConfig` to tune warp/render concurrency. Defaults
+use the host's available parallelism and clamp zero to one permit.
 
 Decoded native tile blocks are cached in a shared `Arc<BlockCache>` under one
 byte budget (default **512 MB**). `ReaderConfig` carries a caller-supplied

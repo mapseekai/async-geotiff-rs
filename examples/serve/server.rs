@@ -20,7 +20,7 @@ use async_geotiff::io::{BlockCache, BlockCacheStats, CogReader, ReaderConfig};
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
 use async_geotiff::style::{TileFormat, TileStyle};
 use async_geotiff::tiler::{Tiler, TilerConfig};
-use async_geotiff::tms::TileMatrixSet;
+use async_geotiff::tms::{TileCoord, TileMatrixSet};
 
 const MAX_DATA_RESPONSE_BYTES: u64 = 32 << 20;
 #[cfg(feature = "perf-tracing")]
@@ -222,7 +222,10 @@ impl AppState {
             return self
                 .tilers
                 .try_get_with(name.to_string(), async move {
-                    let reader = CogReader::open_http_with_config_default(&url, cfg).await?;
+                    let reader = CogReader::builder()
+                        .reader_config(cfg)
+                        .open_http(&url)
+                        .await?;
                     Ok::<_, AgError>(Arc::new(Tiler::with_config(Arc::new(reader), tiler_config)))
                 })
                 .await
@@ -327,7 +330,17 @@ pub async fn tile_handler(
         };
         timer.mark("select_tiler");
 
-        let result = tiler.tile(tile_matrix_set, z, x, y, &style).await;
+        let result = tiler
+            .tile(
+                TileCoord {
+                    tms: tile_matrix_set,
+                    z,
+                    x,
+                    y,
+                },
+                &style,
+            )
+            .await;
         timer.mark("render");
 
         match result {
@@ -442,7 +455,16 @@ pub async fn mosaic_tile_handler(
     let span = tracing::Span::none();
     async move {
         let result = mosaic
-            .tile(tile_matrix_set, z, x, y, selection, &style)
+            .tile(
+                TileCoord {
+                    tms: tile_matrix_set,
+                    z,
+                    x,
+                    y,
+                },
+                selection,
+                &style,
+            )
             .await;
         timer.mark("render");
 
