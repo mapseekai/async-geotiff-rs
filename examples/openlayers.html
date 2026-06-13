@@ -83,6 +83,14 @@
         <label for="dataset">Dataset</label>
         <select id="dataset" name="dataset"></select>
       </div>
+
+      <div class="field">
+        <label for="basemap">Basemap</label>
+        <select id="basemap" name="basemap">
+          <option value="">blank</option>
+          <option value="osm">OpenStreetMap</option>
+        </select>
+      </div>
       <div class="field">
         <label for="colormap">Colormap</label>
         <select id="colormap" name="colormap_name">
@@ -174,6 +182,7 @@
       let styleVersion = 0;
       const c = {
         dataset: document.getElementById("dataset"),
+        basemap: document.getElementById("basemap"),
         colormap: document.getElementById("colormap"),
         stretch: document.getElementById("stretch"),
         stretchArg: document.getElementById("stretchArg"),
@@ -226,11 +235,18 @@
         source: cogSource,
         opacity: Number(c.opacity.value),
       });
+      const baseLayer = new ol.layer.Tile({ source: null });
+
       const map = new ol.Map({
         target: "map",
-        layers: [new ol.layer.Tile({ source: new ol.source.OSM() }), cogLayer],
+        layers: [baseLayer, cogLayer],
         view: new ol.View({ center: [0, 0], zoom: 2 }),
       });
+
+      function applyBasemap() {
+        baseLayer.setSource(c.basemap.value === "osm" ? new ol.source.OSM() : null);
+      }
+      applyBasemap();
 
       function applyStyle() {
         styleVersion += 1;
@@ -265,6 +281,8 @@
         e.preventDefault();
         applyStyle();
       });
+      c.basemap.addEventListener("change", applyBasemap);
+
       c.dataset.addEventListener("change", () => {
         applyStyle();
         flyToDataset();

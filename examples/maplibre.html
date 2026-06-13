@@ -136,6 +136,14 @@
         <label for="dataset">Dataset</label>
         <select id="dataset" name="dataset"></select>
       </div>
+
+      <div class="field">
+        <label for="basemap">Basemap</label>
+        <select id="basemap" name="basemap">
+          <option value="">blank</option>
+          <option value="osm">OpenStreetMap</option>
+        </select>
+      </div>
       <div class="field">
         <label for="mode">Source</label>
         <select id="mode" name="mode">
@@ -251,6 +259,7 @@
 
       const controls = {
         dataset: document.getElementById("dataset"),
+        basemap: document.getElementById("basemap"),
         mode: document.getElementById("mode"),
         pixelSelection: document.getElementById("pixel_selection"),
         colormap: document.getElementById("colormap"),
@@ -417,14 +426,9 @@
             }
           },
           layers: [
-            {
-              id: "osm-raster",
-              type: "raster",
-              source: "osm-raster"
-            },
-            {
-              id: "cog-raster",
-              type: "raster",
+          {
+            id: "cog-raster",
+            type: "raster",
               source: "cog-raster",
               paint: {
                 "raster-opacity": Number(controls.opacity.value)
@@ -436,6 +440,18 @@
         center: parseCenter(),
         zoom: parseZoom()
       });
+      function applyBasemap() {
+        if (!map.isStyleLoaded()) return;
+        if (map.getLayer("osm-raster")) map.removeLayer("osm-raster");
+        if (controls.basemap.value === "osm") {
+          map.addLayer(
+            { id: "osm-raster", type: "raster", source: "osm-raster" },
+            "cog-raster",
+          );
+        }
+      }
+      map.on("load", applyBasemap);
+
 
       map.addControl(new maplibregl.NavigationControl(), "top-right");
       map.addControl(new maplibregl.ScaleControl(), "bottom-right");
@@ -557,6 +573,8 @@
           console.warn("dataset bounds unavailable", err);
         }
       }
+
+      controls.basemap.addEventListener("change", applyBasemap);
 
       controls.dataset.addEventListener("change", () => {
         document.getElementById("style-form").requestSubmit();

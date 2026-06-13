@@ -83,6 +83,14 @@
         <label for="dataset">Dataset</label>
         <select id="dataset" name="dataset"></select>
       </div>
+
+      <div class="field">
+        <label for="basemap">Basemap</label>
+        <select id="basemap" name="basemap">
+          <option value="">blank</option>
+          <option value="osm">OpenStreetMap</option>
+        </select>
+      </div>
       <div class="field">
         <label for="colormap">Colormap</label>
         <select id="colormap" name="colormap_name">
@@ -174,6 +182,7 @@
       let styleVersion = 0;
       const c = {
         dataset: document.getElementById("dataset"),
+        basemap: document.getElementById("basemap"),
         colormap: document.getElementById("colormap"),
         stretch: document.getElementById("stretch"),
         stretchArg: document.getElementById("stretchArg"),
@@ -222,10 +231,21 @@
       }
 
       const map = L.map("map", { center: [0, 0], zoom: 2 });
-      L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19,
-        attribution: "© OpenStreetMap",
-      }).addTo(map);
+      let baseLayer = null;
+      function applyBasemap() {
+        if (baseLayer) {
+          map.removeLayer(baseLayer);
+          baseLayer = null;
+        }
+        if (c.basemap.value === "osm") {
+          baseLayer = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: "© OpenStreetMap",
+          }).addTo(map);
+          baseLayer.bringToBack();
+        }
+      }
+      applyBasemap();
 
       let cogLayer = L.tileLayer(tileUrl(), {
         maxZoom: 22,
@@ -271,6 +291,8 @@
         e.preventDefault();
         applyStyle();
       });
+      c.basemap.addEventListener("change", applyBasemap);
+
       c.dataset.addEventListener("change", () => {
         applyStyle();
         flyToDataset();
