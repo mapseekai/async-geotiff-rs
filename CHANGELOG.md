@@ -24,6 +24,12 @@ can land in any release** and are called out explicitly under a
   (named `scale`/`offset` fields with `apply()` / `IDENTITY`) instead of
   `&[(f64, f64)]`.
 
+### Changed
+
+- Added type-state boundaries for validated tile styles, validated IFD stitch
+  metadata, and non-empty mosaic reducers so invalid intermediate states are
+  represented in Rust types instead of late runtime checks.
+
 ### Added
 
 - `CogReader::builder()` — builder-style construction with setters mirroring

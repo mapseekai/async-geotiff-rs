@@ -31,7 +31,7 @@ use crate::tms::TileCoord;
 pub use reader_pool::Backend;
 
 use reader_pool::{redact_query, ReaderPool};
-use selection::Reducer;
+use selection::{NonEmptyReducer, Reducer};
 
 /// Tuning knobs for [`MosaicTiler`].
 ///
@@ -220,7 +220,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
             return Ok(None);
         }
 
-        let mut reducer = Reducer::new(selection);
+        let mut reducer: Option<Reducer<NonEmptyReducer>> = None;
         let mut fed = 0usize;
 
         for chunk in assets.chunks(self.cfg.chunk_size) {
@@ -235,7 +235,10 @@ impl<S: MosaicSource> MosaicTiler<S> {
             for (asset, res) in chunk.iter().zip(results) {
                 match res {
                     Ok(Some(img)) => {
-                        reducer.feed(&img)?;
+                        match reducer.as_mut() {
+                            Some(reducer) => reducer.feed(&img)?,
+                            None => reducer = Some(Reducer::new(selection).feed(&img)?),
+                        }
                         fed += 1;
                     }
                     Ok(None) => {}
@@ -252,7 +255,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
                 }
             }
 
-            if reducer.is_done() {
+            if reducer.as_ref().is_some_and(|reducer| reducer.is_done()) {
                 break;
             }
         }
@@ -261,6 +264,9 @@ impl<S: MosaicSource> MosaicTiler<S> {
             return Ok(None);
         }
 
+        let Some(reducer) = reducer else {
+            return Ok(None);
+        };
         let composite = reducer.finish()?;
         let compiled = compile_cached(style).await?;
         let img = composite;

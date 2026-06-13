@@ -36,6 +36,22 @@ pub struct TileStyle {
     pub format: TileFormat,
 }
 
+/// `TileStyle` after cross-field validation.
+#[derive(Clone, Debug)]
+pub struct ValidatedTileStyle {
+    style: TileStyle,
+}
+
+impl ValidatedTileStyle {
+    pub fn as_style(&self) -> &TileStyle {
+        &self.style
+    }
+
+    pub fn into_style(self) -> TileStyle {
+        self.style
+    }
+}
+
 impl Default for TileStyle {
     fn default() -> Self {
         Self {
@@ -59,6 +75,11 @@ impl Default for TileStyle {
 }
 
 impl TileStyle {
+    pub fn validate(self) -> AgResult<ValidatedTileStyle> {
+        validate_style(&self)?;
+        Ok(ValidatedTileStyle { style: self })
+    }
+
     /// Parse a URL query string (`?` not included).
     pub fn from_query(q: &str) -> AgResult<Self> {
         if q.is_empty() {
@@ -195,7 +216,58 @@ fn validate_tilesize(tilesize: u32) -> AgResult<()> {
     }
 }
 
+fn validate_style(style: &TileStyle) -> AgResult<()> {
+    style.format.ensure_available()?;
+    validate_tilesize(style.tilesize)?;
+
+    if style.colormap.is_some() && style.colormap_name.is_some() {
+        return Err(AgError::query(
+            "colormap",
+            "colormap and colormap_name are mutually exclusive",
+        ));
+    }
+
+    if let Some(&bad) = style.bidx.iter().find(|&&b| b == 0) {
+        return Err(AgError::query("bidx", format!("{bad} is not 1-indexed")));
+    }
+
+    if style.expression.is_some() {
+        if !style.bidx.is_empty() {
+            return Err(AgError::query(
+                "expression",
+                "expression and bidx are mutually exclusive",
+            ));
+        }
+
+        if style
+            .color_formula
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        {
+            return Err(AgError::query(
+                "expression",
+                "expression and color_formula are mutually exclusive",
+            ));
+        }
+
+        if style.rescale.len() > 1 {
+            return Err(AgError::query(
+                "expression",
+                "expression accepts at most one rescale range",
+            ));
+        }
+    }
+
+    style.resolved_stretch()?;
+    Ok(())
+}
+
+pub fn compile_validated(style: &ValidatedTileStyle) -> AgResult<CompiledTileStyle> {
+    compile(style.as_style())
+}
+
 pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
+    validate_style(style)?;
     style.format.ensure_available()?;
     validate_tilesize(style.tilesize)?;
     if style.colormap.is_some() && style.colormap_name.is_some() {

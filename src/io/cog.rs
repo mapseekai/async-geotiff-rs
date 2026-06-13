@@ -17,7 +17,7 @@ use crate::io::block_cache::{
 };
 use crate::io::cache::CacheConfig;
 use crate::io::scale_offset::ScaleOffset;
-use crate::io::window::{tile_range_for_window, validate_window_shape, IfdInfo};
+use crate::io::window::{tile_range_for_window, validate_window_shape, IfdInfo, ValidatedIfdInfo};
 #[cfg(feature = "perf-tracing")]
 use crate::perf::duration_ms;
 use crate::pixel::{ImageData, PixelData};
@@ -583,13 +583,13 @@ impl CogReader {
                 coords.push((x as usize, y as usize));
             }
         }
-        let data_info = IfdInfo::from(ifd);
+        let data_info = IfdInfo::from(ifd).validate()?;
 
         let mask_ifd = self.mask_ifd(level)?;
         #[cfg(feature = "perf-tracing")]
         let plan_done = started.elapsed();
         let (data_blocks, mask_blocks) = if let Some(mask_ifd) = mask_ifd {
-            let mask_info = IfdInfo::from(mask_ifd);
+            let mask_info = IfdInfo::from(mask_ifd).validate()?;
             let data_blocks = self.blocks_for(level, BlockKind::Data, ifd, &coords);
             let mask_blocks = self.blocks_for(level, BlockKind::Mask, mask_ifd, &coords);
             let (data_blocks, mask_blocks) = tokio::try_join!(data_blocks, mask_blocks)?;
@@ -712,7 +712,7 @@ impl CogReader {
 /// `(tx0..=tx1, ty0..=ty1)`, clamped to the IFD's tile grid and excluding the
 /// inner (already-read) rectangle.
 fn ring_coords(
-    info: &IfdInfo,
+    info: &IfdInfo<ValidatedIfdInfo>,
     (tx0, tx1): (u32, u32),
     (ty0, ty1): (u32, u32),
     ring: i64,
@@ -1091,7 +1091,10 @@ impl CogReader {
         tokio::spawn(async move {
             let _slot = slot;
             for (kind, ifd) in targets {
-                let coords = ring_coords(&IfdInfo::from(&ifd), tx_range, ty_range, ring);
+                let Ok(info) = IfdInfo::from(&ifd).validate() else {
+                    continue;
+                };
+                let coords = ring_coords(&info, tx_range, ty_range, ring);
                 if coords.is_empty() {
                     continue;
                 }
@@ -1434,14 +1437,9 @@ mod tests {
         use crate::io::window::IfdInfo;
         use async_tiff::tags::PlanarConfiguration;
         // 4×4 block grid (1024/256), window = block (0,0), ring = 1.
-        let info = IfdInfo {
-            tile_width: 256,
-            tile_height: 256,
-            bands: 3,
-            planar: PlanarConfiguration::Planar,
-            image_width: 1024,
-            image_height: 1024,
-        };
+        let info = IfdInfo::from_parts(256, 256, 3, PlanarConfiguration::Planar, 1024, 1024)
+            .validate()
+            .unwrap();
         let mut got = super::ring_coords(&info, (0, 0), (0, 0), 1);
         got.sort_unstable();
         // Corner window: only the 3 in-grid neighbours; (−1, *) clamped away.
@@ -1485,7 +1483,7 @@ mod tests {
             .unwrap();
 
         // Need at least a 2-block grid at level 0 for a ring to exist.
-        let info = IfdInfo::from(cog.data_ifd(0).unwrap());
+        let info = IfdInfo::from(cog.data_ifd(0).unwrap()).validate().unwrap();
         let ring = super::ring_coords(&info, (0, 0), (0, 0), 1);
         if ring.is_empty() {
             eprintln!("fixture is single-block at level 0, skipping");

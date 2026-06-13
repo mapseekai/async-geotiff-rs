@@ -1,6 +1,7 @@
 //! Pixel-selection reducer. Mirrors rio-tiler `MosaicMethodBase`.
 
 use ndarray::{Array2, Array3};
+use std::marker::PhantomData;
 
 use crate::error::{AgError, AgResult};
 use crate::pixel::{ImageData, PixelData};
@@ -42,7 +43,11 @@ impl PixelSelection {
 }
 
 /// Accumulates per-asset images into one composite.
-pub struct Reducer {
+pub enum EmptyReducer {}
+
+pub enum NonEmptyReducer {}
+
+pub struct Reducer<State = EmptyReducer> {
     method: PixelSelection,
     /// `(bands, h, w)` accumulator — `None` until first feed.
     /// First/Highest/Lowest: the running result. Mean: the running **sum**.
@@ -59,6 +64,7 @@ pub struct Reducer {
     bbox: Option<crate::bounds::Bbox>,
     crs: Option<crate::crs::Crs>,
     transform: Option<crate::bounds::GeoTransform>,
+    _state: PhantomData<State>,
 }
 
 /// `true` if pixel `(y, x)` is valid. `None` mask = everything valid, with no
@@ -76,7 +82,7 @@ fn owned_mask(m: Option<&Array2<bool>>, h: usize, w: usize) -> Array2<bool> {
         .unwrap_or_else(|| Array2::from_elem((h, w), true))
 }
 
-impl Reducer {
+impl Reducer<EmptyReducer> {
     pub fn new(method: PixelSelection) -> Self {
         Self {
             method,
@@ -88,16 +94,35 @@ impl Reducer {
             bbox: None,
             crs: None,
             transform: None,
+            _state: PhantomData,
         }
     }
 
+    pub fn feed(mut self, img: &ImageData) -> AgResult<Reducer<NonEmptyReducer>> {
+        self.feed_impl(img)?;
+        Ok(Reducer {
+            method: self.method,
+            acc: self.acc,
+            acc_mask: self.acc_mask,
+            count: self.count,
+            stack: self.stack,
+            remaining_invalid: self.remaining_invalid,
+            bbox: self.bbox,
+            crs: self.crs,
+            transform: self.transform,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<State> Reducer<State> {
     /// Feed one warped asset image (already on the destination tile grid).
     ///
     /// Pixels are widened to f64 here (8× the footprint of u8 imagery, like
     /// rio-tiler) so every selection method reduces over one numeric type;
     /// the composite is narrowed back at render time. The asset's mask is
     /// borrowed — it is only copied where a method must retain it.
-    pub fn feed(&mut self, img: &ImageData) -> AgResult<()> {
+    fn feed_impl(&mut self, img: &ImageData) -> AgResult<()> {
         let arr = img.pixels.to_f64(); // (bands, h, w)
         let m = img.mask.as_ref();
         if self.bbox.is_none() {
@@ -254,8 +279,14 @@ impl Reducer {
         // `remaining_invalid` is `usize::MAX` until the first feed sizes it.
         self.acc.is_some() && self.remaining_invalid == 0
     }
+}
 
-    /// Collapse to one `ImageData`. `Err` if nothing was fed.
+impl Reducer<NonEmptyReducer> {
+    pub fn feed(&mut self, img: &ImageData) -> AgResult<()> {
+        self.feed_impl(img)
+    }
+
+    /// Collapse to one `ImageData`.
     pub fn finish(self) -> AgResult<ImageData> {
         let (data, mask) = match self.method {
             PixelSelection::First | PixelSelection::Highest | PixelSelection::Lowest => {
@@ -365,8 +396,9 @@ mod tests {
 
     #[test]
     fn first_fills_holes_in_order_and_short_circuits() {
-        let mut r = Reducer::new(PixelSelection::First);
-        r.feed(&img(&[1.0, 0.0], &[true, false])).unwrap();
+        let mut r = Reducer::new(PixelSelection::First)
+            .feed(&img(&[1.0, 0.0], &[true, false]))
+            .unwrap();
         assert!(!r.is_done()); // pixel 1 still invalid
         r.feed(&img(&[9.0, 2.0], &[true, true])).unwrap();
         assert!(r.is_done()); // all valid now
@@ -378,29 +410,33 @@ mod tests {
 
     #[test]
     fn highest_takes_max_lowest_takes_min() {
-        let mut hi = Reducer::new(PixelSelection::Highest);
-        hi.feed(&img(&[1.0], &[true])).unwrap();
+        let mut hi = Reducer::new(PixelSelection::Highest)
+            .feed(&img(&[1.0], &[true]))
+            .unwrap();
         hi.feed(&img(&[5.0], &[true])).unwrap();
         hi.feed(&img(&[3.0], &[true])).unwrap();
         assert_eq!(hi.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 5.0);
 
-        let mut lo = Reducer::new(PixelSelection::Lowest);
-        lo.feed(&img(&[4.0], &[true])).unwrap();
+        let mut lo = Reducer::new(PixelSelection::Lowest)
+            .feed(&img(&[4.0], &[true]))
+            .unwrap();
         lo.feed(&img(&[2.0], &[true])).unwrap();
         assert_eq!(lo.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 2.0);
     }
 
     #[test]
     fn mean_and_median_skip_invalid_and_never_short_circuit() {
-        let mut me = Reducer::new(PixelSelection::Mean);
-        me.feed(&img(&[2.0], &[true])).unwrap();
+        let mut me = Reducer::new(PixelSelection::Mean)
+            .feed(&img(&[2.0], &[true]))
+            .unwrap();
         me.feed(&img(&[6.0], &[true])).unwrap();
         me.feed(&img(&[100.0], &[false])).unwrap(); // ignored
         assert!(!me.is_done()); // stack family: no short-circuit
         assert_eq!(me.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 4.0);
 
-        let mut md = Reducer::new(PixelSelection::Median);
-        md.feed(&img(&[1.0], &[true])).unwrap();
+        let mut md = Reducer::new(PixelSelection::Median)
+            .feed(&img(&[1.0], &[true]))
+            .unwrap();
         md.feed(&img(&[10.0], &[true])).unwrap();
         md.feed(&img(&[3.0], &[true])).unwrap();
         assert_eq!(md.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 3.0);
@@ -411,8 +447,9 @@ mod tests {
         // Two assets that both fully cover the tile. The second carries a
         // higher value at the pixel, so a correct Highest must read it even
         // though the tile was already "filled" after the first asset.
-        let mut hi = Reducer::new(PixelSelection::Highest);
-        hi.feed(&img(&[3.0], &[true])).unwrap();
+        let mut hi = Reducer::new(PixelSelection::Highest)
+            .feed(&img(&[3.0], &[true]))
+            .unwrap();
         assert!(
             !hi.is_done(),
             "Highest must never short-circuit (it needs a global max)"
@@ -421,8 +458,9 @@ mod tests {
         assert!(!hi.is_done());
         assert_eq!(hi.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 7.0);
 
-        let mut lo = Reducer::new(PixelSelection::Lowest);
-        lo.feed(&img(&[3.0], &[true])).unwrap();
+        let mut lo = Reducer::new(PixelSelection::Lowest)
+            .feed(&img(&[3.0], &[true]))
+            .unwrap();
         assert!(!lo.is_done());
         lo.feed(&img(&[1.0], &[true])).unwrap();
         assert_eq!(lo.finish().unwrap().pixels.to_f64()[[0, 0, 0]], 1.0);
@@ -431,9 +469,10 @@ mod tests {
     #[test]
     fn first_is_done_is_o1_and_tracks_remaining() {
         // Empty reducer is not done; partial coverage is not done; full is.
-        let mut r = Reducer::new(PixelSelection::First);
+        let r = Reducer::new(PixelSelection::First);
         assert!(!r.is_done(), "no assets fed → not done");
-        r.feed(&img(&[1.0, 0.0, 0.0], &[true, false, false]))
+        let mut r = r
+            .feed(&img(&[1.0, 0.0, 0.0], &[true, false, false]))
             .unwrap();
         assert!(!r.is_done());
         r.feed(&img(&[0.0, 2.0, 0.0], &[false, true, false]))
@@ -445,17 +484,18 @@ mod tests {
     }
 
     #[test]
-    fn finish_with_no_assets_is_error() {
+    fn empty_reducer_is_not_done() {
         let r = Reducer::new(PixelSelection::First);
-        assert!(r.finish().is_err());
+        assert!(!r.is_done());
     }
 
     #[test]
     fn median_and_mean_are_nan_safe() {
         // NaN samples with mask=true must not panic; median uses total order,
         // mean ignores non-finite samples.
-        let mut md = Reducer::new(PixelSelection::Median);
-        md.feed(&img(&[1.0], &[true])).unwrap();
+        let mut md = Reducer::new(PixelSelection::Median)
+            .feed(&img(&[1.0], &[true]))
+            .unwrap();
         md.feed(&img(&[f64::NAN], &[true])).unwrap();
         md.feed(&img(&[3.0], &[true])).unwrap();
         let v = md.finish().unwrap().pixels.to_f64()[[0, 0, 0]];
@@ -463,8 +503,9 @@ mod tests {
         assert!(v.is_finite()); // no panic
         assert_eq!(v, 3.0);
 
-        let mut me = Reducer::new(PixelSelection::Mean);
-        me.feed(&img(&[2.0], &[true])).unwrap();
+        let mut me = Reducer::new(PixelSelection::Mean)
+            .feed(&img(&[2.0], &[true]))
+            .unwrap();
         me.feed(&img(&[f64::NAN], &[true])).unwrap();
         me.feed(&img(&[4.0], &[true])).unwrap();
         // NaN filtered out: mean of [2.0, 4.0] = 3.0

@@ -1,6 +1,7 @@
 //! Bbox -> pixel window math + tile stitching.
 
 use std::borrow::Borrow;
+use std::marker::PhantomData;
 
 use crate::error::{AgError, AgResult};
 use crate::pixel::PixelData;
@@ -96,17 +97,24 @@ pub(crate) fn validate_window_shape(width: u64, height: u64) -> AgResult<()> {
 /// Plain-data view of the IFD attributes stitch needs. Extracted up front so
 /// `stitch_with_info` can run inside `spawn_blocking` without holding any
 /// `&ImageFileDirectory` borrow into `self`.
-#[derive(Debug, Clone, Copy)]
-pub struct IfdInfo {
+#[derive(Clone, Copy, Debug)]
+pub enum UncheckedIfdInfo {}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ValidatedIfdInfo {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct IfdInfo<State = UncheckedIfdInfo> {
     pub tile_width: u32,
     pub tile_height: u32,
     pub bands: usize,
     pub planar: PlanarConfiguration,
     pub image_width: u32,
     pub image_height: u32,
+    _state: PhantomData<State>,
 }
 
-impl From<&ImageFileDirectory> for IfdInfo {
+impl From<&ImageFileDirectory> for IfdInfo<UncheckedIfdInfo> {
     fn from(ifd: &ImageFileDirectory) -> Self {
         Self {
             tile_width: ifd.tile_width().unwrap_or_else(|| ifd.image_width()),
@@ -115,19 +123,47 @@ impl From<&ImageFileDirectory> for IfdInfo {
             planar: ifd.planar_configuration(),
             image_width: ifd.image_width(),
             image_height: ifd.image_height(),
+            _state: PhantomData,
         }
     }
 }
 
-impl IfdInfo {
-    fn validate(self) -> AgResult<Self> {
+impl IfdInfo<UncheckedIfdInfo> {
+    pub fn from_parts(
+        tile_width: u32,
+        tile_height: u32,
+        bands: usize,
+        planar: PlanarConfiguration,
+        image_width: u32,
+        image_height: u32,
+    ) -> Self {
+        Self {
+            tile_width,
+            tile_height,
+            bands,
+            planar,
+            image_width,
+            image_height,
+            _state: PhantomData,
+        }
+    }
+
+    pub fn validate(self) -> AgResult<IfdInfo<ValidatedIfdInfo>> {
         if self.tile_width == 0 || self.tile_height == 0 {
             return Err(AgError::Tiff("IFD has zero tile dimensions".into()));
         }
         if self.image_width == 0 || self.image_height == 0 {
             return Err(AgError::Tiff("IFD has zero image dimensions".into()));
         }
-        Ok(self)
+        Ok(IfdInfo {
+            tile_width: self.tile_width,
+            tile_height: self.tile_height,
+            bands: self.bands,
+            planar: self.planar,
+            image_width: self.image_width,
+            image_height: self.image_height,
+            _state: PhantomData,
+        })
     }
 }
 
@@ -185,14 +221,13 @@ pub fn stitch<A: Borrow<Array>>(
 pub fn stitch_with_info<A: Borrow<Array>>(
     arrays: &[A],
     coords: &[(usize, usize)],
-    info: &IfdInfo,
+    info: &IfdInfo<ValidatedIfdInfo>,
     col_off: i64,
     row_off: i64,
     width: u64,
     height: u64,
 ) -> AgResult<PixelData> {
     let planar = info.planar;
-    let info = info.validate()?;
     validate_window_shape(width, height)?;
     let bands = info.bands;
     let dst_h = height as usize;
@@ -268,7 +303,7 @@ pub fn stitch_with_info<A: Borrow<Array>>(
         | TypedArray::UInt64(_)
         | TypedArray::Int64(_)
         | TypedArray::Bool(_) => {
-            stitch_upcast_to_f32(arrays, coords, &info, col_off, row_off, width, height)
+            stitch_upcast_to_f32(arrays, coords, info, col_off, row_off, width, height)
         }
     }
 }
@@ -317,13 +352,12 @@ fn arrange_planar_view<'a, T: 'static>(
 fn stitch_upcast_to_f32<A: Borrow<Array>>(
     arrays: &[A],
     coords: &[(usize, usize)],
-    info: &IfdInfo,
+    info: &IfdInfo<ValidatedIfdInfo>,
     col_off: i64,
     row_off: i64,
     width: u64,
     height: u64,
 ) -> AgResult<PixelData> {
-    let info = info.validate()?;
     validate_window_shape(width, height)?;
     let tw = info.tile_width as i64;
     let th = info.tile_height as i64;
@@ -392,13 +426,12 @@ pub fn stitch_mask<A: Borrow<Array>>(
 pub fn stitch_mask_with_info<A: Borrow<Array>>(
     arrays: &[A],
     coords: &[(usize, usize)],
-    info: &IfdInfo,
+    info: &IfdInfo<ValidatedIfdInfo>,
     col_off: i64,
     row_off: i64,
     width: u64,
     height: u64,
 ) -> AgResult<Array2<bool>> {
-    let info = info.validate()?;
     validate_window_shape(width, height)?;
     let tw = info.tile_width as i64;
     let th = info.tile_height as i64;
