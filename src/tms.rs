@@ -78,6 +78,30 @@ impl Tms {
         })
     }
 
+    /// A process-lifetime cached `Tms` for `tile_matrix_set`. [`Self::new`]
+    /// clones and re-sorts the whole matrix set and builds proj transformers;
+    /// the tile pipeline resolves a `Tms` on every tile (and every mosaic
+    /// asset), so cache one instance per variant. `Tms` is `Send + Sync`.
+    pub fn cached(tile_matrix_set: TileMatrixSet) -> AgResult<&'static Tms> {
+        use std::sync::OnceLock;
+        fn slot(v: TileMatrixSet) -> &'static OnceLock<Tms> {
+            static WEB_MERCATOR: OnceLock<Tms> = OnceLock::new();
+            static WORLD_CRS84: OnceLock<Tms> = OnceLock::new();
+            match v {
+                TileMatrixSet::WebMercatorQuad => &WEB_MERCATOR,
+                TileMatrixSet::WorldCrs84Quad => &WORLD_CRS84,
+            }
+        }
+        let cell = slot(tile_matrix_set);
+        if let Some(t) = cell.get() {
+            return Ok(t);
+        }
+        // Build outside the cell (Tms::new is fallible); a concurrent racer's
+        // instance is simply dropped by `get_or_init`.
+        let built = Tms::new(tile_matrix_set)?;
+        Ok(cell.get_or_init(|| built))
+    }
+
     pub fn tile_matrix_set(&self) -> TileMatrixSet {
         self.tile_matrix_set
     }

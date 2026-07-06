@@ -65,7 +65,7 @@ impl MosaicSource for StacSource {
     async fn assets_for_tile(&self, coord: TileCoord) -> AgResult<Vec<AssetRef>> {
         // 1. Compute tile bbox in the requested TMS, then convert to
         //    WGS84 (EPSG:4326) for the STAC bbox filter.
-        let tms = Tms::new(coord.tms)?;
+        let tms = Tms::cached(coord.tms)?;
         let tb = tms.tile_bbox(coord.z, coord.x, coord.y)?;
 
         // Four corners of the tile in EPSG:3857.

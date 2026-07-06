@@ -21,6 +21,7 @@ use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
 use async_geotiff::style::{TileFormat, TileStyle};
 use async_geotiff::tiler::{Tiler, TilerConfig};
 use async_geotiff::tms::{TileCoord, TileMatrixSet};
+use async_geotiff::CpuLimiter;
 
 const MAX_DATA_RESPONSE_BYTES: u64 = 32 << 20;
 #[cfg(feature = "perf-tracing")]
@@ -155,6 +156,10 @@ pub struct AppState {
     /// One decoded-block cache shared by every per-dataset reader, so the
     /// total decode-memory budget is bounded once instead of per dataset.
     block_cache: Arc<BlockCache>,
+    /// One CPU-job limiter shared by every per-dataset reader+tiler, so the
+    /// process is bound to a single CPU budget instead of one semaphore per
+    /// cached dataset (which oversubscribes cores under load).
+    cpu_limiter: CpuLimiter,
     max_decode_tasks: usize,
     max_tile_tasks: usize,
     slow_tile_ms: Option<u64>,
@@ -176,6 +181,7 @@ impl AppState {
             http_base: http_base.into(),
             tilers: moka::future::Cache::new(64),
             block_cache,
+            cpu_limiter: CpuLimiter::default(),
             max_decode_tasks: ReaderConfig::default().max_decode_tasks,
             max_tile_tasks: TilerConfig::default().max_blocking_tasks,
             slow_tile_ms: None,
@@ -190,6 +196,9 @@ impl AppState {
     ) -> Self {
         self.max_decode_tasks = max_decode_tasks.max(1);
         self.max_tile_tasks = max_tile_tasks.max(1);
+        // Resize the shared budget to cover the larger of the two phases; every
+        // per-dataset reader+tiler draws from this one limiter.
+        self.cpu_limiter = CpuLimiter::new(self.max_decode_tasks.max(self.max_tile_tasks));
         self.slow_tile_ms = slow_tile_ms;
         self
     }
@@ -216,9 +225,10 @@ impl AppState {
             cfg.source_id = name.to_string();
             cfg.block_cache = Arc::clone(&self.block_cache);
             cfg.max_decode_tasks = self.max_decode_tasks;
-            let tiler_config = TilerConfig {
-                max_blocking_tasks: self.max_tile_tasks,
-            };
+            // Inject the one shared CPU limiter so every dataset's reader+tiler
+            // shares a single process-wide CPU budget instead of building its
+            // own semaphore per cached dataset.
+            cfg.cpu_limiter = Some(self.cpu_limiter.clone());
             return self
                 .tilers
                 .try_get_with(name.to_string(), async move {
@@ -226,7 +236,8 @@ impl AppState {
                         .reader_config(cfg)
                         .open_http(&url)
                         .await?;
-                    Ok::<_, AgError>(Arc::new(Tiler::with_config(Arc::new(reader), tiler_config)))
+                    // `Tiler::new` inherits the reader's (now shared) limiter.
+                    Ok::<_, AgError>(Arc::new(Tiler::new(Arc::new(reader))))
                 })
                 .await
                 .map_err(|e: Arc<AgError>| AgError::Tiff(format!("open dataset {name}: {e}")));
@@ -346,7 +357,19 @@ pub async fn tile_handler(
         match result {
             Ok(Some(bytes)) => {
                 timer.finish_ok_bytes(&bytes, state.slow_tile_ms);
-                with_cors(([("content-type", style.format.content_type())], bytes).into_response())
+                with_cors(
+                    (
+                        [
+                            ("content-type", style.format.content_type()),
+                            // COG tiles are immutable for a given URL+style, so
+                            // let browsers reuse them across pan/zoom instead of
+                            // re-rendering (and re-fetching upstream ranges).
+                            ("cache-control", "public, max-age=3600, immutable"),
+                        ],
+                        bytes,
+                    )
+                        .into_response(),
+                )
             }
             // Tile fully outside the dataset -> no content, so the map draws nothing
             // there (a black JPEG would otherwise cover out-of-range areas).
@@ -471,7 +494,19 @@ pub async fn mosaic_tile_handler(
         match result {
             Ok(Some(bytes)) => {
                 timer.finish_ok_bytes(&bytes, state.slow_tile_ms);
-                with_cors(([("content-type", style.format.content_type())], bytes).into_response())
+                with_cors(
+                    (
+                        [
+                            ("content-type", style.format.content_type()),
+                            // COG tiles are immutable for a given URL+style, so
+                            // let browsers reuse them across pan/zoom instead of
+                            // re-rendering (and re-fetching upstream ranges).
+                            ("cache-control", "public, max-age=3600, immutable"),
+                        ],
+                        bytes,
+                    )
+                        .into_response(),
+                )
             }
             // No asset covers this tile -> no content (map draws nothing here).
             Ok(None) => {

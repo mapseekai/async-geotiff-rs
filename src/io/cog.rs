@@ -571,6 +571,22 @@ impl CogReader {
         validate_window_shape(width, height)?;
         checked_window_end(col_off, width, "column")?;
         checked_window_end(row_off, height, "row")?;
+        // Bound the window to the level's pixel extent so a caller-supplied
+        // width/height cannot drive an allocation larger than the image itself
+        // (the output buffers below are sized `bands × height × width`). Every
+        // in-crate caller already clamps to the extent; this rejects the
+        // out-of-bounds windows an external caller could otherwise pass.
+        let (lvl_w, lvl_h) = self.level_dimensions(level)?;
+        if col_off < 0 || row_off < 0 {
+            return Err(AgError::Tiff(format!(
+                "window origin ({col_off},{row_off}) is negative"
+            )));
+        }
+        if col_off as u64 + width > u64::from(lvl_w) || row_off as u64 + height > u64::from(lvl_h) {
+            return Err(AgError::Tiff(format!(
+                "window {width}x{height}+{col_off}+{row_off} exceeds level {level} extent {lvl_w}x{lvl_h}"
+            )));
+        }
 
         let ifd = self.data_ifd(level)?;
         let ((tx0, tx1), (ty0, ty1)) = tile_range_for_window(ifd, col_off, row_off, width, height)
@@ -1536,6 +1552,35 @@ mod tests {
         );
         assert!(n1 > 0, "blocks must be cached");
         assert_eq!(n1, n2, "identical window must not add blocks");
+    }
+
+    #[tokio::test]
+    async fn read_window_rejects_out_of_bounds() {
+        use crate::io::block_cache::BlockCache;
+        use crate::io::cache::CacheConfig;
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("data/cog_uint8_rgb_nodata.tif");
+        if !tif.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
+        let r = open_local_for_test(&tif, "src-A", cache.clone()).await;
+        let (w, h) = r.level_dimensions(0).unwrap();
+        // A window far larger than the level must be rejected before it can
+        // drive a giant allocation — not clamped, not read.
+        assert!(
+            r.read_window(0, 0, 0, u64::from(w) + 100_000, u64::from(h) + 100_000)
+                .await
+                .is_err(),
+            "oversized window must be rejected"
+        );
+        // Exactly-in-bounds still works.
+        assert!(r
+            .read_window(0, 0, 0, u64::from(w), u64::from(h))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

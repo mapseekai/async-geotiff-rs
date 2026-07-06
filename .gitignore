@@ -6,3 +6,5 @@ Cargo.lock.bak
 /.omx/
 /.claude/
 /docs/superpowers/
+/.codegraph/
+/.serena/

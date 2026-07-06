@@ -15,6 +15,8 @@ use crate::blocking::CpuLimiter;
 use crate::error::{AgError, AgResult};
 use crate::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 
+use super::ssrf::{validate_http_url, HttpAccessPolicy};
+
 /// How a mosaic reaches its assets. The two modes are mutually exclusive per
 /// pool: HTTP (each asset key is an HTTP URL, the default) or one
 /// caller-injected `object_store` backend (each key is then a *decoded object
@@ -47,6 +49,10 @@ pub struct ReaderPool {
     /// to a single CPU budget instead of N independent per-reader semaphores.
     cpu: CpuLimiter,
     backend: Backend,
+    /// SSRF guard applied to HTTP asset URLs before they are opened. Ignored
+    /// for [`Backend::Store`] (keys there are object keys, not URLs, within a
+    /// caller-controlled store).
+    http_policy: HttpAccessPolicy,
 }
 
 /// Builds a [`ReaderPool`]. Both knobs are optional: the default backend is
@@ -56,6 +62,7 @@ pub struct ReaderPoolBuilder {
     capacity: u64,
     block_cache: Option<Arc<BlockCache>>,
     backend: Backend,
+    http_policy: HttpAccessPolicy,
 }
 
 impl ReaderPoolBuilder {
@@ -77,6 +84,15 @@ impl ReaderPoolBuilder {
         self
     }
 
+    /// SSRF policy for HTTP asset URLs — see [`HttpAccessPolicy`]. The default
+    /// ([`HttpAccessPolicy::default`]) blocks loopback and link-local (the
+    /// cloud-metadata endpoint) while allowing private ranges and plaintext
+    /// HTTP for internal object stores.
+    pub fn http_policy(mut self, policy: HttpAccessPolicy) -> Self {
+        self.http_policy = policy;
+        self
+    }
+
     pub fn build(self) -> ReaderPool {
         ReaderPool {
             cache: moka::future::Cache::new(self.capacity),
@@ -85,6 +101,7 @@ impl ReaderPoolBuilder {
                 .unwrap_or_else(|| Arc::new(BlockCache::new(CacheConfig::default()))),
             cpu: CpuLimiter::default(),
             backend: self.backend,
+            http_policy: self.http_policy,
         }
     }
 }
@@ -96,6 +113,7 @@ impl ReaderPool {
             capacity,
             block_cache: None,
             backend: Backend::Http,
+            http_policy: HttpAccessPolicy::default(),
         }
     }
 
@@ -122,6 +140,15 @@ impl ReaderPool {
         // same COG), so look up by borrowed key before allocating anything.
         if let Some(r) = self.cache.get(key).await {
             return Ok(r);
+        }
+        // SSRF guard on the miss path (cached readers already passed it): for
+        // HTTP asset URLs from untrusted mosaic/STAC documents, validate scheme
+        // and resolved host before opening. Store-backend keys are object keys
+        // within a caller-controlled store, so they are exempt.
+        if matches!(self.backend, Backend::Http) {
+            validate_http_url(key, &self.http_policy)
+                .await
+                .map_err(|e| AgError::Mosaic(format!("open asset {}: {e}", redact_query(key))))?;
         }
         let key_owned = key.to_string();
         let source_id = source_id.to_string();
@@ -169,8 +196,12 @@ mod tests {
     #[tokio::test]
     async fn open_failure_redacts_query_string() {
         // The query string (where presigned credentials live) must not appear
-        // in the error text; the path part must, for diagnosability.
-        let pool = ReaderPool::builder(8).build();
+        // in the error text; the path part must, for diagnosability. Use a
+        // permissive policy so this exercises the connect-failure path (the
+        // SSRF guard has its own tests in `super::ssrf`).
+        let pool = ReaderPool::builder(8)
+            .http_policy(HttpAccessPolicy::permissive())
+            .build();
         let msg = match pool
             .get_or_open("http://127.0.0.1:1/nope.tif?X-Amz-Signature=s3cr3t", "n")
             .await
@@ -187,7 +218,9 @@ mod tests {
 
     #[tokio::test]
     async fn open_failure_is_mosaic_error() {
-        let pool = ReaderPool::builder(8).build();
+        let pool = ReaderPool::builder(8)
+            .http_policy(HttpAccessPolicy::permissive())
+            .build();
         let result = pool
             .get_or_open("http://127.0.0.1:1/nope.tif", "nope")
             .await;
@@ -198,6 +231,22 @@ mod tests {
             }
             Ok(_) => panic!("expected error opening unreachable URL, but got Ok"),
         }
+    }
+
+    #[tokio::test]
+    async fn default_policy_blocks_loopback_asset() {
+        // Default pool policy must reject a loopback asset URL (SSRF guard)
+        // before ever attempting to connect, as a redacted Mosaic error.
+        let pool = ReaderPool::builder(8).build();
+        let msg = match pool
+            .get_or_open("http://127.0.0.1:9000/x.tif?X-Amz-Signature=s3cr3t", "n")
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("loopback asset must be rejected by default policy"),
+        };
+        assert!(msg.contains("blocked"), "expected policy rejection: {msg}");
+        assert!(!msg.contains("s3cr3t"), "credentials leaked: {msg}");
     }
 
     #[tokio::test]

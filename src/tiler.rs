@@ -150,7 +150,7 @@ impl Tiler {
     /// projection's valid domain. Shared by [`Self::warp_tile`] (mosaic
     /// per-asset path) and the fused [`Self::tile`] path.
     fn plan_tile(&self, coord: TileCoord, style: &TileStyle) -> AgResult<Option<ReadyPlan>> {
-        let tms = Tms::new(coord.tms)?;
+        let tms = Tms::cached(coord.tms)?;
         let dst_bbox = tms.tile_bbox(coord.z, coord.x, coord.y)?;
         let dst_crs = tms.crs();
 
@@ -667,7 +667,10 @@ fn expression_rescale(
     nodata: Option<f64>,
 ) -> Option<(f64, f64)> {
     use crate::render::expression::{eval_rpn_with, referenced_nodata_hit, Token};
-    let src = image.pixels.to_f64();
+    // Borrow as f64: warped cross-CRS tiles are already `F64`, so `as_f64`
+    // avoids the full-image clone `to_f64` would make on the hot expression path.
+    let src = image.pixels.as_f64();
+    let src = src.as_ref();
     let bands = src.shape()[0];
     let (h, w) = (src.shape()[1], src.shape()[2]);
     let refs: Vec<usize> = {

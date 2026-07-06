@@ -6,12 +6,14 @@ pub(crate) mod quadkey;
 mod reader_pool;
 pub(crate) mod selection;
 pub(crate) mod source;
+mod ssrf;
 #[cfg(feature = "stac")]
 pub(crate) mod stac;
 
 pub use mosaicjson::{MosaicDataType, MosaicJson, MosaicJsonSource};
 pub use selection::PixelSelection;
 pub use source::{AssetRef, MosaicSource};
+pub use ssrf::HttpAccessPolicy;
 #[cfg(feature = "stac")]
 pub use stac::StacSource;
 
@@ -46,6 +48,12 @@ pub struct MosaicConfig {
     pub chunk_size: usize,
     /// Max distinct opened COGs kept in the reader pool.
     pub reader_capacity: u64,
+    /// Hard cap on assets processed for a single tile. A low-zoom request whose
+    /// quadkey prefix matches a large fraction of the mosaic index could
+    /// otherwise fan out to thousands of remote opens/reads/warps per tile (a
+    /// fetch-amplification DoS). Excess assets past this cap are dropped with a
+    /// warning. `0` disables the cap.
+    pub max_assets_per_tile: usize,
 }
 
 impl Default for MosaicConfig {
@@ -53,6 +61,7 @@ impl Default for MosaicConfig {
         Self {
             chunk_size: 8,
             reader_capacity: 256,
+            max_assets_per_tile: 64,
         }
     }
 }
@@ -81,6 +90,7 @@ pub struct MosaicTilerBuilder<S: MosaicSource> {
     cfg: MosaicConfig,
     block_cache: Option<Arc<BlockCache>>,
     backend: Backend,
+    http_policy: Option<HttpAccessPolicy>,
 }
 
 impl<S: MosaicSource> MosaicTilerBuilder<S> {
@@ -109,10 +119,23 @@ impl<S: MosaicSource> MosaicTilerBuilder<S> {
         self
     }
 
+    /// SSRF policy for HTTP asset URLs — see [`HttpAccessPolicy`]. Asset URLs
+    /// come from the (possibly untrusted) mosaic source, so the default already
+    /// blocks loopback and the cloud-metadata endpoint; override to
+    /// [`HttpAccessPolicy::strict`] for fully untrusted documents or
+    /// [`HttpAccessPolicy::permissive`] when every URL is operator-controlled.
+    pub fn http_policy(mut self, policy: HttpAccessPolicy) -> Self {
+        self.http_policy = Some(policy);
+        self
+    }
+
     pub fn build(self) -> MosaicTiler<S> {
         let mut pool = ReaderPool::builder(self.cfg.reader_capacity).backend(self.backend);
         if let Some(block_cache) = self.block_cache {
             pool = pool.block_cache(block_cache);
+        }
+        if let Some(http_policy) = self.http_policy {
+            pool = pool.http_policy(http_policy);
         }
         MosaicTiler {
             pool: pool.build(),
@@ -135,6 +158,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
             cfg: MosaicConfig::default(),
             block_cache: None,
             backend: Backend::Http,
+            http_policy: None,
         }
     }
 
@@ -215,9 +239,21 @@ impl<S: MosaicSource> MosaicTiler<S> {
         selection: PixelSelection,
         style: &TileStyle,
     ) -> AgResult<Option<Bytes>> {
-        let assets = self.source.assets_for_tile(coord).await?;
+        let mut assets = self.source.assets_for_tile(coord).await?;
         if assets.is_empty() {
             return Ok(None);
+        }
+        // Cap fan-out: a low-zoom prefix match can return a huge asset set;
+        // opening/warping all of them per tile is a fetch-amplification DoS.
+        let cap = self.cfg.max_assets_per_tile;
+        if cap > 0 && assets.len() > cap {
+            tracing::warn!(
+                coord = ?(coord.z, coord.x, coord.y),
+                matched = assets.len(),
+                cap,
+                "mosaic tile asset fan-out capped"
+            );
+            assets.truncate(cap);
         }
 
         let mut reducer: Option<Reducer<NonEmptyReducer>> = None;
@@ -232,15 +268,13 @@ impl<S: MosaicSource> MosaicTiler<S> {
             });
             let results = futures::future::join_all(futs).await;
 
+            // Collect this chunk's warped assets on the async thread (cheap),
+            // logging skipped/failed ones here so credential-bearing URLs never
+            // cross into the blocking closure below.
+            let mut imgs: Vec<Arc<ImageData>> = Vec::with_capacity(chunk.len());
             for (asset, res) in chunk.iter().zip(results) {
                 match res {
-                    Ok(Some(img)) => {
-                        match reducer.as_mut() {
-                            Some(reducer) => reducer.feed(&img)?,
-                            None => reducer = Some(Reducer::new(selection).feed(&img)?),
-                        }
-                        fed += 1;
-                    }
+                    Ok(Some(img)) => imgs.push(img),
                     Ok(None) => {}
                     Err(e) => {
                         // Redacted: presigned/query-string credentials must not
@@ -253,6 +287,33 @@ impl<S: MosaicSource> MosaicTiler<S> {
                         );
                     }
                 }
+            }
+
+            if !imgs.is_empty() {
+                // The reducer widens each asset to f64 and runs a per-pixel
+                // reduction — real CPU work. Run the whole chunk's feed in ONE
+                // blocking job under a shared CPU permit so it neither stalls a
+                // tokio worker nor escapes the mosaic's CPU budget. The reducer
+                // moves in and back out so it accumulates across chunks.
+                let permit = self.pool.cpu_limiter().acquire().await?;
+                let taken = reducer.take();
+                let (next, added) = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let mut r = taken;
+                    let mut added = 0usize;
+                    for img in imgs {
+                        match r.as_mut() {
+                            Some(r) => r.feed(&img)?,
+                            None => r = Some(Reducer::new(selection).feed(&img)?),
+                        }
+                        added += 1;
+                    }
+                    Ok::<_, AgError>((r, added))
+                })
+                .await
+                .map_err(|e| AgError::Mosaic(format!("reduce join: {e}")))??;
+                reducer = next;
+                fed += added;
             }
 
             if reducer.as_ref().is_some_and(|reducer| reducer.is_done()) {
