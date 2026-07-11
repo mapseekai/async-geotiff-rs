@@ -443,90 +443,96 @@ pub fn stitch_mask_with_info<A: Borrow<Array>>(
         let arr = arr.borrow();
         let tile_col = (*tx as i64) * tw;
         let tile_row = (*ty as i64) * th;
-        let mask = array_to_mask(arr, info.planar)?;
-        let shape = mask.shape();
-        let (a_h, a_w) = (shape[0] as i64, shape[1] as i64);
+        let shape = arr.shape();
+        let (a_h, a_w, stride) = match info.planar {
+            PlanarConfiguration::Planar => (shape[1], shape[2], 1),
+            PlanarConfiguration::Chunky => (shape[0], shape[1], shape[2]),
+            _ => {
+                return Err(AgError::UnsupportedPixel(
+                    "unknown planar configuration".into(),
+                ))
+            }
+        };
 
-        let Some(win) = tile_copy_window(tile_footprint(tile_col, tile_row, a_w, a_h), requested)
-        else {
+        let Some(win) = tile_copy_window(
+            tile_footprint(tile_col, tile_row, a_w as i64, a_h as i64),
+            requested,
+        ) else {
             continue;
         };
 
-        out.slice_mut(s![win.dst_r0..win.dst_r1, win.dst_c0..win.dst_c1])
-            .assign(&mask.slice(s![win.src_r0..win.src_r1, win.src_c0..win.src_c1]));
-    }
-    Ok(out)
-}
-
-/// Build an `Array2<bool>` (valid-pixel mask) from the first mask band of a
-/// decoded tile. Avoids the previous `iter().map(|x| x != 0).collect()` →
-/// `Array3::from_shape_vec` → `index_axis` → `to_owned` chain (3 allocations
-/// per tile); instead does one shape-and-axes-aware single-pass fill into a
-/// pre-sized `Array2<bool>`.
-fn array_to_mask(arr: &Array, planar: PlanarConfiguration) -> AgResult<Array2<bool>> {
-    let shape = arr.shape();
-    let (_, h, w) = band_height_width(shape, planar);
-    // For planar [bands, H, W] the first band is the contiguous prefix of
-    // length H*W; for chunky [H, W, bands] each pixel's first sample lives at
-    // stride `bands`. `fill_mask_from` handles both by indexing into the
-    // typed slice directly.
-    let stride = match planar {
-        PlanarConfiguration::Planar => 1,
-        // chunky: samples interleaved as [s0,s1,...,sN, s0,s1,...] per pixel
-        PlanarConfiguration::Chunky => shape[2],
-        _ => {
-            return Err(AgError::UnsupportedPixel(
-                "unknown planar configuration".into(),
-            ))
+        macro_rules! fill {
+            ($values:expr, $predicate:expr) => {
+                fill_mask_window(&mut out, $values, a_w, stride, win, $predicate)
+            };
         }
-    };
-    let mut out = Array2::<bool>::from_elem((h, w), false);
-    match arr.data() {
-        TypedArray::Bool(v) => fill_mask(&mut out, v, h, w, stride, |&x| x),
-        TypedArray::UInt8(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
-        TypedArray::UInt16(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
-        TypedArray::UInt32(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
-        TypedArray::UInt64(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
-        TypedArray::Int8(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
-        TypedArray::Int16(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
-        TypedArray::Int32(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
-        TypedArray::Int64(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0),
-        TypedArray::Float32(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0.0),
-        TypedArray::Float64(v) => fill_mask(&mut out, v, h, w, stride, |&x| x != 0.0),
+        match arr.data() {
+            TypedArray::Bool(v) => fill!(v, |&x| x),
+            TypedArray::UInt8(v) => fill!(v, |&x| x != 0),
+            TypedArray::UInt16(v) => fill!(v, |&x| x != 0),
+            TypedArray::UInt32(v) => fill!(v, |&x| x != 0),
+            TypedArray::UInt64(v) => fill!(v, |&x| x != 0),
+            TypedArray::Int8(v) => fill!(v, |&x| x != 0),
+            TypedArray::Int16(v) => fill!(v, |&x| x != 0),
+            TypedArray::Int32(v) => fill!(v, |&x| x != 0),
+            TypedArray::Int64(v) => fill!(v, |&x| x != 0),
+            TypedArray::Float32(v) => fill!(v, |&x| x != 0.0),
+            TypedArray::Float64(v) => fill!(v, |&x| x != 0.0),
+        }
     }
     Ok(out)
 }
 
-fn fill_mask<T: Copy, F: Fn(&T) -> bool>(
+/// Fill only the requested part of one decoded mask tile into the final mask.
+///
+/// Valid decoded arrays take the checked-row fast path: one bounds check per
+/// source row followed by a linear destination write. The fallback preserves
+/// the old behavior for malformed, truncated arrays, where missing cells were
+/// materialized as `false` before the crop was copied.
+fn fill_mask_window<T, F: Fn(&T) -> bool>(
     out: &mut Array2<bool>,
     src: &[T],
-    h: usize,
-    w: usize,
+    src_width: usize,
     stride: usize,
+    win: TileCopyWindow,
     pred: F,
 ) {
-    // Single linear sweep over `src` with stride `stride`. The destination is
-    // row-major Array2; we use `as_slice_mut` to avoid bounds checks per cell.
+    let rows = win.src_r1 - win.src_r0;
+    let cols = win.src_c1 - win.src_c0;
+    debug_assert_eq!(rows, win.dst_r1 - win.dst_r0);
+    debug_assert_eq!(cols, win.dst_c1 - win.dst_c0);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+
+    let dst_width = out.ncols();
     let dst = out
         .as_slice_mut()
-        .expect("freshly-allocated Array2 is standard layout");
-    let mut i = 0usize;
-    for r in 0..h {
-        for c in 0..w {
-            let s = (r * w + c) * stride;
-            if let Some(v) = src.get(s) {
-                dst[i] = pred(v);
-            }
-            i += 1;
-        }
-    }
-}
+        .expect("stitch mask output is freshly allocated in standard layout");
 
-fn band_height_width(shape: [usize; 3], planar: PlanarConfiguration) -> (usize, usize, usize) {
-    match planar {
-        PlanarConfiguration::Planar => (shape[0], shape[1], shape[2]),
-        PlanarConfiguration::Chunky => (shape[2], shape[0], shape[1]),
-        _ => (shape[2], shape[0], shape[1]),
+    for row in 0..rows {
+        let src_start = ((win.src_r0 + row) * src_width + win.src_c0) * stride;
+        let src_span = (cols - 1) * stride + 1;
+        let dst_start = (win.dst_r0 + row) * dst_width + win.dst_c0;
+        let dst_row = &mut dst[dst_start..dst_start + cols];
+
+        let src_row = if stride == 0 {
+            None
+        } else {
+            src.get(src_start..src_start + src_span)
+        };
+        if let Some(src_row) = src_row {
+            for (dst_cell, src_cell) in dst_row.iter_mut().zip(src_row.iter().step_by(stride)) {
+                *dst_cell = pred(src_cell);
+            }
+        } else {
+            for (col, dst_cell) in dst_row.iter_mut().enumerate() {
+                *dst_cell = src
+                    .get(src_start + col * stride)
+                    .map(&pred)
+                    .unwrap_or(false);
+            }
+        }
     }
 }
 
@@ -542,7 +548,12 @@ fn tile_height(ifd: &ImageFileDirectory) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{requested_window, tile_copy_window, tile_footprint, validate_window_shape};
+    use ndarray::{arr2, Array2};
+
+    use super::{
+        fill_mask_window, requested_window, tile_copy_window, tile_footprint,
+        validate_window_shape, TileCopyWindow,
+    };
 
     fn pure(tw: i64, th: i64, col: i64, row: i64, w: u64, h: u64) -> ((i64, i64), (i64, i64)) {
         let ce = col + w as i64;
@@ -582,5 +593,101 @@ mod tests {
         assert_eq!((win.src_r0, win.src_r1), (200, 256));
         assert_eq!((win.dst_c0, win.dst_c1), (0, 56));
         assert_eq!((win.dst_r0, win.dst_r1), (0, 56));
+    }
+
+    #[test]
+    fn fill_mask_window_crops_planar_interior_into_destination() {
+        let src = [
+            1u8, 0, 1, 0, 1, // row 0
+            0, 1, 0, 1, 0, // row 1
+            1, 1, 0, 0, 1, // row 2
+            0, 0, 1, 1, 0, // row 3
+        ];
+        let mut out = Array2::from_elem((4, 6), true);
+        let win = TileCopyWindow {
+            src_r0: 1,
+            src_r1: 3,
+            src_c0: 1,
+            src_c1: 4,
+            dst_r0: 1,
+            dst_r1: 3,
+            dst_c0: 2,
+            dst_c1: 5,
+        };
+
+        fill_mask_window(&mut out, &src, 5, 1, win, |&value| value != 0);
+
+        assert_eq!(
+            out,
+            arr2(&[
+                [true, true, true, true, true, true],
+                [true, true, true, false, true, true],
+                [true, true, true, false, false, true],
+                [true, true, true, true, true, true],
+            ])
+        );
+    }
+
+    #[test]
+    fn fill_mask_window_uses_first_chunky_band_only() {
+        let src = [
+            0u8, 9, 9, 1, 9, 9, 0, 9, 9, // row 0
+            1, 9, 9, 0, 9, 9, 1, 9, 9, // row 1
+        ];
+        let mut out = Array2::from_elem((2, 3), true);
+        let win = TileCopyWindow {
+            src_r0: 0,
+            src_r1: 2,
+            src_c0: 0,
+            src_c1: 3,
+            dst_r0: 0,
+            dst_r1: 2,
+            dst_c0: 0,
+            dst_c1: 3,
+        };
+
+        fill_mask_window(&mut out, &src, 3, 3, win, |&value| value != 0);
+
+        assert_eq!(out, arr2(&[[false, true, false], [true, false, true]]));
+    }
+
+    #[test]
+    fn fill_mask_window_places_short_edge_tile_for_negative_request() {
+        let src = [1u8, 0, 0, 1];
+        let requested = requested_window(-1, -1, 3, 3);
+        let win = tile_copy_window(tile_footprint(0, 0, 2, 2), requested).unwrap();
+        let mut out = Array2::from_elem((4, 4), true);
+
+        fill_mask_window(&mut out, &src, 2, 1, win, |&value| value != 0);
+
+        assert_eq!(
+            out,
+            arr2(&[
+                [true, true, true, true],
+                [true, true, false, true],
+                [true, false, true, true],
+                [true, true, true, true],
+            ])
+        );
+    }
+
+    #[test]
+    fn fill_mask_window_treats_truncated_source_cells_as_false() {
+        let src = [1u8, 0, 1, 0];
+        let mut out = Array2::from_elem((2, 3), true);
+        let win = TileCopyWindow {
+            src_r0: 0,
+            src_r1: 2,
+            src_c0: 0,
+            src_c1: 3,
+            dst_r0: 0,
+            dst_r1: 2,
+            dst_c0: 0,
+            dst_c1: 3,
+        };
+
+        fill_mask_window(&mut out, &src, 3, 1, win, |&value| value != 0);
+
+        assert_eq!(out, arr2(&[[true, false, true], [false, false, false]]));
     }
 }

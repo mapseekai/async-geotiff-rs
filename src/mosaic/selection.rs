@@ -74,6 +74,11 @@ fn valid(m: Option<&Array2<bool>>, y: usize, x: usize) -> bool {
     m.is_none_or(|m| m[[y, x]])
 }
 
+#[inline(always)]
+const fn linear_offset(band: usize, plane: usize, pixel: usize) -> usize {
+    band * plane + pixel
+}
+
 /// Materialize an owned mask only where the reducer must *store* one (first
 /// feed of First/Highest/Lowest, every Median feed). Clones the source mask if
 /// present; allocates all-true otherwise.
@@ -164,15 +169,38 @@ impl<State> Reducer<State> {
             }
             (Some(acc), Some(am)) => {
                 let (bands, h, w) = acc.dim();
-                for y in 0..h {
-                    for x in 0..w {
-                        // fill only where acc is still invalid AND arr is valid
-                        if !am[[y, x]] && valid(m, y, x) {
+                let plane = h * w;
+                let mask_slice = match m {
+                    None => Some(None),
+                    Some(mask) => mask.as_slice().map(Some),
+                };
+                if let (Some(acc), Some(am), Some(arr), Some(mask)) = (
+                    acc.as_slice_mut(),
+                    am.as_slice_mut(),
+                    arr.as_slice(),
+                    mask_slice,
+                ) {
+                    for i in 0..plane {
+                        if !am[i] && mask.is_none_or(|mask| mask[i]) {
                             for b in 0..bands {
-                                acc[[b, y, x]] = arr[[b, y, x]];
+                                let offset = linear_offset(b, plane, i);
+                                acc[offset] = arr[offset];
                             }
-                            am[[y, x]] = true;
+                            am[i] = true;
                             self.remaining_invalid = self.remaining_invalid.saturating_sub(1);
+                        }
+                    }
+                } else {
+                    for y in 0..h {
+                        for x in 0..w {
+                            // fill only where acc is still invalid AND arr is valid
+                            if !am[[y, x]] && valid(m, y, x) {
+                                for b in 0..bands {
+                                    acc[[b, y, x]] = arr[[b, y, x]];
+                                }
+                                am[[y, x]] = true;
+                                self.remaining_invalid = self.remaining_invalid.saturating_sub(1);
+                            }
                         }
                     }
                 }
@@ -209,17 +237,45 @@ impl<State> Reducer<State> {
                 )
             }
         };
-        for y in 0..h {
-            for x in 0..w {
-                if !valid(m, y, x) {
+        let plane = h * w;
+        let mask_slice = match m {
+            None => Some(None),
+            Some(mask) => mask.as_slice().map(Some),
+        };
+        if let (Some(sum), Some(count), Some(am), Some(arr), Some(mask)) = (
+            sum.as_slice_mut(),
+            count.as_slice_mut(),
+            am.as_slice_mut(),
+            arr.as_slice(),
+            mask_slice,
+        ) {
+            for i in 0..plane {
+                if !mask.is_none_or(|mask| mask[i]) {
                     continue;
                 }
-                am[[y, x]] = true;
+                am[i] = true;
                 for b in 0..bands {
-                    let v = arr[[b, y, x]];
-                    if v.is_finite() {
-                        sum[[b, y, x]] += v;
-                        count[[b, y, x]] += 1;
+                    let offset = linear_offset(b, plane, i);
+                    let value = arr[offset];
+                    if value.is_finite() {
+                        sum[offset] += value;
+                        count[offset] += 1;
+                    }
+                }
+            }
+        } else {
+            for y in 0..h {
+                for x in 0..w {
+                    if !valid(m, y, x) {
+                        continue;
+                    }
+                    am[[y, x]] = true;
+                    for b in 0..bands {
+                        let v = arr[[b, y, x]];
+                        if v.is_finite() {
+                            sum[[b, y, x]] += v;
+                            count[[b, y, x]] += 1;
+                        }
                     }
                 }
             }
@@ -241,24 +297,57 @@ impl<State> Reducer<State> {
             }
             (Some(acc), Some(am)) => {
                 let (bands, h, w) = acc.dim();
-                for y in 0..h {
-                    for x in 0..w {
-                        if !valid(m, y, x) {
+                let plane = h * w;
+                let mask_slice = match m {
+                    None => Some(None),
+                    Some(mask) => mask.as_slice().map(Some),
+                };
+                if let (Some(acc), Some(am), Some(arr), Some(mask)) = (
+                    acc.as_slice_mut(),
+                    am.as_slice_mut(),
+                    arr.as_slice(),
+                    mask_slice,
+                ) {
+                    for i in 0..plane {
+                        if !mask.is_none_or(|mask| mask[i]) {
                             continue;
                         }
                         // compare on band 0; replace whole pixel stack
-                        let replace = if !am[[y, x]] {
+                        let replace = if !am[i] {
                             true
                         } else if want_high {
-                            arr[[0, y, x]] > acc[[0, y, x]]
+                            arr[i] > acc[i]
                         } else {
-                            arr[[0, y, x]] < acc[[0, y, x]]
+                            arr[i] < acc[i]
                         };
                         if replace {
                             for b in 0..bands {
-                                acc[[b, y, x]] = arr[[b, y, x]];
+                                let offset = linear_offset(b, plane, i);
+                                acc[offset] = arr[offset];
                             }
-                            am[[y, x]] = true;
+                            am[i] = true;
+                        }
+                    }
+                } else {
+                    for y in 0..h {
+                        for x in 0..w {
+                            if !valid(m, y, x) {
+                                continue;
+                            }
+                            // compare on band 0; replace whole pixel stack
+                            let replace = if !am[[y, x]] {
+                                true
+                            } else if want_high {
+                                arr[[0, y, x]] > acc[[0, y, x]]
+                            } else {
+                                arr[[0, y, x]] < acc[[0, y, x]]
+                            };
+                            if replace {
+                                for b in 0..bands {
+                                    acc[[b, y, x]] = arr[[b, y, x]];
+                                }
+                                am[[y, x]] = true;
+                            }
                         }
                     }
                 }
@@ -341,18 +430,29 @@ fn aggregate_median(stack: &[(Array3<f64>, Array2<bool>)]) -> (Array3<f64>, Arra
     let mut out = Array3::<f64>::zeros((bands, h, w));
     let mut out_mask = Array2::from_elem((h, w), false);
     let mut buf: Vec<f64> = Vec::with_capacity(stack.len());
-    for y in 0..h {
-        for x in 0..w {
-            let any_valid = stack.iter().any(|(_, m)| m[[y, x]]);
-            if !any_valid {
+    let slices: Option<Vec<(&[f64], &[bool])>> = stack
+        .iter()
+        .map(|(arr, mask)| Some((arr.as_slice()?, mask.as_slice()?)))
+        .collect();
+    if let Some(slices) = slices {
+        let plane = h * w;
+        let out = out
+            .as_slice_mut()
+            .expect("freshly allocated median output is contiguous");
+        let out_mask = out_mask
+            .as_slice_mut()
+            .expect("freshly allocated median mask is contiguous");
+        for i in 0..plane {
+            if !slices.iter().any(|(_, mask)| mask[i]) {
                 continue;
             }
-            out_mask[[y, x]] = true;
+            out_mask[i] = true;
             for b in 0..bands {
                 buf.clear();
-                for (arr, m) in stack {
-                    if m[[y, x]] {
-                        buf.push(arr[[b, y, x]]);
+                let offset = linear_offset(b, plane, i);
+                for (arr, mask) in &slices {
+                    if mask[i] {
+                        buf.push(arr[offset]);
                     }
                 }
                 let len = buf.len();
@@ -361,12 +461,42 @@ fn aggregate_median(stack: &[(Array3<f64>, Array2<bool>)]) -> (Array3<f64>, Arra
                 // behaviour; quickselect only positions the needed rank(s).
                 let (_, hi, _) = buf.select_nth_unstable_by(mid, f64::total_cmp);
                 let hi_val = *hi;
-                out[[b, y, x]] = if len % 2 == 1 {
+                out[offset] = if len % 2 == 1 {
                     hi_val
                 } else {
                     let (_, lo, _) = buf.select_nth_unstable_by(mid - 1, f64::total_cmp);
                     (*lo + hi_val) / 2.0
                 };
+            }
+        }
+    } else {
+        for y in 0..h {
+            for x in 0..w {
+                let any_valid = stack.iter().any(|(_, m)| m[[y, x]]);
+                if !any_valid {
+                    continue;
+                }
+                out_mask[[y, x]] = true;
+                for b in 0..bands {
+                    buf.clear();
+                    for (arr, m) in stack {
+                        if m[[y, x]] {
+                            buf.push(arr[[b, y, x]]);
+                        }
+                    }
+                    let len = buf.len();
+                    let mid = len / 2;
+                    // total_cmp orders NaN last, matching the previous full-sort
+                    // behaviour; quickselect only positions the needed rank(s).
+                    let (_, hi, _) = buf.select_nth_unstable_by(mid, f64::total_cmp);
+                    let hi_val = *hi;
+                    out[[b, y, x]] = if len % 2 == 1 {
+                        hi_val
+                    } else {
+                        let (_, lo, _) = buf.select_nth_unstable_by(mid - 1, f64::total_cmp);
+                        (*lo + hi_val) / 2.0
+                    };
+                }
             }
         }
     }
@@ -379,19 +509,118 @@ mod tests {
     use crate::bounds::{Bbox, GeoTransform};
     use crate::crs::Crs;
 
-    fn img(vals: &[f64], valid: &[bool]) -> ImageData {
-        // 1 band, 1 row, N cols
-        let n = vals.len();
-        let arr = Array3::from_shape_vec((1, 1, n), vals.to_vec()).unwrap();
-        let mask = Array2::from_shape_vec((1, n), valid.to_vec()).unwrap();
+    fn image_from_arrays(pixels: Array3<f64>, mask: Option<Array2<bool>>) -> ImageData {
         ImageData {
-            pixels: PixelData::F64(arr),
-            mask: Some(mask),
+            pixels: PixelData::F64(pixels),
+            mask,
             bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
             crs: Crs::epsg(3857),
             transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 1.0, 0.0, -1.0]),
             nodata: None,
         }
+    }
+
+    fn img(vals: &[f64], valid: &[bool]) -> ImageData {
+        // 1 band, 1 row, N cols
+        let n = vals.len();
+        let arr = Array3::from_shape_vec((1, 1, n), vals.to_vec()).unwrap();
+        let mask = Array2::from_shape_vec((1, n), valid.to_vec()).unwrap();
+        image_from_arrays(arr, Some(mask))
+    }
+
+    fn reduce(method: PixelSelection, images: &[ImageData]) -> ImageData {
+        let mut reducer = Reducer::new(method).feed(&images[0]).unwrap();
+        for image in &images[1..] {
+            reducer.feed(image).unwrap();
+        }
+        reducer.finish().unwrap()
+    }
+
+    fn assert_reduction(method: PixelSelection, images: &[ImageData], expected: &[f64]) {
+        let out = reduce(method, images);
+        let actual = out.pixels.to_f64();
+        assert_eq!(actual.len(), expected.len());
+        for (&actual, &expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+        assert!(out.mask.unwrap().iter().all(|&valid| valid));
+    }
+
+    #[test]
+    fn slice_reducers_preserve_multiband_mask_tie_and_nan_semantics() {
+        let shape = (2, 1, 3);
+        let images = vec![
+            image_from_arrays(
+                Array3::from_shape_vec(shape, vec![1.0, 5.0, 4.0, 10.0, 50.0, f64::NAN]).unwrap(),
+                Some(Array2::from_shape_vec((1, 3), vec![true, false, true]).unwrap()),
+            ),
+            image_from_arrays(
+                Array3::from_shape_vec(shape, vec![1.0, 7.0, 3.0, 99.0, 70.0, 30.0]).unwrap(),
+                Some(Array2::from_shape_vec((1, 3), vec![true, true, false]).unwrap()),
+            ),
+            image_from_arrays(
+                Array3::from_shape_vec(
+                    shape,
+                    vec![2.0, 6.0, f64::INFINITY, 20.0, 60.0, f64::INFINITY],
+                )
+                .unwrap(),
+                None,
+            ),
+        ];
+
+        assert_reduction(
+            PixelSelection::First,
+            &images,
+            &[1.0, 7.0, 4.0, 10.0, 70.0, f64::NAN],
+        );
+        assert_reduction(
+            PixelSelection::Highest,
+            &images,
+            &[2.0, 7.0, f64::INFINITY, 20.0, 70.0, f64::INFINITY],
+        );
+        assert_reduction(
+            PixelSelection::Lowest,
+            &images,
+            &[1.0, 6.0, 4.0, 10.0, 60.0, f64::NAN],
+        );
+        assert_reduction(
+            PixelSelection::Mean,
+            &images,
+            &[4.0 / 3.0, 6.5, 4.0, 43.0, 65.0, 0.0],
+        );
+        assert_reduction(
+            PixelSelection::Median,
+            &images,
+            &[1.0, 6.5, f64::INFINITY, 20.0, 65.0, f64::NAN],
+        );
+
+        let tied = reduce(PixelSelection::Highest, &images[..2]);
+        assert_eq!(tied.pixels.to_f64()[[1, 0, 0]], 10.0);
+    }
+
+    #[test]
+    fn non_standard_layout_falls_back_to_indexed_reduction() {
+        let first = Array3::from_shape_vec((2, 2, 2), (0..8).map(f64::from).collect())
+            .unwrap()
+            .permuted_axes([0, 2, 1]);
+        let mask = Array2::from_shape_vec((2, 2), vec![true, false, false, true])
+            .unwrap()
+            .reversed_axes();
+        assert!(first.as_slice().is_none() && mask.as_slice().is_none());
+        let images = vec![
+            image_from_arrays(first, Some(mask)),
+            image_from_arrays(Array3::from_elem((2, 2, 2), 9.0), None),
+        ];
+        assert_reduction(
+            PixelSelection::First,
+            &images,
+            &[0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0],
+        );
+        assert_reduction(
+            PixelSelection::Median,
+            &images,
+            &[4.5, 9.0, 9.0, 6.0, 6.5, 9.0, 9.0, 8.0],
+        );
     }
 
     #[test]

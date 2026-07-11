@@ -419,43 +419,15 @@ fn try_subtile_affine(
         .crop(crop_left, crop_top, crop_w, crop_h);
     // Dispatch on source dtype — same fan-out as warp_affine.
     let pixels = match &src.pixels {
-        PixelData::U8(a) => PixelData::U8(resize_bands(
-            a,
-            fr::PixelType::U8,
-            dst_w,
-            dst_h,
-            &options,
-            |b| b.iter().copied().collect::<Vec<u8>>(),
-            |bytes| bytes.to_vec(),
-        )?),
-        PixelData::U16(a) => PixelData::U16(resize_bands(
-            a,
-            fr::PixelType::U16,
-            dst_w,
-            dst_h,
-            &options,
-            |b| {
-                let mut buf = vec![0u8; b.len() * 2];
-                bytemuck::cast_slice_mut::<u8, u16>(&mut buf)
-                    .copy_from_slice(b.as_slice().expect("u16 band contiguous"));
-                buf
-            },
-            |bytes| bytemuck::cast_slice::<u8, u16>(bytes).to_vec(),
-        )?),
-        PixelData::F32(a) => PixelData::F32(resize_bands(
-            a,
-            fr::PixelType::F32,
-            dst_w,
-            dst_h,
-            &options,
-            |b| {
-                let mut buf = vec![0u8; b.len() * 4];
-                bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
-                    .copy_from_slice(b.as_slice().expect("f32 band contiguous"));
-                buf
-            },
-            |bytes| bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
-        )?),
+        PixelData::U8(a) => {
+            PixelData::U8(resize_bands(a, fr::PixelType::U8, dst_w, dst_h, &options)?)
+        }
+        PixelData::U16(a) => {
+            PixelData::U16(resize_bands(a, fr::PixelType::U16, dst_w, dst_h, &options)?)
+        }
+        PixelData::F32(a) => {
+            PixelData::F32(resize_bands(a, fr::PixelType::F32, dst_w, dst_h, &options)?)
+        }
         other => {
             let f32_arr = other.to_f64().mapv(|v| v as f32);
             PixelData::F32(resize_bands(
@@ -464,13 +436,6 @@ fn try_subtile_affine(
                 dst_w,
                 dst_h,
                 &options,
-                |band| {
-                    let mut buf = vec![0u8; band.len() * 4];
-                    bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
-                        .copy_from_slice(band.as_slice().expect("f32 band contiguous"));
-                    buf
-                },
-                |bytes| bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
             )?)
         }
     };
@@ -553,44 +518,15 @@ fn warp_affine(
         crop_h_clamped,
     );
     let pixels = match &src.pixels {
-        PixelData::U8(a) => PixelData::U8(resize_bands(
-            a,
-            fr::PixelType::U8,
-            dst_w,
-            dst_h,
-            &options,
-            |b| b.iter().copied().collect::<Vec<u8>>(),
-            |bytes| bytes.to_vec(),
-        )?),
-        PixelData::U16(a) => PixelData::U16(resize_bands(
-            a,
-            fr::PixelType::U16,
-            dst_w,
-            dst_h,
-            &options,
-            |b| {
-                // Native u16 → bytes
-                let mut buf = vec![0u8; b.len() * 2];
-                bytemuck::cast_slice_mut::<u8, u16>(&mut buf)
-                    .copy_from_slice(b.as_slice().expect("u16 band contiguous"));
-                buf
-            },
-            |bytes| bytemuck::cast_slice::<u8, u16>(bytes).to_vec(),
-        )?),
-        PixelData::F32(a) => PixelData::F32(resize_bands(
-            a,
-            fr::PixelType::F32,
-            dst_w,
-            dst_h,
-            &options,
-            |b| {
-                let mut buf = vec![0u8; b.len() * 4];
-                bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
-                    .copy_from_slice(b.as_slice().expect("f32 band contiguous"));
-                buf
-            },
-            |bytes| bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
-        )?),
+        PixelData::U8(a) => {
+            PixelData::U8(resize_bands(a, fr::PixelType::U8, dst_w, dst_h, &options)?)
+        }
+        PixelData::U16(a) => {
+            PixelData::U16(resize_bands(a, fr::PixelType::U16, dst_w, dst_h, &options)?)
+        }
+        PixelData::F32(a) => {
+            PixelData::F32(resize_bands(a, fr::PixelType::F32, dst_w, dst_h, &options)?)
+        }
         // I16/I32/U32/F64 cast to F32 once — fast_image_resize has no
         // native signed-int or f64 SIMD kernel, but f32 keeps SIMD on.
         other => {
@@ -601,13 +537,6 @@ fn warp_affine(
                 dst_w,
                 dst_h,
                 &options,
-                |band| {
-                    let mut buf = vec![0u8; band.len() * 4];
-                    bytemuck::cast_slice_mut::<u8, f32>(&mut buf)
-                        .copy_from_slice(band.as_slice().expect("f32 band contiguous"));
-                    buf
-                },
-                |bytes| bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
             )?)
         }
     };
@@ -675,8 +604,6 @@ fn resize_bands<T: bytemuck::Pod + Default + Send + Sync>(
     dst_w: usize,
     dst_h: usize,
     options: &fast_image_resize::ResizeOptions,
-    to_bytes: impl Fn(&ndarray::ArrayView2<T>) -> Vec<u8> + Send + Sync,
-    from_bytes: impl Fn(&[u8]) -> Vec<T> + Send + Sync,
 ) -> AgResult<Array3<T>> {
     use fast_image_resize as fr;
     use ndarray::Axis;
@@ -684,37 +611,54 @@ fn resize_bands<T: bytemuck::Pod + Default + Send + Sync>(
     let bands = src_arr.shape()[0];
     let src_h = src_arr.shape()[1];
     let src_w = src_arr.shape()[2];
+    let dst_band_len = dst_w
+        .checked_mul(dst_h)
+        .ok_or_else(|| AgError::Warp("resize destination dimensions overflow".into()))?;
+    if dst_band_len == 0 {
+        return Err(AgError::Warp("empty resize destination".into()));
+    }
+    let output_len = bands
+        .checked_mul(dst_band_len)
+        .ok_or_else(|| AgError::Warp("resize output dimensions overflow".into()))?;
+    let mut output = vec![T::default(); output_len];
 
     // Run each band's fast_image_resize call in parallel; each rayon worker
     // owns its own Resizer (construction is microseconds, plenty cheaper
     // than the SIMD convolution it amortises across).
-    let band_outputs: Vec<AgResult<Vec<T>>> = (0..bands)
-        .into_par_iter()
-        .map(|b| {
+    output
+        .par_chunks_mut(dst_band_len)
+        .enumerate()
+        .try_for_each(|(b, dst_band)| -> AgResult<()> {
             let band = src_arr.index_axis(Axis(0), b);
-            let src_bytes = to_bytes(&band);
-            let src_img =
-                fr::images::Image::from_vec_u8(src_w as u32, src_h as u32, src_bytes, pixel_type)
-                    .map_err(|e| AgError::Warp(format!("fast_image_resize src: {e}")))?;
-            let mut dst_img = fr::images::Image::new(dst_w as u32, dst_h as u32, pixel_type);
+            let fallback;
+            let src_pixels = if let Some(contiguous) = band.as_slice() {
+                contiguous
+            } else {
+                fallback = band.iter().copied().collect::<Vec<T>>();
+                &fallback
+            };
+            let src_img = fr::images::ImageRef::new(
+                src_w as u32,
+                src_h as u32,
+                bytemuck::cast_slice(src_pixels),
+                pixel_type,
+            )
+            .map_err(|e| AgError::Warp(format!("fast_image_resize src: {e}")))?;
+            let mut dst_img = fr::images::Image::from_slice_u8(
+                dst_w as u32,
+                dst_h as u32,
+                bytemuck::cast_slice_mut(dst_band),
+                pixel_type,
+            )
+            .map_err(|e| AgError::Warp(format!("fast_image_resize dst: {e}")))?;
             let mut local = fr::Resizer::new();
             local
                 .resize(&src_img, &mut dst_img, Some(options))
                 .map_err(|e| AgError::Warp(format!("fast_image_resize: {e}")))?;
-            Ok(from_bytes(dst_img.buffer()))
-        })
-        .collect();
-
-    let mut out = Array3::<T>::from_elem((bands, dst_h, dst_w), T::default());
-    for (b, result) in band_outputs.into_iter().enumerate() {
-        let dst_typed = result?;
-        let mut out_band = out.index_axis_mut(Axis(0), b);
-        out_band
-            .as_slice_mut()
-            .expect("out_band contiguous")
-            .copy_from_slice(&dst_typed);
-    }
-    Ok(out)
+            Ok(())
+        })?;
+    Array3::from_shape_vec((bands, dst_h, dst_w), output)
+        .map_err(|e| AgError::Warp(format!("resize output reshape: {e}")))
 }
 
 fn sample_valid(
@@ -742,6 +686,50 @@ fn sample_valid(
 mod tests {
     use super::*;
     use ndarray::Array3;
+
+    fn identity_resize_options() -> fast_image_resize::ResizeOptions {
+        fast_image_resize::ResizeOptions::new().resize_alg(fast_image_resize::ResizeAlg::Nearest)
+    }
+
+    #[test]
+    fn resize_bands_preserves_native_multiband_values() {
+        let options = identity_resize_options();
+
+        let u8_src = Array3::from_shape_fn((2, 3, 4), |(b, y, x)| (b * 40 + y * 4 + x) as u8);
+        let u8_out =
+            resize_bands(&u8_src, fast_image_resize::PixelType::U8, 4, 3, &options).unwrap();
+        assert_eq!(u8_out, u8_src);
+
+        let u16_src = Array3::from_shape_fn((2, 3, 4), |(b, y, x)| (b * 1000 + y * 40 + x) as u16);
+        let u16_out =
+            resize_bands(&u16_src, fast_image_resize::PixelType::U16, 4, 3, &options).unwrap();
+        assert_eq!(u16_out, u16_src);
+
+        let f32_src = Array3::from_shape_fn((2, 3, 4), |(b, y, x)| {
+            b as f32 * 100.0 + y as f32 * 10.0 + x as f32 + 0.25
+        });
+        let f32_out =
+            resize_bands(&f32_src, fast_image_resize::PixelType::F32, 4, 3, &options).unwrap();
+        assert_eq!(f32_out, f32_src);
+    }
+
+    #[test]
+    fn resize_bands_accepts_non_standard_layout() {
+        let src = Array3::from_shape_fn((2, 2, 3), |(b, y, x)| (b * 20 + y * 3 + x) as u8)
+            .permuted_axes([0, 2, 1]);
+        assert!(!src.is_standard_layout());
+
+        let out = resize_bands(
+            &src,
+            fast_image_resize::PixelType::U8,
+            src.shape()[2],
+            src.shape()[1],
+            &identity_resize_options(),
+        )
+        .unwrap();
+
+        assert_eq!(out, src);
+    }
 
     fn dummy_src(crs: Crs) -> ImageData {
         ImageData {

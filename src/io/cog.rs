@@ -106,6 +106,9 @@ pub struct CogReader {
     pub(crate) src_crs: Crs,
     pub(crate) transform: GeoTransform,
     data_ifds: Vec<usize>,
+    /// Ground-sample distance for each data level, computed once when the
+    /// immutable IFD pyramid is opened.
+    level_gsds: Vec<f64>,
     mask_ifds: Vec<Option<usize>>,
     /// Per data-level, the band index (0-based) whose `ExtraSamples` is
     /// Associated/UnassociatedAlpha. Mirrors rio-tiler's
@@ -377,12 +380,13 @@ impl CogReader {
             let md = ifd.and_then(|i| i.gdal_metadata());
             crate::io::scale_offset::parse_scale_offset(md, bands)
         };
-        Ok(Self {
+        let mut cog = Self {
             tiff,
             reader,
             src_crs,
             transform,
             data_ifds,
+            level_gsds: Vec::new(),
             mask_ifds,
             alpha_bands,
             band_scale_offset,
@@ -394,7 +398,11 @@ impl CogReader {
                 .unwrap_or_else(|| CpuLimiter::new(config.decode_task_limit())),
             prefetch_ring: config.prefetch_ring,
             prefetch_inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        })
+        };
+        cog.level_gsds = (0..cog.level_count())
+            .map(|level| cog.compute_level_gsd(level).unwrap_or(f64::INFINITY))
+            .collect();
+        Ok(cog)
     }
 
     /// Open a COG from an existing object store and key, building the
@@ -518,11 +526,25 @@ impl CogReader {
         Ok(self.transform.scaled(scale_x, scale_y))
     }
 
-    pub fn level_gsd(&self, level: usize) -> AgResult<f64> {
+    fn compute_level_gsd(&self, level: usize) -> AgResult<f64> {
         let tr = self.level_transform(level)?.0;
         let x_res = (tr.a.powi(2) + tr.d.powi(2)).sqrt();
         let y_res = (tr.b.powi(2) + tr.e.powi(2)).sqrt();
         Ok(x_res.max(y_res))
+    }
+
+    pub fn level_gsd(&self, level: usize) -> AgResult<f64> {
+        match self
+            .level_gsds
+            .get(level)
+            .copied()
+            .filter(|v| v.is_finite())
+        {
+            Some(gsd) => Ok(gsd),
+            // Preserve the previous error/non-finite behavior for malformed or
+            // out-of-range levels; normal levels stay on the cached fast path.
+            None => self.compute_level_gsd(level),
+        }
     }
 
     /// Faithful port of rio-tiler `get_overview_level`
@@ -542,11 +564,7 @@ impl CogReader {
     ///   or snap to `L` if `|gsd(L) − target| < 0.1`.
     /// - target coarser than every overview: use the coarsest level.
     pub fn pick_overview(&self, target_gsd: f64) -> usize {
-        let n = self.level_count();
-        let gsds: Vec<f64> = (0..n)
-            .map(|l| self.level_gsd(l).unwrap_or(f64::INFINITY))
-            .collect();
-        pick_overview_from_gsds(&gsds, target_gsd)
+        pick_overview_from_gsds(&self.level_gsds, target_gsd)
     }
 
     /// Read a pixel window. Each native tile in the window is resolved through
@@ -1648,6 +1666,39 @@ mod tests {
             fetched, blocks,
             "each cold block must be fetched exactly once despite the race"
         );
+    }
+
+    #[tokio::test]
+    async fn level_gsds_are_cached_from_the_existing_formula() {
+        use crate::io::block_cache::BlockCache;
+        use crate::io::cache::CacheConfig;
+
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("data/cog_uint8_rgb_nodata.tif");
+        if !tif.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
+        let reader = open_local_for_test(&tif, "level-gsd-cache", cache).await;
+
+        assert!(reader.level_count() > 1, "fixture must contain overviews");
+        assert_eq!(reader.level_gsds.len(), reader.level_count());
+        for level in 0..reader.level_count() {
+            // This is the formula `level_gsd` used before the eager cache.
+            let tr = reader.level_transform(level).unwrap().0;
+            let x_res = (tr.a.powi(2) + tr.d.powi(2)).sqrt();
+            let y_res = (tr.b.powi(2) + tr.e.powi(2)).sqrt();
+            let expected = x_res.max(y_res);
+
+            assert_eq!(reader.level_gsds[level], expected);
+            assert_eq!(reader.level_gsd(level).unwrap(), expected);
+        }
+        assert!(matches!(
+            reader.level_gsd(reader.level_count()),
+            Err(AgError::MissingGeo("overview level"))
+        ));
     }
 
     #[test]

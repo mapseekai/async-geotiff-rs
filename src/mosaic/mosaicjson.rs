@@ -111,6 +111,7 @@ fn default_version() -> String {
 /// using this source with another TMS is not meaningful.
 pub struct MosaicJsonSource {
     doc: MosaicJson,
+    tile_keys: Vec<String>,
     quadkey_zoom: u8,
     bbox: Bbox,
 }
@@ -124,7 +125,10 @@ impl MosaicJsonSource {
         validate_document(&mut doc)?;
         let quadkey_zoom = doc.quadkey_zoom.unwrap_or(doc.minzoom);
         let b = doc.bounds;
+        let mut tile_keys: Vec<_> = doc.tiles.keys().cloned().collect();
+        tile_keys.sort_unstable();
         Ok(Self {
+            tile_keys,
             quadkey_zoom,
             bbox: Bbox::new(b[0], b[1], b[2], b[3]),
             doc,
@@ -141,6 +145,14 @@ impl MosaicJsonSource {
     pub fn document(&self) -> &MosaicJson {
         &self.doc
     }
+}
+
+fn prefix_key_range(keys: &[String], prefix: &str) -> std::ops::Range<usize> {
+    let start = keys.partition_point(|key| key.as_str() < prefix);
+    let mut upper = prefix.to_owned();
+    upper.push('4');
+    let end = keys.partition_point(|key| key < &upper);
+    start..end
 }
 
 fn validate_document(doc: &mut MosaicJson) -> AgResult<()> {
@@ -223,8 +235,8 @@ impl MosaicSource for MosaicJsonSource {
                 }
             }
             QkLookup::Prefix(prefix) => {
-                for (k, v) in &self.doc.tiles {
-                    if k.starts_with(&prefix) {
+                for key in &self.tile_keys[prefix_key_range(&self.tile_keys, &prefix)] {
+                    if let Some(v) = self.doc.tiles.get(key) {
                         urls.extend(v.iter().cloned());
                     }
                 }
@@ -276,32 +288,75 @@ mod tests {
       }
     }"#;
 
-    #[tokio::test]
-    async fn exact_zoom_returns_listed_assets() {
-        let s = MosaicJsonSource::from_str(DOC).unwrap();
-        let qk = "1230123";
-        let (mut tx, mut ty) = (0u32, 0u32);
-        for ch in qk.chars() {
-            tx <<= 1;
-            ty <<= 1;
+    fn coord_for_quadkey(quadkey: &str) -> TileCoord {
+        let (mut x, mut y) = (0u32, 0u32);
+        for ch in quadkey.chars() {
+            x <<= 1;
+            y <<= 1;
             match ch {
                 '0' => {}
-                '1' => tx |= 1,
-                '2' => ty |= 1,
+                '1' => x |= 1,
+                '2' => y |= 1,
                 '3' => {
-                    tx |= 1;
-                    ty |= 1;
+                    x |= 1;
+                    y |= 1;
                 }
                 _ => unreachable!(),
             }
         }
+        TileCoord {
+            tms: TileMatrixSet::WebMercatorQuad,
+            z: quadkey.len() as u8,
+            x,
+            y,
+        }
+    }
+
+    #[test]
+    fn prefix_key_range_limits_candidates() {
+        let keys = ["0000000", "1230120", "1230123", "2000000"]
+            .map(str::to_owned)
+            .to_vec();
+
+        let matching = prefix_key_range(&keys, "123012");
+        assert_eq!(&keys[matching], &["1230120", "1230123"]);
+
+        let all = prefix_key_range(&keys, "");
+        assert_eq!(all, 0..keys.len());
+    }
+
+    #[tokio::test]
+    async fn lower_zoom_unions_matching_prefix_assets() {
+        let source = MosaicJsonSource::from_str(DOC).unwrap();
+        let got = source
+            .assets_for_tile(coord_for_quadkey("123012"))
+            .await
+            .unwrap();
+        let urls: Vec<_> = got.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            vec!["https://x/a.tif", "https://x/b.tif", "https://x/c.tif"]
+        );
+    }
+
+    #[tokio::test]
+    async fn zoom_zero_empty_prefix_returns_all_assets() {
+        let source = MosaicJsonSource::from_str(DOC).unwrap();
+        let got = source.assets_for_tile(coord_for_quadkey("")).await.unwrap();
+        let urls: Vec<_> = got.iter().map(|asset| asset.url.as_str()).collect();
+
+        assert_eq!(
+            urls,
+            vec!["https://x/a.tif", "https://x/b.tif", "https://x/c.tif"]
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_zoom_returns_listed_assets() {
+        let s = MosaicJsonSource::from_str(DOC).unwrap();
         let got = s
-            .assets_for_tile(TileCoord {
-                tms: TileMatrixSet::WebMercatorQuad,
-                z: 7,
-                x: tx,
-                y: ty,
-            })
+            .assets_for_tile(coord_for_quadkey("1230123"))
             .await
             .unwrap();
         let urls: Vec<_> = got.iter().map(|a| a.url.as_str()).collect();

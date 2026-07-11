@@ -163,18 +163,21 @@ fn flatten_to_rgb_black(rgba: &Array3<u8>) -> AgResult<Array3<u8>> {
             "expected RGBA channels, got {c}"
         )));
     }
-    let mut rgb = Array3::<u8>::zeros((h, w, 3));
-    for row in 0..h {
-        for col in 0..w {
-            let a = rgba[[row, col, 3]] as u32;
-            for ch in 0..3 {
-                let v = rgba[[row, col, ch]] as u32;
-                // Rounded premultiply: (v * a + 127) / 255.
-                rgb[[row, col, ch]] = ((v * a + 127) / 255) as u8;
-            }
-        }
+    let standard = rgba.as_standard_layout();
+    let raw = standard
+        .as_slice()
+        .expect("rgba array must be contiguous after as_standard_layout");
+    let mut rgb = Vec::with_capacity(h * w * 3);
+    for pixel in raw.chunks_exact(4) {
+        let alpha = u32::from(pixel[3]);
+        rgb.extend_from_slice(&[
+            ((u32::from(pixel[0]) * alpha + 127) / 255) as u8,
+            ((u32::from(pixel[1]) * alpha + 127) / 255) as u8,
+            ((u32::from(pixel[2]) * alpha + 127) / 255) as u8,
+        ]);
     }
-    Ok(rgb)
+    Ok(Array3::from_shape_vec((h, w, 3), rgb)
+        .expect("flattened RGB length must match the output shape"))
 }
 
 pub fn encode_png(rgba: &Array3<u8>) -> AgResult<Bytes> {
@@ -285,6 +288,24 @@ mod tests {
         assert_eq!(opaque[[1, 1, 0]], 10);
         assert_eq!(opaque[[1, 1, 1]], 20);
         assert_eq!(opaque[[1, 1, 2]], 30);
+    }
+
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn flatten_to_rgb_black_accepts_non_standard_layout() {
+        let mut rgba = Array3::<u8>::zeros((2, 3, 4));
+        rgba[[1, 2, 0]] = 200;
+        rgba[[1, 2, 1]] = 100;
+        rgba[[1, 2, 2]] = 50;
+        rgba[[1, 2, 3]] = 128;
+        let transposed = rgba.permuted_axes([1, 0, 2]);
+
+        let rgb = flatten_to_rgb_black(&transposed).unwrap();
+
+        assert_eq!(rgb.shape(), &[3, 2, 3]);
+        assert_eq!(rgb[[2, 1, 0]], 100);
+        assert_eq!(rgb[[2, 1, 1]], 50);
+        assert_eq!(rgb[[2, 1, 2]], 25);
     }
 
     #[cfg(feature = "webp")]
