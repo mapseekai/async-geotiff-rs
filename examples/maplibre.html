@@ -196,6 +196,11 @@
         <label for="bidx">Bands</label>
         <input id="bidx" name="bidx" type="text" autocomplete="off" spellcheck="false">
       </div>
+      <div class="field wide">
+        <label for="expression">Expression</label>
+        <input id="expression" name="expression" type="text" autocomplete="off" spellcheck="false"
+               placeholder="(b5-b4)/(b5+b4)">
+      </div>
       <div class="field">
         <label for="resampling">Kernel</label>
         <select id="resampling" name="resampling">
@@ -224,6 +229,7 @@
         <label for="opacity">Opacity</label>
         <input id="opacity" name="opacity" type="range" min="0" max="1" step="0.05">
       </div>
+      <button type="button" id="ndvi">NDVI</button>
       <button type="submit">Apply</button>
       <span style="margin-left:auto;font-size:12px">
         viewer:
@@ -267,6 +273,8 @@
         stretchArg: document.getElementById("stretchArg"),
         rescale: document.getElementById("rescale"),
         bidx: document.getElementById("bidx"),
+        expression: document.getElementById("expression"),
+        ndvi: document.getElementById("ndvi"),
         resampling: document.getElementById("resampling"),
         tilesize: document.getElementById("tilesize"),
         format: document.getElementById("format"),
@@ -284,6 +292,7 @@
         pageParams.get("pc") ?? pageParams.get("sigma") ?? "";
       controls.rescale.value = pageParams.getAll("rescale").join(";") || "0,255;0,255;0,255";
       controls.bidx.value = pageParams.getAll("bidx").join(",") || "1,2,3";
+      controls.expression.value = pageParams.get("expression") ?? "";
       controls.resampling.value = pageParams.get("resampling") ?? "bilinear";
       controls.tilesize.value = pageParams.get("tilesize") ?? "256";
       controls.opacity.value = pageParams.get("opacity") ?? "0.85";
@@ -342,13 +351,24 @@
         } else if (controls.dataset && controls.dataset.value) {
           params.set("dataset", controls.dataset.value);
         }
-        appendRepeated(params, "bidx", controls.bidx.value, ",");
+        const expression = controls.expression.value.trim();
+        if (expression) {
+          params.set("expression", expression);
+        } else {
+          appendRepeated(params, "bidx", controls.bidx.value, ",");
+        }
         // Auto means the advertised global mean ± 2σ stretch, not the U8 raw-value fast path.
         // Explicitly send it so every tile resolves the same dataset statistics.
         const mode = controls.stretch.value;
         const arg = controls.stretchArg.value.trim();
         if (mode === "custom") {
-          appendRepeated(params, "rescale", controls.rescale.value, ";");
+          const ranges = controls.rescale.value
+            .split(";")
+            .map((range) => range.trim())
+            .filter(Boolean);
+          for (const range of expression ? ranges.slice(0, 1) : ranges) {
+            params.append("rescale", range);
+          }
         } else if (mode === "minmax") {
           params.set("stretch", "minmax");
         } else if (mode === "percent") {
@@ -593,11 +613,39 @@
         controls.stretchArg.disabled = !(m === "percent" || m === "stddev");
         controls.rescale.disabled = m !== "custom";
       }
+
+      function isExpressionMode() {
+        return Boolean(controls.expression.value.trim());
+      }
+
+      function syncExpressionUi() {
+        const active = isExpressionMode();
+        controls.bidx.disabled = active;
+        if (!active && !controls.bidx.value.trim()) {
+          controls.bidx.value = "1,2,3";
+        }
+      }
+
+      function applyNdvi() {
+        controls.expression.value = "(b5-b4)/(b5+b4)";
+        controls.bidx.value = "";
+        controls.stretch.value = "custom";
+        controls.rescale.value = "-1,1";
+        controls.colormap.value = "viridis";
+        syncStretchUi();
+        syncExpressionUi();
+        document.getElementById("style-form").requestSubmit();
+      }
       controls.stretch.addEventListener("change", () => {
         syncStretchUi();
         document.getElementById("style-form").requestSubmit();
       });
       syncStretchUi();
+      controls.expression.addEventListener("change", () => {
+        syncExpressionUi();
+      });
+      controls.ndvi.addEventListener("click", applyNdvi);
+      syncExpressionUi();
 
       controls.tilesize.addEventListener("change", () => {
         document.getElementById("style-form").requestSubmit();
