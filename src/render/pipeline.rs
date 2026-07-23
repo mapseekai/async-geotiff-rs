@@ -837,6 +837,73 @@ mod tests {
         assert!(valid[[0, 1]]);
     }
 
+    #[test]
+    fn expression_marks_nodata_and_division_by_zero_invalid() {
+        use crate::render::expression::parse_expression;
+        use ndarray::Array3;
+
+        let pixels = Array3::from_shape_vec(
+            (2, 1, 3),
+            vec![3.0, -9999.0, 1.0, 1.0, 2.0, -1.0],
+        )
+        .unwrap();
+        let expression = parse_expression("(b1-b2)/(b1+b2)").unwrap();
+
+        let (values, valid) =
+            eval_expression_band(&pixels.view(), &expression, Some(-9999.0), 1, 3).unwrap();
+
+        assert!((values[[0, 0]] - 0.5).abs() < 1e-12);
+        assert!(valid[[0, 0]]);
+        assert!(!valid[[0, 1]]);
+        assert!(!valid[[0, 2]]);
+    }
+
+    #[test]
+    fn expression_rejects_missing_source_band() {
+        use crate::render::expression::parse_expression;
+        use ndarray::Array3;
+
+        let pixels = Array3::from_elem((1, 1, 1), 1.0);
+        let expression = parse_expression("b2").unwrap();
+        let err = eval_expression_band(&pixels.view(), &expression, None, 1, 1).unwrap_err();
+
+        assert!(matches!(err, AgError::Query { .. }));
+    }
+
+    #[test]
+    fn expression_render_encodes_invalid_pixels_transparent() {
+        use crate::pixel::{ImageData, PixelData};
+        use crate::style::params::compile;
+        use crate::style::TileStyle;
+        use ndarray::Array3;
+
+        let source = ImageData {
+            pixels: PixelData::F64(
+                Array3::from_shape_vec(
+                    (2, 1, 3),
+                    vec![3.0, -9999.0, 1.0, 1.0, 2.0, -1.0],
+                )
+                .unwrap(),
+            ),
+            mask: None,
+            crs: Crs::epsg(3857),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
+            nodata: Some(-9999.0),
+            bbox: Bbox::new(0.0, 0.0, 3.0, 1.0),
+        };
+        let style = TileStyle {
+            expression: Some("(b1-b2)/(b1+b2)".into()),
+            rescale: vec![(-1.0, 1.0)],
+            ..TileStyle::default()
+        };
+
+        let png = render(&source, &compile(&style).unwrap()).unwrap();
+        let rgba = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0)[3], 255);
+        assert_eq!(rgba.get_pixel(1, 0)[3], 0);
+        assert_eq!(rgba.get_pixel(2, 0)[3], 0);
+    }
+
     /// The u16 LUT fast paths must be BIT-IDENTICAL to the generic typed path.
     /// We render the same pixel values once as U16 (LUT path) and once as F64
     /// (generic path) and require equal encoded bytes.
