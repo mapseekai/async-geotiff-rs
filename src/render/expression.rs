@@ -287,34 +287,6 @@ pub(crate) fn referenced_nodata_hit(px: &[f64], refs: &[usize], nodata: Option<f
     false
 }
 
-/// Common spectral indices. Band numbers are 1-indexed (as in `b<N>`).
-/// Lowers to an arithmetic expression string evaluated by the same engine.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Index {
-    Ndvi { nir: u32, red: u32 },
-    Ndwi { green: u32, nir: u32 },
-    Ndbi { swir: u32, nir: u32 },
-    Evi { nir: u32, red: u32, blue: u32 },
-    Savi { nir: u32, red: u32, l: f64 },
-}
-
-impl Index {
-    pub fn to_expression(&self) -> String {
-        match *self {
-            Index::Ndvi { nir, red } => format!("(b{nir}-b{red})/(b{nir}+b{red})"),
-            Index::Ndwi { green, nir } => format!("(b{green}-b{nir})/(b{green}+b{nir})"),
-            Index::Ndbi { swir, nir } => format!("(b{swir}-b{nir})/(b{swir}+b{nir})"),
-            Index::Evi { nir, red, blue } => {
-                format!("2.5*(b{nir}-b{red})/(b{nir}+6*b{red}-7.5*b{blue}+1)")
-            }
-            Index::Savi { nir, red, l } => {
-                format!("(1+{l})*(b{nir}-b{red})/(b{nir}+b{red}+{l})")
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,35 +396,13 @@ mod tests {
     }
 
     #[test]
-    fn index_lowers_and_parses() {
-        for idx in [
-            Index::Ndvi { nir: 5, red: 4 },
-            Index::Ndwi { green: 3, nir: 5 },
-            Index::Ndbi { swir: 6, nir: 5 },
-            Index::Evi {
-                nir: 5,
-                red: 4,
-                blue: 2,
-            },
-            Index::Savi {
-                nir: 5,
-                red: 4,
-                l: 0.5,
-            },
-        ] {
-            let s = idx.to_expression();
-            assert!(parse_expression(&s).is_ok(), "unparseable: {s}");
-        }
-    }
-
-    #[test]
-    fn ndvi_index_matches_manual_expression_end_to_end() {
-        let idx = Index::Ndvi { nir: 5, red: 4 };
-        let t = parse_expression(&idx.to_expression()).unwrap();
+    fn generic_ndvi_expression_evaluates() {
+        let tokens = rpn("(b5-b4)/(b5+b4)");
         let mut bands = vec![0.0; 5];
         bands[4] = 0.5;
         bands[3] = 0.1;
-        assert!((eval_rpn(&t, &bands) - 0.6666667).abs() < 1e-5);
+
+        assert!((eval_rpn(&tokens, &bands) - 0.6666667).abs() < 1e-5);
     }
 
     #[test]
@@ -471,21 +421,5 @@ mod tests {
             parse_expression(&long),
             Err(AgError::Query { .. })
         ));
-    }
-
-    #[test]
-    fn savi_uses_l_factor() {
-        // SAVI = (1+L)(NIR-RED)/(NIR+RED+L); L=0.5,NIR=0.5,RED=0.1: 1.5*0.4/1.1 = 0.5454545
-        let idx = Index::Savi {
-            nir: 5,
-            red: 4,
-            l: 0.5,
-        };
-        let t = parse_expression(&idx.to_expression()).unwrap();
-        let mut bands = vec![0.0; 5];
-        bands[4] = 0.5;
-        bands[3] = 0.1;
-        let v = eval_rpn(&t, &bands);
-        assert!((v - 0.5454545).abs() < 1e-5, "savi={v}");
     }
 }
