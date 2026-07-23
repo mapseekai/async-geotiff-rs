@@ -203,7 +203,6 @@
       };
 
       const pageParams = new URLSearchParams(window.location.search);
-      c.expression.value = pageParams.get("expression") ?? "";
 
       function isExpressionMode() {
         return Boolean(c.expression.value.trim());
@@ -219,6 +218,28 @@
         c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
         c.rescale.disabled = c.stretch.value !== "custom";
       }
+
+      function restorePageParams() {
+        const dataset = pageParams.get("dataset");
+        if (dataset !== null) c.dataset.add(new Option(dataset, dataset, true, true));
+        c.colormap.value = pageParams.get("colormap_name") ?? "";
+        const rescale = pageParams.getAll("rescale");
+        if (rescale.length) {
+          c.rescale.value = rescale.join(";");
+          c.stretch.value = "custom";
+        }
+        for (const control of [c.resampling, c.tilesize, c.format]) {
+          const value = pageParams.get(control.name);
+          if (value !== null && [...control.options].some((option) => option.value === value)) {
+            control.value = value;
+          }
+        }
+        c.expression.value = pageParams.get("expression") ?? "";
+        syncStretchUi();
+        syncExpressionUi();
+      }
+
+      restorePageParams();
 
       function applyNdvi() {
         c.expression.value = "(b5-b4)/(b5+b4)";
