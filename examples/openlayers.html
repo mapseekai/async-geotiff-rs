@@ -130,6 +130,11 @@
         <label for="bidx">Bands</label>
         <input id="bidx" name="bidx" type="text" value="1,2,3" />
       </div>
+      <div class="field wide">
+        <label for="expression">Expression</label>
+        <input id="expression" name="expression" type="text" autocomplete="off" spellcheck="false"
+               placeholder="(b5-b4)/(b5+b4)">
+      </div>
       <div class="field">
         <label for="resampling">Kernel</label>
         <select id="resampling" name="resampling">
@@ -165,6 +170,7 @@
           value="0.9"
         />
       </div>
+      <button type="button" id="ndvi">NDVI</button>
       <button type="submit">Apply</button>
       <span class="nav">
         viewer:
@@ -188,11 +194,41 @@
         stretchArg: document.getElementById("stretchArg"),
         rescale: document.getElementById("rescale"),
         bidx: document.getElementById("bidx"),
+        expression: document.getElementById("expression"),
         resampling: document.getElementById("resampling"),
         tilesize: document.getElementById("tilesize"),
         format: document.getElementById("format"),
         opacity: document.getElementById("opacity"),
+        ndvi: document.getElementById("ndvi"),
       };
+
+      c.expression.value = new URLSearchParams(window.location.search).get("expression") ?? "";
+
+      function isExpressionMode() {
+        return Boolean(c.expression.value.trim());
+      }
+
+      function syncExpressionUi() {
+        const active = isExpressionMode();
+        c.bidx.disabled = active;
+        if (!active && !c.bidx.value.trim()) c.bidx.value = "1,2,3";
+      }
+
+      function syncStretchUi() {
+        c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
+        c.rescale.disabled = c.stretch.value !== "custom";
+      }
+
+      function applyNdvi() {
+        c.expression.value = "(b5-b4)/(b5+b4)";
+        c.bidx.value = "";
+        c.stretch.value = "custom";
+        c.rescale.value = "-1,1";
+        c.colormap.value = "viridis";
+        syncStretchUi();
+        syncExpressionUi();
+        document.getElementById("style-form").requestSubmit();
+      }
 
       function appendRepeated(p, name, value, sep) {
         value
@@ -204,13 +240,18 @@
       function tileUrl() {
         const p = new URLSearchParams();
         if (c.dataset.value) p.set("dataset", c.dataset.value);
-        appendRepeated(p, "bidx", c.bidx.value, ",");
+        const expression = c.expression.value.trim();
+        if (expression) p.set("expression", expression);
+        else appendRepeated(p, "bidx", c.bidx.value, ",");
         // Auto means the advertised global mean ± 2σ stretch, not the U8 raw-value fast path.
         // Explicitly send it so every tile resolves the same dataset statistics.
         const mode = c.stretch.value;
         const arg = c.stretchArg.value.trim();
         if (mode === "custom") {
-          appendRepeated(p, "rescale", c.rescale.value, ";");
+          const ranges = c.rescale.value.split(";").map((s) => s.trim()).filter(Boolean);
+          for (const range of expression ? ranges.slice(0, 1) : ranges) {
+            p.append("rescale", range);
+          }
         } else if (mode === "minmax") {
           p.set("stretch", "minmax");
         } else if (mode === "percent") {
@@ -291,14 +332,15 @@
         flyToDataset();
       });
       c.stretch.addEventListener("change", () => {
-        c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
-        c.rescale.disabled = c.stretch.value !== "custom";
+        syncStretchUi();
         applyStyle();
       });
       c.tilesize.addEventListener("change", applyStyle);
       c.format.addEventListener("change", applyStyle);
-      c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
-      c.rescale.disabled = c.stretch.value !== "custom";
+      c.expression.addEventListener("change", syncExpressionUi);
+      c.ndvi.addEventListener("click", applyNdvi);
+      syncStretchUi();
+      syncExpressionUi();
       c.opacity.addEventListener("input", () =>
         cogLayer.setOpacity(Number(c.opacity.value)),
       );
