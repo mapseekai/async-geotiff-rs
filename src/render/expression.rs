@@ -166,6 +166,9 @@ fn lex(s: &str) -> AgResult<Vec<Lexeme>> {
                 let n: f64 = s[start..j]
                     .parse()
                     .map_err(|_| AgError::query("expression", "invalid number"))?;
+                if !n.is_finite() {
+                    return Err(AgError::query("expression", "number must be finite"));
+                }
                 out.push(Lexeme::Num(n));
                 i = j;
             }
@@ -341,6 +344,15 @@ mod tests {
         assert!(matches!(
             parse_expression("   "),
             Err(AgError::Query { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_overflowing_numeric_literal() {
+        let literal = "9".repeat(400);
+        assert!(matches!(
+            parse_expression(&literal),
+            Err(AgError::Query { name, .. }) if name == "expression"
         ));
     }
     #[test]

@@ -94,10 +94,16 @@ pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
         let src = image.pixels.as_f64();
         let nodata = style.nodata.or(image.nodata);
         let (band, valid) = eval_expression_band(&src.view(), &style.expression, nodata, h, w)?;
-        let valid_opt = if valid.iter().all(|&b| b) {
-            None
-        } else {
-            Some(valid)
+        let valid_opt = match image.mask.as_ref() {
+            Some(mask) => {
+                let mut valid = valid;
+                Zip::from(&mut valid).and(mask).for_each(|ok, &source_ok| {
+                    *ok &= source_ok;
+                });
+                Some(valid)
+            }
+            None if valid.iter().all(|&ok| ok) => None,
+            None => Some(valid),
         };
         let rgba = render_single_band(&band.view(), valid_opt.as_ref(), style);
         return encode(&rgba, style.format);
@@ -876,13 +882,19 @@ mod tests {
 
         let source = ImageData {
             pixels: PixelData::F64(
-                Array3::from_shape_vec((2, 1, 3), vec![3.0, -9999.0, 1.0, 1.0, 2.0, -1.0]).unwrap(),
+                Array3::from_shape_vec(
+                    (2, 1, 4),
+                    vec![3.0, -9999.0, 1.0, 4.0, 1.0, 2.0, -1.0, 1.0],
+                )
+                .unwrap(),
             ),
-            mask: None,
+            mask: Some(
+                ndarray::Array2::from_shape_vec((1, 4), vec![false, true, true, true]).unwrap(),
+            ),
             crs: Crs::epsg(3857),
             transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
             nodata: Some(-9999.0),
-            bbox: Bbox::new(0.0, 0.0, 3.0, 1.0),
+            bbox: Bbox::new(0.0, 0.0, 4.0, 1.0),
         };
         let style = TileStyle {
             expression: Some("(b1-b2)/(b1+b2)".into()),
@@ -892,9 +904,10 @@ mod tests {
 
         let png = render(&source, &compile(&style).unwrap()).unwrap();
         let rgba = image::load_from_memory(&png).unwrap().to_rgba8();
-        assert_eq!(rgba.get_pixel(0, 0)[3], 255);
+        assert_eq!(rgba.get_pixel(0, 0)[3], 0);
         assert_eq!(rgba.get_pixel(1, 0)[3], 0);
         assert_eq!(rgba.get_pixel(2, 0)[3], 0);
+        assert_eq!(rgba.get_pixel(3, 0)[3], 255);
     }
 
     /// The u16 LUT fast paths must be BIT-IDENTICAL to the generic typed path.
