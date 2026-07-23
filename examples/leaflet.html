@@ -205,7 +205,8 @@
         const p = new URLSearchParams();
         if (c.dataset.value) p.set("dataset", c.dataset.value);
         appendRepeated(p, "bidx", c.bidx.value, ",");
-        // custom rescale > stretch mode > auto (no params → server stddev 2σ)
+        // Auto means the advertised global mean ± 2σ stretch, not the U8 raw-value fast path.
+        // Explicitly send it so every tile resolves the same dataset statistics.
         const mode = c.stretch.value;
         const arg = c.stretchArg.value.trim();
         if (mode === "custom") {
@@ -218,6 +219,8 @@
         } else if (mode === "stddev") {
           p.set("stretch", "stddev");
           if (arg) p.set("sigma", arg);
+        } else {
+          p.set("stretch", "stddev");
         }
         if (c.colormap.value) p.set("colormap_name", c.colormap.value);
         p.set("resampling", c.resampling.value);

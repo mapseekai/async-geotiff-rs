@@ -14,6 +14,7 @@ use crate::io::{CogReader, ScaleOffset};
 #[cfg(feature = "perf-tracing")]
 use crate::perf::duration_ms;
 use crate::pixel::{ImageData, PixelData};
+use crate::render::composite::CompositeKind;
 use crate::render::pipeline::{render, CompiledTileStyle};
 use crate::style::params::compile_cached;
 use crate::style::stretch::{fallback_rescale, resolve_rescale, Stretch};
@@ -579,6 +580,22 @@ fn effective_compiled_sync(
     let spec: Stretch = match style.resolved_stretch()? {
         Some(s) => s,
         None => {
+            if matches!(image.pixels, PixelData::U8(_))
+                && matches!(compiled.composite.kind, CompositeKind::Gradient)
+            {
+                let bidx = if compiled.bidx.is_empty() {
+                    vec![0]
+                } else {
+                    compiled.bidx.clone()
+                };
+                let ranges = fallback_rescale(&image.pixels, image.nodata, &bidx);
+                let mut next = (**compiled).clone();
+                next.rescale = ranges.clone();
+                next.composite.vmin = Some(ranges.iter().map(|range| range.0).collect());
+                next.composite.vmax = Some(ranges.iter().map(|range| range.1).collect());
+                next.luts = Default::default();
+                return Ok(Ready(Arc::new(next)));
+            }
             if matches!(image.pixels, PixelData::U8(_)) {
                 return Ok(Ready(Arc::clone(compiled)));
             }
@@ -864,6 +881,55 @@ mod tests {
         assert!(
             outside.is_none(),
             "fully out-of-bounds tile must return None, got bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_jl1_cog_center_tile_is_not_opaque_black() {
+        use crate::io::CogReader;
+        use crate::style::TileStyle;
+        use crate::tms::{TileCoord, TileMatrixSet};
+        use async_tiff::reader::ObjectReader;
+        use object_store::local::LocalFileSystem;
+        use object_store::path::Path as OsPath;
+        use std::sync::Arc;
+
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("data/JL1GF04A_PMS_20230301124138_3857_cog.tif");
+        if !tif.exists() {
+            eprintln!("fixture missing, skipping");
+            return;
+        }
+        let os_path = OsPath::from_filesystem_path(&tif).unwrap();
+        let reader = CogReader::open_with_reader(ObjectReader::new(
+            Arc::new(LocalFileSystem::new()),
+            os_path,
+        ))
+        .await
+        .unwrap();
+        let tiler = Tiler::new(Arc::new(reader));
+        let style =
+            TileStyle::from_query("bidx=1&resampling=bilinear&reproject=bilinear&tilesize=256")
+                .unwrap();
+        let png = tiler
+            .tile(
+                TileCoord {
+                    tms: TileMatrixSet::WebMercatorQuad,
+                    z: 14,
+                    x: 12866,
+                    y: 7017,
+                },
+                &style,
+            )
+            .await
+            .unwrap()
+            .expect("JL1 center tile must intersect the COG");
+        let rgba = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert!(
+            rgba.pixels()
+                .any(|pixel| pixel[3] > 0 && (pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)),
+            "JL1 center tile must retain source imagery instead of becoming opaque black"
         );
     }
 

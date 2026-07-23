@@ -40,6 +40,77 @@ network interface, set `ASYNC_GEOTIFF_BIND`, for example:
 ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 ```
 
+## 中文使用说明
+
+### 启动示例服务
+
+读取远程 COG：
+
+```bash
+cargo run --release --example serve -- https://example.com/cog.tif
+```
+
+不传 URL 时，示例服务会使用本地 `data/*.tif`，并在浏览器页面里提供数据集选择器：
+
+```bash
+cargo run --release --example serve
+```
+
+启动后访问任一内置地图页面：
+
+- `http://127.0.0.1:8080/maplibre`
+- `http://127.0.0.1:8080/openlayers`
+- `http://127.0.0.1:8080/leaflet`
+
+默认只监听 `127.0.0.1:8080`。如果需要让局域网或容器外部访问，设置
+`ASYNC_GEOTIFF_BIND`：
+
+```bash
+ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
+```
+
+### 请求瓦片
+
+瓦片接口格式：
+
+```text
+/tiles/{tms}/{z}/{x}/{y}.{ext}
+```
+
+常用示例：
+
+```bash
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?colormap_name=viridis&rescale=0,3000'
+```
+
+`ext` 可用 `png`；启用对应 feature 后也可用 `webp`、`jpg` 或 `jpeg`：
+
+```bash
+cargo run --release --features webp,jpeg --example serve -- https://example.com/cog.tif
+```
+
+常用参数：
+
+- `bidx=1&bidx=2&bidx=3`：选择 1 起始的波段。
+- `rescale=0,3000`：按给定最小/最大值拉伸像素值，可重复传入多组。
+- `stretch=percent&pc=2,98`：自动百分位拉伸。
+- `stretch=stddev&sigma=2.5`：按均值和标准差拉伸。
+- `colormap_name=viridis`：给单波段数据套用色带。
+- `resampling=average`：读取/缩放时的重采样方式，默认 `nearest`。
+- `reproject=bilinear`：重投影时的重采样方式。
+- `tilesize=512`：输出瓦片大小，默认 `256`。
+
+支持的 TileMatrixSet：
+
+- `WebMercatorQuad`：EPSG:3857，适合常见 XYZ 地图客户端。
+- `WorldCRS84Quad`：EPSG:4326。
+
+### 作为库使用
+
+HTTP 服务只放在 `examples/serve.rs`，库本身不强制依赖 axum。下游项目通常直接使用
+`CogReader`、`Tiler` 或 `MosaicTiler` 读取 COG 并生成瓦片。读取多个数据源时，建议复用同一个
+`Arc<BlockCache>`，并给每个 reader 设置不同 `source_id`，这样多个数据源共享同一个解码块缓存预算。
+
 ## URL contract (titiler-compatible subset)
 
 Path: `/tiles/{tms}/{z}/{x}/{y}.{ext}` where `ext ∈ {png, webp, jpg, jpeg}`.
@@ -238,6 +309,13 @@ Boundary metrics you can't read from the library (request rate, latency
 percentiles, the HTTP-204 "no tile" rate) are best recorded where you call
 `Tiler::tile` / `MosaicTiler::tile` — match on `Ok(Some)` / `Ok(None)` / `Err`
 and record OTel histograms/counters there.
+
+## Roadmap
+
+- Keep improving hot-path tile latency and cache behavior for large COGs and mosaics.
+- Expand MosaicJSON/STAC interoperability without adding web-framework dependencies to the library core.
+- Add focused compatibility coverage for titiler-style styling and resampling parameters.
+- Improve operational documentation for profiling, cache sizing, and production service integration.
 
 ## License
 

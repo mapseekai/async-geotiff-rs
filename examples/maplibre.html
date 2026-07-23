@@ -343,8 +343,8 @@
           params.set("dataset", controls.dataset.value);
         }
         appendRepeated(params, "bidx", controls.bidx.value, ",");
-        // Stretch priority mirrors the server: custom rescale > stretch
-        // mode > auto (no params → server default stddev 2σ).
+        // Auto means the advertised global mean ± 2σ stretch, not the U8 raw-value fast path.
+        // Explicitly send it so every tile resolves the same dataset statistics.
         const mode = controls.stretch.value;
         const arg = controls.stretchArg.value.trim();
         if (mode === "custom") {
@@ -357,8 +357,9 @@
         } else if (mode === "stddev") {
           params.set("stretch", "stddev");
           if (arg) params.set("sigma", arg);
+        } else {
+          params.set("stretch", "stddev");
         }
-        // mode === "auto": send neither rescale nor stretch.
         if (controls.colormap.value) {
           params.set("colormap_name", controls.colormap.value);
         }
@@ -574,12 +575,13 @@
         }
       }
 
-      controls.basemap.addEventListener("change", applyBasemap);
 
+      controls.basemap.addEventListener("change", applyBasemap);
       controls.dataset.addEventListener("change", () => {
         document.getElementById("style-form").requestSubmit();
         flyToDataset();
       });
+
 
       // Reflect which companion arg the chosen stretch mode consumes,
       // and disable the rescale box unless in custom mode.
