@@ -203,6 +203,8 @@
       };
 
       const pageParams = new URLSearchParams(window.location.search);
+      const requestedDataset = pageParams.get("dataset");
+      const requestedFormat = pageParams.get("format") ?? "png";
 
       function isExpressionMode() {
         return Boolean(c.expression.value.trim());
@@ -220,15 +222,26 @@
       }
 
       function restorePageParams() {
-        const dataset = pageParams.get("dataset");
-        if (dataset !== null) c.dataset.add(new Option(dataset, dataset, true, true));
+        if (requestedDataset !== null) {
+          c.dataset.add(new Option(requestedDataset, requestedDataset, true, true));
+        }
         c.colormap.value = pageParams.get("colormap_name") ?? "";
         const rescale = pageParams.getAll("rescale");
         if (rescale.length) {
           c.rescale.value = rescale.join(";");
           c.stretch.value = "custom";
+        } else {
+          const stretch = pageParams.get("stretch");
+          if (["minmax", "percent", "stddev"].includes(stretch)) {
+            c.stretch.value = stretch;
+          }
         }
-        for (const control of [c.resampling, c.tilesize, c.format]) {
+        if (c.stretch.value === "percent") {
+          c.stretchArg.value = pageParams.get("pc") ?? "";
+        } else if (c.stretch.value === "stddev") {
+          c.stretchArg.value = pageParams.get("sigma") ?? "";
+        }
+        for (const control of [c.resampling, c.tilesize]) {
           const value = pageParams.get(control.name);
           if (value !== null && [...control.options].some((option) => option.value === value)) {
             control.value = value;
@@ -383,7 +396,12 @@
             o.textContent = fmt.label;
             c.format.appendChild(o);
           }
-          c.format.value = "png";
+          c.format.value = [...c.format.options].some(
+            (option) => option.value === requestedFormat,
+          )
+            ? requestedFormat
+            : "png";
+          applyStyle();
         } catch (err) {
           console.warn("format list unavailable", err);
         }
@@ -402,7 +420,9 @@
             o.textContent = n;
             c.dataset.appendChild(o);
           }
-          c.dataset.value = names[0];
+          c.dataset.value = names.includes(requestedDataset)
+            ? requestedDataset
+            : names[0];
           applyStyle();
           flyToDataset();
         } catch (err) {
