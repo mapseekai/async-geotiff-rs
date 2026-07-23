@@ -27,7 +27,13 @@ pub struct TileStyle {
     /// Mutually exclusive with `colormap_name`.
     pub colormap: Option<String>,
     pub color_formula: Option<String>,
-    /// Band-math expression, e.g. "(b5-b4)/(b5+b4)". Mutually exclusive with bidx/color_formula.
+    /// Arithmetic derived-band expression, for example `(b5-b4)/(b5+b4)`.
+    ///
+    /// `bN` references source band `N` using one-based numbering. The grammar
+    /// accepts numeric literals, parentheses, unary `-`, and binary `+`, `-`,
+    /// `*`, `/`; it is mutually exclusive with `bidx` and `color_formula`.
+    /// A calculated non-finite value or a referenced nodata value renders
+    /// transparent.
     pub expression: Option<String>,
     pub resampling: Resampling,
     pub reproject: Resampling,

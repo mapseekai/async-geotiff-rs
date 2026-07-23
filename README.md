@@ -83,6 +83,18 @@ ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?colormap_name=viridis&rescale=0,3000'
 ```
 
+### 波段计算
+
+使用 `expression` 计算一个派生单波段。`bN` 表示从 1 开始计数的源波段；
+表达式支持数值、括号、一元负号和 `+`、`-`、`*`、`/`：
+
+```bash
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?expression=(b5-b4)/(b5%2Bb4)&rescale=-1,1'
+```
+
+`expression` 不能与 `bidx` 或 `color_formula` 同时使用。引用波段中的
+nodata、除零或其他非有限计算结果会输出透明像元；不会被替换为 0。
+
 `ext` 可用 `png`；启用对应 feature 后也可用 `webp`、`jpg` 或 `jpeg`：
 
 ```bash
