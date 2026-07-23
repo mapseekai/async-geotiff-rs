@@ -283,7 +283,10 @@ pub(crate) fn referenced_nodata_hit(px: &[f64], refs: &[usize], nodata: Option<f
         let Some(&x) = px.get(b) else {
             continue;
         };
-        if (nd_is_nan && x.is_nan()) || (!nd_is_nan && (x - nd).abs() < 1e-9) {
+        if (nd_is_nan && x.is_nan())
+            || (nd.is_infinite() && x == nd)
+            || (nd.is_finite() && (x - nd).abs() < 1e-9)
+        {
             return true;
         }
     }
@@ -309,6 +312,24 @@ mod tests {
         assert!(referenced_nodata_hit(&px2, &[0], Some(f64::NAN)));
         // no nodata configured → never hits
         assert!(!referenced_nodata_hit(&px, &[1], None));
+    }
+
+    #[test]
+    fn referenced_nodata_hit_matches_infinite_nodata() {
+        let expression = parse_expression("0/b1").unwrap();
+        let refs: Vec<usize> = expression
+            .iter()
+            .filter_map(|token| match token {
+                Token::Band(index) => Some(*index),
+                _ => None,
+            })
+            .collect();
+
+        assert!(referenced_nodata_hit(
+            &[f64::INFINITY],
+            &refs,
+            Some(f64::INFINITY)
+        ));
     }
 
     #[test]

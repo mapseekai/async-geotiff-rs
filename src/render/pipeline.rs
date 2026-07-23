@@ -910,6 +910,32 @@ mod tests {
         assert_eq!(rgba.get_pixel(3, 0)[3], 255);
     }
 
+    #[test]
+    fn expression_render_masks_infinite_nodata_transparent() {
+        use crate::pixel::{ImageData, PixelData};
+        use crate::style::params::compile;
+        use crate::style::TileStyle;
+        use ndarray::Array3;
+
+        let source = ImageData {
+            pixels: PixelData::F64(Array3::from_elem((1, 1, 1), f64::INFINITY)),
+            mask: None,
+            crs: Crs::epsg(3857),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 1.0, 0.0, -1.0]),
+            nodata: Some(f64::INFINITY),
+            bbox: Bbox::new(0.0, 0.0, 1.0, 1.0),
+        };
+        let style = TileStyle {
+            expression: Some("0/b1".into()),
+            rescale: vec![(0.0, 1.0)],
+            ..TileStyle::default()
+        };
+
+        let png = render(&source, &compile(&style).unwrap()).unwrap();
+        let rgba = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(rgba.get_pixel(0, 0)[3], 0);
+    }
+
     /// The u16 LUT fast paths must be BIT-IDENTICAL to the generic typed path.
     /// We render the same pixel values once as U16 (LUT path) and once as F64
     /// (generic path) and require equal encoded bytes.
