@@ -842,11 +842,8 @@ mod tests {
         use crate::render::expression::parse_expression;
         use ndarray::Array3;
 
-        let pixels = Array3::from_shape_vec(
-            (2, 1, 3),
-            vec![3.0, -9999.0, 1.0, 1.0, 2.0, -1.0],
-        )
-        .unwrap();
+        let pixels =
+            Array3::from_shape_vec((2, 1, 3), vec![3.0, -9999.0, 1.0, 1.0, 2.0, -1.0]).unwrap();
         let expression = parse_expression("(b1-b2)/(b1+b2)").unwrap();
 
         let (values, valid) =
@@ -879,11 +876,7 @@ mod tests {
 
         let source = ImageData {
             pixels: PixelData::F64(
-                Array3::from_shape_vec(
-                    (2, 1, 3),
-                    vec![3.0, -9999.0, 1.0, 1.0, 2.0, -1.0],
-                )
-                .unwrap(),
+                Array3::from_shape_vec((2, 1, 3), vec![3.0, -9999.0, 1.0, 1.0, 2.0, -1.0]).unwrap(),
             ),
             mask: None,
             crs: Crs::epsg(3857),
