@@ -8,3 +8,4 @@ Cargo.lock.bak
 /docs/superpowers/
 /.codegraph/
 /.serena/
+.superpowers/sdd/
