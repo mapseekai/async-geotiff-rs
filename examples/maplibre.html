@@ -534,7 +534,14 @@
           }
           const has = formats.some((f) => f.value === wanted);
           controls.format.value = has ? wanted : "png";
-          syncStatus();
+          const submitResolvedFormat = () => {
+            document.getElementById("style-form").requestSubmit();
+          };
+          if (map.isStyleLoaded()) {
+            submitResolvedFormat();
+          } else {
+            map.once("load", submitResolvedFormat);
+          }
         } catch (err) {
           console.warn("format list unavailable", err);
         }
