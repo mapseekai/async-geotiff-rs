@@ -1,7 +1,5 @@
 # Agent Instructions
 
-See [CLAUDE.md](./CLAUDE.md) for project-specific instructions and guidelines.
-
 # Issue Tracking (Multica)
 
 When you discover a problem while working in this repo — a bug, security
