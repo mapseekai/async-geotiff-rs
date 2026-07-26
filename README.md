@@ -64,6 +64,33 @@ Division by zero and other non-finite results are also rendered as transparent
 pixels rather than being replaced with zero. Expressions are limited to 4096
 bytes, 256 tokens, and 128 levels of nesting.
 
+## Library usage
+
+HTTP serving lives only in `examples/serve.rs`; the library itself does not
+require axum. Downstream applications can use `CogReader`, `Tiler`, or
+`MosaicTiler` directly to read COGs and produce tiles. When reading multiple
+sources, reuse one `Arc<BlockCache>` and give each reader a distinct
+`source_id` so all sources share one decoded-block memory budget.
+
+## Optional STAC demo
+
+With the existing `stac` feature enabled, startup environment variables can
+connect `/mosaic/tiles/...` to a fixed STAC API, collection, and COG asset key:
+
+```bash
+ASYNC_GEOTIFF_STAC_URL=https://earth-search.aws.element84.com/v1 \
+ASYNC_GEOTIFF_STAC_COLLECTION=sentinel-2-l2a \
+ASYNC_GEOTIFF_STAC_ASSET_KEY=visual \
+cargo run --example serve --features stac
+```
+
+All three variables are required and are mutually exclusive with
+`ASYNC_GEOTIFF_MOSAIC`. They are read only at process startup; HTTP query
+parameters cannot choose the STAC endpoint, collection, or asset key. STAC
+assets still use the default HTTP access policy, which rejects loopback and
+link-local destinations so the demo cannot become a client-controlled public
+proxy.
+
 ## URL contract (titiler-compatible subset)
 
 Path: `/tiles/{tms}/{z}/{x}/{y}.{ext}` where `ext ∈ {png, webp, jpg, jpeg}`.

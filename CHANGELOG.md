@@ -11,9 +11,37 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the style compiler's debug-string cache key with a typed key that
+  covers every `TileStyle` field and preserves exact floating-point bit
+  patterns, so cache identity does not depend on debug formatting.
+
 ## [0.10.0] - 2026-07-26
 
+### ⚠️ BREAKING
+
+- Removed the built-in typed spectral-index API (`Index` and its predefined
+  indices). Use the arithmetic `expression` style parameter instead; this keeps
+  band math extensible without growing a fixed list of index variants.
+
 ### Added
+
+- Arithmetic band-math expressions through the `expression` query parameter.
+  Expressions use 1-indexed `b<N>` references, decimal literals, parentheses,
+  `+`, `-`, `*`, `/`, and unary minus; multiplication/division bind more
+  tightly and same-precedence operators are left-associative. The result is a
+  synthetic single band that can be rescaled and colorized.
+- Expression rendering semantics and validation: referenced nodata, division
+  by zero, and other non-finite results become transparent pixels; `expression`
+  is mutually exclusive with `bidx` and `color_formula` and accepts at most one
+  `rescale` range. Expression size, token-count, nesting, and missing-band
+  cases are bounded and return query errors.
+- Band-math examples in the MapLibre, OpenLayers, and Leaflet viewers,
+  including expression-aware URL permalinks and state restoration.
+- Type-state validation for tile styles, IFD metadata, and mosaic reducers,
+  making invalid intermediate states harder to construct while preserving the
+  existing tile-style compilation entry point.
 
 - Optional STAC-backed Mosaic demo for `examples/serve`, enabled only when the
   existing `stac` feature and all three startup settings are present:
@@ -28,11 +56,36 @@ can land in any release** and are called out explicitly under a
 - The MapLibre viewer defaults to mosaic when a MosaicJSON or STAC source is
   configured, keeps the normal single-COG demo unchanged otherwise, and no
   longer lets local dataset discovery override mosaic mode.
+- The example viewers use blank basemaps by default, so the demo does not
+  depend on external map-tile providers.
+- Mosaic and tile hot paths reduce allocations and blocking handoffs, reuse
+  native pixel layouts during resize, stream `mean`, use quickselect for
+  `median`, and track `First` reducer completion incrementally. Shared CPU
+  limiting now covers reader, warp, render, and mosaic reduction work.
+- Remote tile responses from the example server advertise one-hour immutable
+  browser caching for a fixed URL and style.
+- Mosaic tile fan-out is bounded by `MosaicConfig::max_assets_per_tile` (64 by
+  default), and oversized or invalid read windows are rejected before they can
+  cause unbounded allocation or remote work.
 
 ### Security
 
 - STAC endpoint, collection, and asset selection are fixed at process startup;
   tile requests cannot supply arbitrary remote STAC configuration.
+- HTTP-backed mosaic assets are checked by the new `HttpAccessPolicy` before
+  opening. The default policy blocks loopback and link-local destinations,
+  `strict()` also blocks private ranges and requires HTTPS, and `permissive()`
+  is available only for operator-controlled asset URLs. Credential-bearing URL
+  query strings remain redacted from mosaic errors.
+
+### Fixed
+
+- Expression rendering now preserves finite numeric literals and masks
+  referenced nodata, including infinite nodata sentinels, instead of allowing
+  invalid values to become visible pixels.
+- Rendering and resizing paths now handle non-standard array layouts and
+  malformed or empty dimensions with structured errors rather than panics or
+  wrapped allocations.
 
 ## [0.0.9] - 2026-06-11
 
@@ -342,7 +395,9 @@ can land in any release** and are called out explicitly under a
 - PNG output; example axum server with MapLibre / OpenLayers / Leaflet
   viewers and a local `data/*.tif` dataset picker.
 
-[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.0.9...HEAD
+[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.10.0...HEAD
+
+[0.10.0]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.10.0
 
 [0.0.9]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.0.9
 

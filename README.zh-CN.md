@@ -89,8 +89,6 @@ cargo run --release --features webp,jpeg --example serve -- https://example.com/
 - `reproject=bilinear`：重投影时的重采样方式。
 - `tilesize=512`：输出瓦片大小，默认 `256`。
 
-支持的 TileMatrixSet：`WebMercatorQuad`（EPSG:3857）和 `WorldCRS84Quad`（EPSG:4326）。
-
 ## 作为库使用
 
 HTTP 服务只位于 `examples/serve.rs`，库本身不强制依赖 axum。下游项目通常直接使用 `CogReader`、`Tiler` 或 `MosaicTiler` 读取 COG 并生成瓦片。
@@ -121,10 +119,10 @@ cargo run --example serve --features stac
 | `stretch` | 否 | `?stretch=percent&pc=2,98` | `minmax`、`percent` 或 `stddev` |
 | `pc` | 否 | `?pc=2,98` | 百分位裁剪，默认 `2,98` |
 | `sigma` | 否 | `?sigma=2.5` | 标准差倍数，默认 `2.0` |
-| `nodata` | 否 | `?nodata=nan` | 覆盖数据集 nodata 值 |
-| `colormap_name` | 否 | `?colormap_name=viridis` | `viridis`、`magma`、`inferno` 等色带 |
+| `nodata` | 否 | `?nodata=nan` | 覆盖数据集 nodata 值，支持 `nan`、`inf`、`-inf` 和浮点数 |
+| `colormap_name` | 否 | `?colormap_name=viridis` | 来自 `colorous`：`viridis`、`magma`、`inferno`、`plasma`、`cividis`、`turbo`、`greys` |
 | `color_formula` | 否 | `?color_formula=gamma%20RGB%201.5` | rio-color 子集 |
-| `resampling` | 否 | `?resampling=average` | 读取和缩放时的重采样方式 |
+| `resampling` | 否 | `?resampling=average` | `nearest`（默认）、`bilinear`、`cubic`、`cubic_spline`、`lanczos`、`average`；`average` 对覆盖的源像元求盒式平均，下采样时抗锯齿，上采样时使用 nearest |
 | `reproject` | 否 | `?reproject=bilinear` | 重投影时的重采样方式 |
 | `tilesize` | 否 | `?tilesize=512` | 默认 256，可用 64、128、256、512、1024 |
 
@@ -132,18 +130,28 @@ cargo run --example serve --features stac
 
 ### 数据拉伸
 
-UInt16、Int16 和 Float COG 需要值域，否则可能渲染为饱和白色。优先级为：显式 `rescale` → `stretch` 模式 → 未指定参数时的 `stretch=stddev&sigma=2.0`。U8 RGB 保留 0–255 快速路径，不会自动拉伸。
+UInt16、Int16 和 Float COG 需要值域，否则可能渲染为饱和白色。优先级为：显式 **`rescale`**（Custom）→ **`stretch`** 模式 → 未指定参数时的 **`stretch=stddev&sigma=2.0`**。U8 RGB 保留 0–255 快速路径，不会自动拉伸。
 
-- `?rescale=470,660`：使用指定范围。
-- `?stretch=minmax`：使用数据集最小值和最大值。
-- `?stretch=percent&pc=2,98`：使用第 2 至第 98 百分位。
-- `?stretch=stddev&sigma=2.5`：使用 `mean ± 2.5·σ`，并限制在最小值和最大值内。
+| 模式 | 示例 | 每波段范围 |
+|---|---|---|
+| Custom | `?rescale=470,660&rescale=470,700&rescale=350,730` | 完全按指定范围 |
+| MinMax | `?stretch=minmax` | 数据集 `min … max` |
+| Percent | `?stretch=percent&pc=2,98` | 第 2 至第 98 百分位（QGIS cumulative cut） |
+| StdDev | `?stretch=stddev&sigma=2.5` | `mean ± 2.5·σ`，限制在最小值和最大值内 |
+| *无参数* | `?`（没有拉伸参数） | 等同于 `stretch=stddev&sigma=2.0` |
 
-统计信息优先读取 COG 内嵌的 `STATISTICS_*` GDAL 标签，否则从最高级概览读取一次并缓存。无效参数返回 HTTP 400。
+统计信息优先读取 COG 内嵌的 `STATISTICS_*` GDAL 标签（**精确**），否则从最高级概览读取一次并缓存（**估算**）。对于没有统计标签的 COG，可离线写入统计信息，例如 `gdal_edit.py -stats file.tif`。无效参数（`?stretch=bogus`、`?pc=2`、`?sigma=0`，或不带 `stretch=` 的 `pc`/`sigma`）返回 HTTP 400。
 
-## 支持的数据类型与构建要求
+## 支持的 TileMatrixSet
 
-源 COG 支持 U8、U16、I16、U32、I32、F32 和 F64，读取和重投影边界处统一为 F64。
+- `WebMercatorQuad`（EPSG:3857）：常见 slippy XYZ 客户端的默认选择。
+- `WorldCRS84Quad`（EPSG:4326）。
+
+## TMS 支持的像素类型
+
+源 COG 支持 U8、U16、I16、U32、I32、F32 和 F64；在读取与重投影边界处统一为 F64。
+
+## 构建要求
 
 - Rust ≥ 1.88，与 `Cargo.toml` 中的 `rust-version` 一致。
 - 默认 `proj` feature 需要系统安装 `libproj` 9.x。
@@ -155,18 +163,87 @@ UInt16、Int16 和 Float COG 需要值域，否则可能渲染为饱和白色。
 
 处理流程为：HTTP 请求 → TMS 瓦片范围 → `CogReader` 读取 → 可选重投影 → 拉伸、着色和合成 → PNG/WebP/JPEG 编码。
 
-CPU 密集型解码、拼接、重投影和渲染通过受信号量限制的 `spawn_blocking` 执行。默认共享解码块缓存预算为 **512 MB**；多数据集服务可根据内存情况调大。`MosaicTiler` 会通过 `ReaderPool` 自动共享缓存。
+```text
+HTTP 请求（axum，`examples/serve.rs`）
+  ├─ TMS.tile_bbox(z, x, y)            瓦片网格
+  ├─ CogReader.read_window              async-tiff + object_store
+  │    └─ 共享 BlockCache 中的原生解码块；未命中时合并获取，
+  │       并通过受信号量限制的 spawn_blocking 解码
+  ├─ warp::warp（src_crs ≠ dst_crs）    proj 粗网格 + 双线性重投影
+  │    └─ 在受信号量限制的 spawn_blocking 中执行（Proj 不实现 Send/Sync）
+  ├─ 渲染管线：                         ndarray + palette
+  │    ├─ 每波段拉伸
+  │    ├─ color_formula（sRGB Lab/Lch）
+  │    └─ 合成（渐变 LUT / 离散 HashMap / 多波段 RGB）
+  └─ PNG / WebP / JPEG 编码             image（+ image-webp）
+```
 
-性能调优建议：
+超出数据范围的瓦片返回 `Ok(None)`（示例服务响应 HTTP 204）；WebP/JPEG 输出需要启用对应的 `webp` / `jpeg` Cargo feature。
 
-- 缓存容量通常是最有效的调节项。
-- 创建 COG 时优先使用 ZSTD；基准测试显示其块解码速度明显快于 DEFLATE。
-- `MAX_TILE_TASKS` 默认使用主机可用并行度，只有在 profiling 证明存在 CPU 争用时才覆盖。
-- 相同未缓存块的并发请求使用 single-flight，避免重复下载和解码。
+模块布局：
+
+```text
+src/
+  error.rs            AgError + AgResult
+  bounds.rs           Bbox + GeoTransform（封装 raffine::Affine）
+  crs.rs              Crs 标识
+  pixel.rs            PixelData + ImageData
+  tms.rs              WebMercatorQuad + WorldCRS84Quad
+  io/
+    cog.rs            CogReader 打开、元数据和块读取编排
+    block_cache.rs    共享解码块缓存（BlockKey/BlockCache，单一预算）
+    cache.rs          CacheConfig（块缓存字节预算和可选 TTL）
+    decode.rs         受信号量限制的单块 spawn_blocking 解码辅助函数
+    window.rs         源瓦片范围和拼接辅助函数
+  warp/               Projector + Resampling + 粗网格重投影
+  render/             colour、colormap、color_formula、composite、encode、pipeline
+  style/              titiler 风格参数解析器（`TileStyle`）和编译器
+  tiler.rs            编排器
+examples/
+  serve.rs            Demo 入口和 viewer wiring
+  serve/server.rs     Demo 服务的 axum 路由
+  maplibre.html       MapLibre viewer
+  openlayers.html     OpenLayers viewer
+  leaflet.html        Leaflet viewer
+```
+
+库本身不暴露 axum 服务模块；HTTP 服务位于示例中，因此下游库用户不会被迫引入 Web 框架依赖。
+
+CPU 密集型解码、拼接、重投影和渲染通过受信号量限制的 `spawn_blocking` 执行。可以使用 `CogReader::builder()`（例如 `.max_decode_tasks(n)`、`.block_cache(cache)`，再调用 `.open_http(url)` / `.open_object_store(store, key)` / `.open(reader)`）调整解码并发；使用 `Tiler::with_config` 与 `async_geotiff::tiler::TilerConfig` 调整重投影和渲染并发。默认使用主机可用并行度，并将 0 限制为至少一个 permit。
+
+解码后的原生瓦片块使用共享 `Arc<BlockCache>` 缓存，默认预算为 **512 MB**。`ReaderConfig` 携带调用方提供的 `source_id`（缓存键前缀）和 `block_cache`；多个 reader 应共享同一个 `block_cache`，但使用不同的 `source_id`，从而把所有数据集的解码内存限制在一个预算内。`MosaicTiler` 会通过 `ReaderPool` 自动完成这件事。
+
+### 性能说明
+
+- **缓存容量是最重要的调节项。** 512 MB 通常足够大型 RGB COG 的浏览视口；多数据集服务或大范围平移缩放可以使用 1024 MB。
+- **创建 COG 时优先使用 ZSTD。** 基准测试显示 ZSTD 块解码 P50 约 1.5 ms，DEFLATE 约 4.5 ms（约快 3 倍）；可使用 `gdal_translate -co COMPRESS=ZSTD -co ZSTD_LEVEL=1` 降低读取延迟。
+- **`MAX_TILE_TASKS` 保持默认值**（`available_parallelism()`）。只有 profiling 证明默认值造成 CPU 争用时才覆盖它。
+- **并发 single-flight。** 多个请求同时访问同一个未缓存块时，只有第一个请求负责获取和解码，其余请求等待结果；如果所有者因客户端断开而取消，等待者会重新发起 claim，而不是收到 500。
 
 ## 可观测性
 
-库只发出 [`tracing`](https://docs.rs/tracing) 信息，不直接依赖 OpenTelemetry 或其他指标后端。`Tiler::tile` 和 `CogReader::read_window` 提供 tracing span；应用可以定期读取 `BlockCache::stats()` 并接入自己的指标系统。
+库只发出 [`tracing`](https://docs.rs/tracing) 信息，不直接依赖 OpenTelemetry 或其他指标后端，因此由应用负责导出管线。主要有两个接入点：
+
+**Span → trace。** `Tiler::tile` 和 `CogReader::read_window` 带有 `#[tracing::instrument]`，包含 source id、瓦片坐标、level 和 format 字段。可以通过 `tracing-opentelemetry` layer 接入 OpenTelemetry：
+
+```rust
+use tracing_subscriber::prelude::*;
+tracing_subscriber::registry()
+    .with(tracing_subscriber::EnvFilter::new("async_geotiff=info"))
+    .with(tracing_opentelemetry::layer().with_tracer(tracer)) // 你的 OTLP tracer
+    .init();
+```
+
+**缓存指标 → gauges/counters。** 应用创建共享的 `Arc<BlockCache>`，可以定期读取 `BlockCache::stats()` 并送入指标后端：
+
+```rust
+let s = block_cache.stats(); // BlockCacheStats { hits, misses, decoded, fetched, entries, resident_bytes }
+// 命中率             = hits / (hits + misses)
+// 获取放大系数        = fetched / decoded（1.0 表示没有重复冷启动获取）
+// 内存压力            = resident_bytes / configured budget
+```
+
+请求速率、延迟百分位数、HTTP 204“无瓦片”比例等库外指标，应在调用 `Tiler::tile` / `MosaicTiler::tile` 的位置记录，并根据 `Ok(Some)` / `Ok(None)` / `Err` 分别统计。
 
 ## 许可证
 
