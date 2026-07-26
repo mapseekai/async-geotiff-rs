@@ -11,6 +11,29 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-26
+
+### Added
+
+- Optional STAC-backed Mosaic demo for `examples/serve`, enabled only when the
+  existing `stac` feature and all three startup settings are present:
+  `ASYNC_GEOTIFF_STAC_URL`, `ASYNC_GEOTIFF_STAC_COLLECTION`, and
+  `ASYNC_GEOTIFF_STAC_ASSET_KEY`.
+- Offline end-to-end coverage that starts a local mock STAC API and serves a
+  repository COG fixture, verifying the STAC request, returned asset, and a
+  non-empty rendered tile without external network access.
+
+### Changed
+
+- The MapLibre viewer defaults to mosaic when a MosaicJSON or STAC source is
+  configured, keeps the normal single-COG demo unchanged otherwise, and no
+  longer lets local dataset discovery override mosaic mode.
+
+### Security
+
+- STAC endpoint, collection, and asset selection are fixed at process startup;
+  tile requests cannot supply arbitrary remote STAC configuration.
+
 ## [0.0.9] - 2026-06-11
 
 ### ⚠️ BREAKING

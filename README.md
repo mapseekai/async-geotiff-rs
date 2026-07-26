@@ -123,6 +123,23 @@ HTTP 服务只放在 `examples/serve.rs`，库本身不强制依赖 axum。下�
 `CogReader`、`Tiler` 或 `MosaicTiler` 读取 COG 并生成瓦片。读取多个数据源时，建议复用同一个
 `Arc<BlockCache>`，并给每个 reader 设置不同 `source_id`，这样多个数据源共享同一个解码块缓存预算。
 
+### 可选 STAC Demo
+
+默认 Demo 行为不变。使用已有的 `stac` feature 后，可在启动时通过环境变量把 `/mosaic/tiles/...`
+接到一个固定的 STAC API、集合和 COG 资产字段：
+
+```bash
+ASYNC_GEOTIFF_STAC_URL=https://earth-search.aws.element84.com/v1 \
+ASYNC_GEOTIFF_STAC_COLLECTION=sentinel-2-l2a \
+ASYNC_GEOTIFF_STAC_ASSET_KEY=visual \
+cargo run --example serve --features stac
+```
+
+三个变量必须同时提供，且与 `ASYNC_GEOTIFF_MOSAIC` 互斥。它们只在进程启动时读取；HTTP 请求参数
+不能选择 STAC 地址、集合或资产字段。来自 STAC 的资产仍使用默认 HTTP 访问策略，拒绝环回和 link-local
+地址，避免把 Demo 变成可由客户端驱动的公网代理。启用后，MapLibre 会默认使用 mosaic；打开
+`/maplibre?center=-0.1278,51.5074&zoom=12` 可直接验证，Source 下拉框也可在 mosaic 与单 COG 间切换。
+
 ## URL contract (titiler-compatible subset)
 
 Path: `/tiles/{tms}/{z}/{x}/{y}.{ext}` where `ext ∈ {png, webp, jpg, jpeg}`.

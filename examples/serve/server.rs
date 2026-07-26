@@ -17,6 +17,8 @@ use tracing::Instrument;
 
 use async_geotiff::error::{AgError, AgResult};
 use async_geotiff::io::{BlockCache, BlockCacheStats, CogReader, ReaderConfig};
+#[cfg(feature = "stac")]
+use async_geotiff::mosaic::StacSource;
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
 use async_geotiff::style::{TileFormat, TileStyle};
 use async_geotiff::tiler::{Tiler, TilerConfig};
@@ -144,13 +146,35 @@ impl StageTimer {
 ///   opens that file over HTTP (loopback, same object_store HTTP path as
 ///   production) and caches the `Tiler` lazily.
 #[derive(Clone)]
+pub enum Mosaic {
+    Json(Arc<MosaicTiler<MosaicJsonSource>>),
+    #[cfg(feature = "stac")]
+    Stac(Arc<MosaicTiler<StacSource>>),
+}
+
+impl Mosaic {
+    async fn tile(
+        &self,
+        coord: TileCoord,
+        selection: PixelSelection,
+        style: &TileStyle,
+    ) -> AgResult<Option<bytes::Bytes>> {
+        match self {
+            Self::Json(mosaic) => mosaic.tile(coord, selection, style).await,
+            #[cfg(feature = "stac")]
+            Self::Stac(mosaic) => mosaic.tile(coord, selection, style).await,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub default_tiler: Option<Arc<Tiler>>,
     pub data_dir: Option<PathBuf>,
     pub datasets: Arc<Vec<String>>,
     /// Optional MosaicJSON-backed mosaic, served at `/mosaic/tiles/...`.
     /// Loaded once at startup from `ASYNC_GEOTIFF_MOSAIC` (file path).
-    pub mosaic: Option<Arc<MosaicTiler<MosaicJsonSource>>>,
+    pub mosaic: Option<Mosaic>,
     http_base: String,
     tilers: moka::future::Cache<String, Arc<Tiler>>,
     /// One decoded-block cache shared by every per-dataset reader, so the
@@ -205,7 +229,13 @@ impl AppState {
 
     /// Attach a MosaicJSON-backed mosaic, exposed at `/mosaic/tiles/...`.
     pub fn with_mosaic(mut self, mosaic: Arc<MosaicTiler<MosaicJsonSource>>) -> Self {
-        self.mosaic = Some(mosaic);
+        self.mosaic = Some(Mosaic::Json(mosaic));
+        self
+    }
+
+    #[cfg(feature = "stac")]
+    pub fn with_stac_mosaic(mut self, mosaic: Arc<MosaicTiler<StacSource>>) -> Self {
+        self.mosaic = Some(Mosaic::Stac(mosaic));
         self
     }
 
@@ -412,7 +442,7 @@ pub async fn mosaic_tile_handler(
         return with_cors(
             (
                 StatusCode::NOT_FOUND,
-                "no mosaic loaded; set ASYNC_GEOTIFF_MOSAIC to a MosaicJSON path",
+                "no mosaic loaded; set ASYNC_GEOTIFF_MOSAIC or the ASYNC_GEOTIFF_STAC_* variables",
             )
                 .into_response(),
         );

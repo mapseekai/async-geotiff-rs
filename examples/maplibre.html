@@ -261,6 +261,7 @@
       }
       const SERVER_DEFAULT_CENTER = "__ASYNC_GEOTIFF_DEFAULT_CENTER__";
       const SERVER_DEFAULT_ZOOM = "__ASYNC_GEOTIFF_DEFAULT_ZOOM__";
+      const SERVER_DEFAULT_MODE = "__ASYNC_GEOTIFF_DEFAULT_MODE__";
       const pageParams = new URLSearchParams(window.location.search);
 
       const controls = {
@@ -282,7 +283,7 @@
         status: document.getElementById("status")
       };
 
-      controls.mode.value = pageParams.get("mode") ?? "single";
+      controls.mode.value = pageParams.get("mode") ?? SERVER_DEFAULT_MODE;
       controls.pixelSelection.value = pageParams.get("pixel_selection") ?? "first";
       controls.colormap.value = pageParams.get("colormap_name") ?? "";
       controls.stretch.value =
@@ -410,6 +411,12 @@
 
       function syncStatus() {
         controls.status.textContent = tileUrl();
+      }
+
+      function syncSourceUi() {
+        const mosaic = isMosaic();
+        controls.dataset.disabled = mosaic;
+        controls.pixelSelection.disabled = !mosaic;
       }
 
       function syncPermalink() {
@@ -570,10 +577,10 @@
           }
           controls.dataset.value =
             wanted && names.includes(wanted) ? wanted : names[0];
-          // Rebuild the COG source against the selected dataset, then
-          // fly to its extent.
-          document.getElementById("style-form").requestSubmit();
-          flyToDataset();
+          if (!isMosaic()) {
+            document.getElementById("style-form").requestSubmit();
+            flyToDataset();
+          }
         } catch (err) {
           console.warn("dataset list unavailable", err);
         }
@@ -605,8 +612,17 @@
 
       controls.basemap.addEventListener("change", applyBasemap);
       controls.dataset.addEventListener("change", () => {
+        if (!isMosaic()) {
+          document.getElementById("style-form").requestSubmit();
+          flyToDataset();
+        }
+      });
+      controls.mode.addEventListener("change", () => {
+        syncSourceUi();
         document.getElementById("style-form").requestSubmit();
-        flyToDataset();
+        if (!isMosaic()) {
+          flyToDataset();
+        }
       });
 
 
@@ -653,6 +669,7 @@
       });
       controls.ndvi.addEventListener("click", applyNdvi);
       syncExpressionUi();
+      syncSourceUi();
 
       controls.tilesize.addEventListener("change", () => {
         document.getElementById("style-form").requestSubmit();
