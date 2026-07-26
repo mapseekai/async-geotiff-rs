@@ -1,5 +1,7 @@
 # async-geotiff
 
+[中文文档](README.zh-CN.md) | English
+
 Pure-Rust async crate that reads cloud-hosted Cloud-Optimized GeoTIFFs (COGs)
 and serves them as XYZ map tiles with titiler-style URL parameter styling.
 
@@ -8,14 +10,6 @@ Reprojection through [`proj`] (libproj system dep, feature-gated). Affine math
 through [`raffine`] (the author's own Rust port of Python's `affine`).
 Colormaps via [`colorous`] + [`enterpolation`]. Resampling via
 [`fast_image_resize`]. PNG encoding via [`image`].
-
-## Status
-
-MVP (v0.0.1). See:
-
-- Design spec: `docs/superpowers/specs/2026-05-14-async-geotiff-rs-design.md`
-- Library research: `docs/superpowers/research/2026-05-14-library-deep-dive.md`
-- Implementation plan: `docs/superpowers/plans/2026-05-14-async-geotiff-rs.md`
 
 ## Quick start
 
@@ -40,105 +34,35 @@ network interface, set `ASYNC_GEOTIFF_BIND`, for example:
 ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 ```
 
-## 中文使用说明
+## Band math expressions
 
-### 启动示例服务
+Use the `expression` query parameter to calculate one derived band per pixel.
+Band references are 1-indexed (`b1` is the first source band). The grammar is
+arithmetic-only:
 
-读取远程 COG：
+- band references such as `b1`, `b4`, and `b5` (uppercase `B` is also accepted);
+- finite decimal numbers such as `2.5` and `0.5`;
+- parentheses, binary `+`, `-`, `*`, `/`, and unary `-`.
 
-```bash
-cargo run --release --example serve -- https://example.com/cog.tif
-```
-
-不传 URL 时，示例服务会使用本地 `data/*.tif`，并在浏览器页面里提供数据集选择器：
-
-```bash
-cargo run --release --example serve
-```
-
-启动后访问任一内置地图页面：
-
-- `http://127.0.0.1:8080/maplibre`
-- `http://127.0.0.1:8080/openlayers`
-- `http://127.0.0.1:8080/leaflet`
-
-默认只监听 `127.0.0.1:8080`。如果需要让局域网或容器外部访问，设置
-`ASYNC_GEOTIFF_BIND`：
+Multiplication and division bind more tightly than addition and subtraction;
+operators at the same level are evaluated left to right. Scientific notation
+such as `1e3` is not supported. For example, NDVI can be rendered from bands 5
+and 4 with:
 
 ```bash
-ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?expression=(b5-b4)%2F(b5%2Bb4)&rescale=-1,1'
 ```
 
-### 请求瓦片
+The `+` and `/` characters are percent-encoded here because this is a URL
+query string. Equivalent expressions include `b1/2`, `-b1+3`, and
+`(b2-b1)/(b2+b1)`.
 
-瓦片接口格式：
-
-```text
-/tiles/{tms}/{z}/{x}/{y}.{ext}
-```
-
-常用示例：
-
-```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?colormap_name=viridis&rescale=0,3000'
-```
-
-### 波段计算
-
-使用 `expression` 计算一个派生单波段。`bN` 表示从 1 开始计数的源波段；
-表达式支持数值、括号、一元负号和 `+`、`-`、`*`、`/`：
-
-```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?expression=(b5-b4)/(b5%2Bb4)&rescale=-1,1'
-```
-
-`expression` 不能与 `bidx` 或 `color_formula` 同时使用。引用波段中的
-nodata、除零或其他非有限计算结果会输出透明像元；不会被替换为 0。
-
-`ext` 可用 `png`；启用对应 feature 后也可用 `webp`、`jpg` 或 `jpeg`：
-
-```bash
-cargo run --release --features webp,jpeg --example serve -- https://example.com/cog.tif
-```
-
-常用参数：
-
-- `bidx=1&bidx=2&bidx=3`：选择 1 起始的波段。
-- `rescale=0,3000`：按给定最小/最大值拉伸像素值，可重复传入多组。
-- `stretch=percent&pc=2,98`：自动百分位拉伸。
-- `stretch=stddev&sigma=2.5`：按均值和标准差拉伸。
-- `colormap_name=viridis`：给单波段数据套用色带。
-- `resampling=average`：读取/缩放时的重采样方式，默认 `nearest`。
-- `reproject=bilinear`：重投影时的重采样方式。
-- `tilesize=512`：输出瓦片大小，默认 `256`。
-
-支持的 TileMatrixSet：
-
-- `WebMercatorQuad`：EPSG:3857，适合常见 XYZ 地图客户端。
-- `WorldCRS84Quad`：EPSG:4326。
-
-### 作为库使用
-
-HTTP 服务只放在 `examples/serve.rs`，库本身不强制依赖 axum。下游项目通常直接使用
-`CogReader`、`Tiler` 或 `MosaicTiler` 读取 COG 并生成瓦片。读取多个数据源时，建议复用同一个
-`Arc<BlockCache>`，并给每个 reader 设置不同 `source_id`，这样多个数据源共享同一个解码块缓存预算。
-
-### 可选 STAC Demo
-
-默认 Demo 行为不变。使用已有的 `stac` feature 后，可在启动时通过环境变量把 `/mosaic/tiles/...`
-接到一个固定的 STAC API、集合和 COG 资产字段：
-
-```bash
-ASYNC_GEOTIFF_STAC_URL=https://earth-search.aws.element84.com/v1 \
-ASYNC_GEOTIFF_STAC_COLLECTION=sentinel-2-l2a \
-ASYNC_GEOTIFF_STAC_ASSET_KEY=visual \
-cargo run --example serve --features stac
-```
-
-三个变量必须同时提供，且与 `ASYNC_GEOTIFF_MOSAIC` 互斥。它们只在进程启动时读取；HTTP 请求参数
-不能选择 STAC 地址、集合或资产字段。来自 STAC 的资产仍使用默认 HTTP 访问策略，拒绝环回和 link-local
-地址，避免把 Demo 变成可由客户端驱动的公网代理。启用后，MapLibre 会默认使用 mosaic；打开
-`/maplibre?center=-0.1278,51.5074&zoom=12` 可直接验证，Source 下拉框也可在 mosaic 与单 COG 间切换。
+`expression` produces a single derived band, so it is mutually exclusive with
+`bidx` and `color_formula`, and accepts at most one `rescale` range. A source
+nodata value referenced by the expression produces a transparent pixel.
+Division by zero and other non-finite results are also rendered as transparent
+pixels rather than being replaced with zero. Expressions are limited to 4096
+bytes, 256 tokens, and 128 levels of nesting.
 
 ## URL contract (titiler-compatible subset)
 
@@ -203,25 +127,6 @@ unified to F64 at the read/warp seam.
   (`brew install proj` on macOS; `apt install libproj-dev libsqlite3-dev
   libtiff-dev clang` on Debian/Ubuntu).
   Build without it via `cargo build --no-default-features`.
-
-## Issue Tracking
-
-Obsidian vault for problem tracking: `~/知识库/async-geotiff-rs/`
-
-**Folders:**
-- `Open/` — active issues under investigation
-- `Resolved-Pending/` — fixes awaiting validation
-- `Resolved/` — archived issues with solutions
-- `Deferred/` — not currently prioritized
-
-**Quick commands:**
-```bash
-obsidian vault="async-geotiff-rs" read path="async-geotiff-rs 问题汇总.md"
-obsidian vault="async-geotiff-rs" search query="memory"
-obsidian vault="async-geotiff-rs" search query="performance"
-```
-
-See `CHANGELOG.md` (English) or `~/知识库/async-geotiff-rs/CHANGELOG-CN.md` (中文) for version history.
 
 ## Architecture
 
@@ -338,13 +243,6 @@ Boundary metrics you can't read from the library (request rate, latency
 percentiles, the HTTP-204 "no tile" rate) are best recorded where you call
 `Tiler::tile` / `MosaicTiler::tile` — match on `Ok(Some)` / `Ok(None)` / `Err`
 and record OTel histograms/counters there.
-
-## Roadmap
-
-- Keep improving hot-path tile latency and cache behavior for large COGs and mosaics.
-- Expand MosaicJSON/STAC interoperability without adding web-framework dependencies to the library core.
-- Add focused compatibility coverage for titiler-style styling and resampling parameters.
-- Improve operational documentation for profiling, cache sizing, and production service integration.
 
 ## License
 
