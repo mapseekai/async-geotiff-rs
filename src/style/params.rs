@@ -42,6 +42,50 @@ pub struct TileStyle {
     pub format: TileFormat,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StyleCacheKey {
+    bidx: Vec<u32>,
+    rescale: Vec<(u64, u64)>,
+    stretch_kind: Option<String>,
+    stretch_pc: Option<(u64, u64)>,
+    stretch_sigma: Option<u64>,
+    nodata: Option<u64>,
+    unscale: bool,
+    colormap_name: Option<String>,
+    colormap: Option<String>,
+    color_formula: Option<String>,
+    expression: Option<String>,
+    resampling: ResamplingCacheKey,
+    reproject: ResamplingCacheKey,
+    tilesize: u32,
+    format: TileFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ResamplingCacheKey {
+    Nearest,
+    Bilinear,
+    Cubic,
+    CubicSpline,
+    Lanczos,
+    Average,
+    Mode,
+}
+
+impl From<Resampling> for ResamplingCacheKey {
+    fn from(resampling: Resampling) -> Self {
+        match resampling {
+            Resampling::Nearest => Self::Nearest,
+            Resampling::Bilinear => Self::Bilinear,
+            Resampling::Cubic => Self::Cubic,
+            Resampling::CubicSpline => Self::CubicSpline,
+            Resampling::Lanczos => Self::Lanczos,
+            Resampling::Average => Self::Average,
+            Resampling::Mode => Self::Mode,
+        }
+    }
+}
+
 /// `TileStyle` after cross-field validation.
 #[derive(Clone, Debug)]
 pub struct ValidatedTileStyle {
@@ -81,6 +125,30 @@ impl Default for TileStyle {
 }
 
 impl TileStyle {
+    fn cache_key(&self) -> StyleCacheKey {
+        StyleCacheKey {
+            bidx: self.bidx.clone(),
+            rescale: self
+                .rescale
+                .iter()
+                .map(|&(lo, hi)| (lo.to_bits(), hi.to_bits()))
+                .collect(),
+            stretch_kind: self.stretch_kind.clone(),
+            stretch_pc: self.stretch_pc.map(|(lo, hi)| (lo.to_bits(), hi.to_bits())),
+            stretch_sigma: self.stretch_sigma.map(f64::to_bits),
+            nodata: self.nodata.map(f64::to_bits),
+            unscale: self.unscale,
+            colormap_name: self.colormap_name.clone(),
+            colormap: self.colormap.clone(),
+            color_formula: self.color_formula.clone(),
+            expression: self.expression.clone(),
+            resampling: self.resampling.into(),
+            reproject: self.reproject.into(),
+            tilesize: self.tilesize,
+            format: self.format,
+        }
+    }
+
     pub fn validate(self) -> AgResult<ValidatedTileStyle> {
         validate_style(&self)?;
         Ok(ValidatedTileStyle { style: self })
@@ -383,18 +451,18 @@ pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
     })
 }
 
-/// Cached [`compile`]. Every tile in a viewport carries an identical
-/// `TileStyle`, so the nom color-formula parse + colormap LUT build is
-/// pure per-request redundancy. Keyed by the style's `Debug` string
-/// (stable, and `f64` fields make `Hash`/`Eq` impractical). Returns a
-/// shared `Arc` so cache hits clone a pointer. Concurrent misses may
-/// both compile — `compile` is cheap and idempotent, so single-flight
-/// isn't worth the closure-lifetime cost here.
+/// Cached compile. Every tile in a viewport carries an identical TileStyle,
+/// so the nom color-formula parse + colormap LUT build is pure per-request
+/// redundancy. The private key stores every style field in typed form;
+/// floating-point values use their exact IEEE-754 bit patterns. Returns a
+/// shared Arc so cache hits clone a pointer. Concurrent misses may both compile
+/// because compile is cheap and idempotent, so single-flight is not worthwhile.
 pub async fn compile_cached(style: &TileStyle) -> AgResult<std::sync::Arc<CompiledTileStyle>> {
     use std::sync::{Arc, OnceLock};
-    static CACHE: OnceLock<moka::future::Cache<String, Arc<CompiledTileStyle>>> = OnceLock::new();
+    static CACHE: OnceLock<moka::future::Cache<StyleCacheKey, Arc<CompiledTileStyle>>> =
+        OnceLock::new();
     let cache = CACHE.get_or_init(|| moka::future::Cache::new(256));
-    let key = format!("{style:?}");
+    let key = style.cache_key();
     if let Some(hit) = cache.get(&key).await {
         return Ok(hit);
     }
@@ -411,6 +479,136 @@ mod tests {
     fn format_defaults_to_png() {
         let s = TileStyle::from_query("").unwrap();
         assert_eq!(s.format, TileFormat::Png);
+    }
+
+    #[test]
+    fn style_cache_key_matches_identical_styles() {
+        let style = TileStyle {
+            bidx: vec![1, 2, 3],
+            rescale: vec![(1.5, 2.5), (3.5, 4.5), (5.5, 6.5)],
+            stretch_kind: Some("percent".into()),
+            stretch_pc: Some((2.0, 98.0)),
+            stretch_sigma: Some(3.0),
+            nodata: Some(-9999.0),
+            unscale: true,
+            colormap_name: Some("viridis".into()),
+            colormap: None,
+            color_formula: Some("gamma RGB 1.2".into()),
+            expression: Some("b1 / 2".into()),
+            resampling: Resampling::Cubic,
+            reproject: Resampling::Lanczos,
+            tilesize: 512,
+            format: TileFormat::Jpeg,
+        };
+
+        assert_eq!(style.cache_key(), style.clone().cache_key());
+    }
+
+    #[test]
+    fn style_cache_key_includes_every_tile_style_field() {
+        let baseline = TileStyle::default().cache_key();
+        let assert_changes_key = |style: TileStyle| assert_ne!(baseline, style.cache_key());
+
+        assert_changes_key(TileStyle {
+            bidx: vec![1],
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            rescale: vec![(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)],
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            stretch_kind: Some("percent".into()),
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            stretch_pc: Some((2.0, 98.0)),
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            stretch_sigma: Some(2.0),
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            nodata: Some(-9999.0),
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            unscale: true,
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            colormap_name: Some("viridis".into()),
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            colormap: Some(r#"{"1":[255,0,0,255]}"#.into()),
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            color_formula: Some("gamma RGB 1.2".into()),
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            expression: Some("(b2-b1)/(b2+b1)".into()),
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            resampling: Resampling::Bilinear,
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            reproject: Resampling::Bilinear,
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            tilesize: 512,
+            ..TileStyle::default()
+        });
+        assert_changes_key(TileStyle {
+            format: TileFormat::Jpeg,
+            ..TileStyle::default()
+        });
+    }
+
+    #[test]
+    fn style_cache_key_uses_f64_bit_patterns() {
+        let positive = TileStyle {
+            rescale: vec![(0.0, 0.0)],
+            stretch_pc: Some((0.0, 0.0)),
+            stretch_sigma: Some(0.0),
+            nodata: Some(0.0),
+            ..TileStyle::default()
+        }
+        .cache_key();
+        let negative = TileStyle {
+            rescale: vec![(-0.0, -0.0)],
+            stretch_pc: Some((-0.0, -0.0)),
+            stretch_sigma: Some(-0.0),
+            nodata: Some(-0.0),
+            ..TileStyle::default()
+        }
+        .cache_key();
+
+        assert_eq!(positive.rescale, vec![(0.0f64.to_bits(), 0.0f64.to_bits())]);
+        assert_eq!(
+            negative.rescale,
+            vec![((-0.0f64).to_bits(), (-0.0f64).to_bits())]
+        );
+        assert_ne!(positive.stretch_pc, negative.stretch_pc);
+        assert_ne!(positive.stretch_sigma, negative.stretch_sigma);
+        assert_ne!(positive.nodata, negative.nodata);
+        assert_ne!(positive, negative);
+    }
+
+    #[tokio::test]
+    async fn compile_cached_reuses_arc_for_identical_styles() {
+        let style = TileStyle::default();
+
+        let first = compile_cached(&style).await.unwrap();
+        let second = compile_cached(&style).await.unwrap();
+
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 
     #[cfg(all(feature = "webp", feature = "jpeg"))]
