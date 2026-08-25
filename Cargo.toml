@@ -1,6 +1,7 @@
 [package]
 name = "async-geotiff"
 version = "0.10.0"
+publish = false
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
