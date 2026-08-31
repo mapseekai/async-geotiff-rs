@@ -1,5 +1,5 @@
 title: &siteTitle async-geotiff
-baseURL: https://mapseekai.github.io/async-geotiff-rs/
+baseURL: https://async-geotiff-rs.pages.dev/
 defaultContentLanguage: en
 enableGitInfo: true
 enableRobotsTXT: true
