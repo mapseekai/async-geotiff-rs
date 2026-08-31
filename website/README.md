@@ -28,3 +28,12 @@ GOWORK=off HUGO_MODULE_WORKSPACE=off \
 
 The site pins OINK in `go.mod` and `go.sum`. Do not commit generated
 `public/`, `resources/`, `.hugo_cache/`, or `.hugo_build.lock` files.
+
+## Continuous integration
+
+`.github/workflows/docs.yml` runs the same strict production build and uploads
+`public/` as the `async-geotiff-docs` workflow artifact. The repository is
+private and its current GitHub plan does not support Pages, so CI validates and
+packages the site but does not deploy it. Publishing requires making the
+repository public, enabling private-repository Pages on the organization, or
+deploying the artifact to another host.

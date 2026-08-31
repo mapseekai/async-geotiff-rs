@@ -1,5 +1,5 @@
 title: &siteTitle async-geotiff
-baseURL: https://zwishing.github.io/async-geotiff-rs/
+baseURL: https://mapseekai.github.io/async-geotiff-rs/
 defaultContentLanguage: en
 enableGitInfo: true
 enableRobotsTXT: true
@@ -45,7 +45,7 @@ params:
     authors: async-geotiff contributors
     from_year: 2026
   footer_center_info: Pure Rust · No GDAL · Apache-2.0 OR MIT
-  github_repo: https://github.com/zwishing/async-geotiff-rs
+  github_repo: https://github.com/mapseekai/async-geotiff-rs
   github_branch: main
   logo: icons/logo.svg
   ui:

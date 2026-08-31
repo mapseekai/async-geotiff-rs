@@ -9,7 +9,7 @@ hero:
   lead: 无需 GDAL，异步读取云优化 GeoTIFF，完成重投影、像元样式处理与地图瓦片渲染。
   actions:
     - { label: 快速开始, url: docs/get-started/, icon: fa-solid fa-rocket, style: primary }
-    - { label: 查看 GitHub, url: 'https://github.com/zwishing/async-geotiff-rs', icon: fa-brands fa-github, style: ghost }
+    - { label: 查看 GitHub, url: 'https://github.com/mapseekai/async-geotiff-rs', icon: fa-brands fa-github, style: ghost }
 
 cards:
   eyebrow: 从字节到地图瓦片

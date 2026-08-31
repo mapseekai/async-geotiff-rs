@@ -1,4 +1,4 @@
-module github.com/zwishing/async-geotiff-rs/website
+module github.com/mapseekai/async-geotiff-rs/website
 
 go 1.27.0
 

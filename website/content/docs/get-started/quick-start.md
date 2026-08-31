@@ -7,7 +7,7 @@ weight: 20
 ## Clone and run {#run}
 
 ```bash
-git clone https://github.com/zwishing/async-geotiff-rs.git
+git clone https://github.com/mapseekai/async-geotiff-rs.git
 cd async-geotiff-rs
 COG_URL='https://raw.githubusercontent.com/cogeotiff/rio-tiler/0b08b7f35a8b639cee2f35a0cb565034f7b55bfd/tests/fixtures/cog.tif'
 cargo run --release --example serve -- "$COG_URL"
