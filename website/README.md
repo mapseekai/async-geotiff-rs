@@ -37,3 +37,12 @@ private and its current GitHub plan does not support Pages, so CI validates and
 packages the site but does not deploy it. Publishing requires making the
 repository public, enabling private-repository Pages on the organization, or
 deploying the artifact to another host.
+
+## Cloudflare Pages releases
+
+`.github/workflows/cloudflare-pages.yml` deploys `website/public` to
+<https://async-geotiff-rs.pages.dev/> whenever a GitHub Release is published.
+Before the first release, add the repository secret `CLOUDFLARE_API_TOKEN` with
+the minimum Cloudflare permission **Account → Cloudflare Pages → Edit**. The
+workflow passes the account and project IDs explicitly and never stores the
+token in the repository.
