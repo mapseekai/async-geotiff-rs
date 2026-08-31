@@ -1,0 +1,37 @@
+sections: [hero, cards, cta]
+
+hero:
+  align: center
+  eyebrow: Pure-Rust geospatial infrastructure
+  title_lines:
+    - words: [{ text: Cloud-native rasters. }]
+    - words: [{ text: Fast XYZ tiles. }]
+  lead: Read Cloud-Optimized GeoTIFFs asynchronously, reproject them, style pixels, and render map tiles without GDAL.
+  actions:
+    - { label: Get started, url: docs/get-started/, icon: fa-solid fa-rocket, style: primary }
+    - { label: View on GitHub, url: 'https://github.com/zwishing/async-geotiff-rs', icon: fa-brands fa-github, style: ghost }
+
+cards:
+  eyebrow: From bytes to map tiles
+  title: Use the layer you need
+  columns: 3
+  items:
+    - title: Read COGs
+      desc: Open HTTPS or object-store assets and share one bounded decoded-block cache.
+      icon: fa-solid fa-cloud-arrow-down
+      url: docs/get-started/library-usage/
+    - title: Render and style
+      desc: Produce PNG, WebP, or JPEG tiles with rescaling, colormaps, resampling, and band math.
+      icon: fa-solid fa-palette
+      url: docs/guides/styling/
+    - title: Build mosaics
+      desc: Combine MosaicJSON, STAC, or custom asset sources with bounded fan-out and CPU work.
+      icon: fa-solid fa-layer-group
+      url: docs/guides/mosaics/
+
+cta:
+  title: Run the interactive example server.
+  text: Browse local COGs with MapLibre, OpenLayers, or Leaflet, or point the server at a remote COG.
+  label: Quick start
+  url: docs/get-started/quick-start/
+  style: primary

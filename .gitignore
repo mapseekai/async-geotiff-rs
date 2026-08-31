@@ -9,3 +9,7 @@ Cargo.lock.bak
 /.codegraph/
 /.serena/
 .superpowers/sdd/
+/website/public/
+/website/resources/
+/website/.hugo_cache/
+/website/.hugo_build.lock

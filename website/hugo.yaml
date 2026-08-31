@@ -1,0 +1,66 @@
+title: &siteTitle async-geotiff
+baseURL: https://zwishing.github.io/async-geotiff-rs/
+defaultContentLanguage: en
+enableGitInfo: true
+enableRobotsTXT: true
+enableEmoji: true
+timeZone: Asia/Shanghai
+
+languages:
+  en:
+    label: English
+    locale: en-US
+    weight: 1
+    title: *siteTitle
+    params:
+      description: Async Cloud-Optimized GeoTIFF reading and XYZ tile rendering in Rust.
+  zh:
+    label: 简体中文
+    locale: zh-CN
+    weight: 2
+    title: *siteTitle
+    hasCJKLanguage: true
+    params:
+      description: 使用 Rust 异步读取云优化 GeoTIFF 并渲染 XYZ 地图瓦片。
+
+markup:
+  goldmark:
+    renderer:
+      unsafe: true
+    parser:
+      attribute:
+        block: true
+      wrapStandAloneImageWithinParagraph: false
+  highlight:
+    noClasses: false
+
+outputs:
+  home: [HTML, RSS, markdown, LLMS, NAVJSON]
+  page: [HTML, markdown]
+  section: [HTML, RSS, print, markdown]
+
+params:
+  offline_search: true
+  copyright:
+    authors: async-geotiff contributors
+    from_year: 2026
+  footer_center_info: Pure Rust · No GDAL · Apache-2.0 OR MIT
+  github_repo: https://github.com/zwishing/async-geotiff-rs
+  github_branch: main
+  logo: icons/logo.svg
+  ui:
+    dark_mode: true
+    theme_color: '#0f766e'
+    typography: system
+    section_index: cards
+    sidebar_menu_foldable: true
+    sidebar_icon_policy: groups
+    backlinks: true
+    page_width: wide
+
+module:
+  imports:
+    - path: github.com/pgsty/oink
+  hugoVersion:
+    extended: true
+    min: 0.160.1

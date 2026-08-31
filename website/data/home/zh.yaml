@@ -1,0 +1,37 @@
+sections: [hero, cards, cta]
+
+hero:
+  align: center
+  eyebrow: 纯 Rust 地理空间基础设施
+  title_lines:
+    - words: [{ text: 云端栅格， }]
+    - words: [{ text: 快速生成 XYZ 瓦片。 }]
+  lead: 无需 GDAL，异步读取云优化 GeoTIFF，完成重投影、像元样式处理与地图瓦片渲染。
+  actions:
+    - { label: 快速开始, url: docs/get-started/, icon: fa-solid fa-rocket, style: primary }
+    - { label: 查看 GitHub, url: 'https://github.com/zwishing/async-geotiff-rs', icon: fa-brands fa-github, style: ghost }
+
+cards:
+  eyebrow: 从字节到地图瓦片
+  title: 按需使用每一层能力
+  columns: 3
+  items:
+    - title: 读取 COG
+      desc: 打开 HTTPS 或对象存储中的资产，并通过共享缓存统一限制解码内存。
+      icon: fa-solid fa-cloud-arrow-down
+      url: docs/get-started/library-usage/
+    - title: 渲染与样式
+      desc: 通过拉伸、色带、重采样和波段计算生成 PNG、WebP 或 JPEG 瓦片。
+      icon: fa-solid fa-palette
+      url: docs/guides/styling/
+    - title: 构建镶嵌
+      desc: 使用 MosaicJSON、STAC 或自定义资产源，并限制扇出与 CPU 任务。
+      icon: fa-solid fa-layer-group
+      url: docs/guides/mosaics/
+
+cta:
+  title: 运行交互式示例服务。
+  text: 使用 MapLibre、OpenLayers 或 Leaflet 浏览本地 COG，也可以直接连接远程 COG。
+  label: 快速开始
+  url: docs/get-started/quick-start/
+  style: primary
