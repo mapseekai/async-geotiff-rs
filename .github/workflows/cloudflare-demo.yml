@@ -50,7 +50,7 @@ jobs:
         run: npm run typecheck --prefix cloudflare-demo
 
       - name: Test Rust library
-        run: cargo test --locked --no-default-features
+        run: cargo test --locked
 
       - name: Deploy demo container
         env:
