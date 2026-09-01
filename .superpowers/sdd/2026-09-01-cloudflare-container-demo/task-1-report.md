@@ -31,3 +31,18 @@ response with `Retry-After: 10`.
 
 Only the requested `cloudflare-demo` package files are staged for the task.
 The pre-existing untracked `data` directory is intentionally untouched.
+
+## Review fix round 1
+
+Added a regression test for a rejection from `container.fetch()` after a
+successful `startAndWaitForPorts()`. The proxy returns the same `503` retry
+response as a startup failure, including `Retry-After: 10` and the exact
+retry-safe message. The existing implementation already handled this path, so
+no production-code change was necessary.
+
+Focused verification passed:
+
+```text
+npm test --prefix cloudflare-demo          # 3 tests passed
+npm run typecheck --prefix cloudflare-demo # passed
+```

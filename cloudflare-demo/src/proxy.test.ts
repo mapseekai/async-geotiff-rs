@@ -35,3 +35,23 @@ it("returns a retry-safe response when the demo cannot start", async () => {
   );
   expect(container.fetch).not.toHaveBeenCalled();
 });
+
+it("returns a retry-safe response when forwarding to the demo fails", async () => {
+  const container = {
+    startAndWaitForPorts: vi.fn().mockResolvedValue(undefined),
+    fetch: vi.fn().mockRejectedValue(new Error("unavailable")),
+  };
+
+  const response = await proxyDemoRequest(
+    new Request("https://demo.example/maplibre"),
+    container,
+  );
+
+  expect(container.startAndWaitForPorts).toHaveBeenCalledOnce();
+  expect(container.fetch).toHaveBeenCalledOnce();
+  expect(response.status).toBe(503);
+  expect(response.headers.get("retry-after")).toBe("10");
+  expect(await response.text()).toBe(
+    "Demo temporarily unavailable. Please retry shortly.",
+  );
+});
