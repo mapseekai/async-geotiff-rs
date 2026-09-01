@@ -9,6 +9,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - Dockerfile.demo
+      - .dockerignore
       - wrangler.demo.jsonc
       - cloudflare-demo/**
       - .github/workflows/cloudflare-demo.yml
@@ -16,6 +17,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: cloudflare-demo-production
+  cancel-in-progress: false
 
 env:
   CLOUDFLARE_ACCOUNT_ID: bdebb92ffabb18388b7e2e864d63aee7
@@ -37,6 +42,15 @@ jobs:
 
       - name: Install demo dependencies
         run: npm ci --prefix cloudflare-demo
+
+      - name: Test demo project
+        run: npm test --prefix cloudflare-demo
+
+      - name: Type-check demo project
+        run: npm run typecheck --prefix cloudflare-demo
+
+      - name: Test Rust library
+        run: cargo test --locked --no-default-features
 
       - name: Deploy demo container
         env:
