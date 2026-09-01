@@ -49,6 +49,17 @@ jobs:
       - name: Type-check demo project
         run: npm run typecheck --prefix cloudflare-demo
 
+      - name: Verify Cloudflare container access
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+            echo "CLOUDFLARE_API_TOKEN GitHub Secret is required for deployment." >&2
+            exit 1
+          fi
+          npx --prefix cloudflare-demo wrangler whoami
+          npx --prefix cloudflare-demo wrangler containers images list
+
       - name: Test Rust library
         run: cargo test --locked --lib --no-run
 
