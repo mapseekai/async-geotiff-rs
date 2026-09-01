@@ -1,0 +1,37 @@
+FROM rust:1.88-bookworm AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libproj-dev \
+        libsqlite3-dev \
+        libtiff-dev \
+        clang \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY examples ./examples
+
+RUN cargo build --release --locked --example serve
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libproj-dev \
+        libsqlite3-0 \
+        libtiff6 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /app/target/release/examples/serve /usr/local/bin/serve
+COPY cloudflare-demo/start-demo.sh /usr/local/bin/start-demo
+
+RUN chmod +x /usr/local/bin/start-demo
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/start-demo"]
