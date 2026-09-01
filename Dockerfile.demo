@@ -8,6 +8,7 @@ RUN apt-get update \
         libtiff-dev \
         clang \
         cmake \
+        sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
