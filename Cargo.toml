@@ -41,6 +41,7 @@ zstd             = "0.13"
 weezl            = "0.1"
 jpeg-decoder     = { version = "0.3", default-features = false }
 stac-client       = { version = "0.3", optional = true }
+reqwest_stac      = { package = "reqwest", version = "0.11", default-features = false, optional = true }
 futures = { version = "0.3.32", optional = true }
 futures-util = "0.3"
 
@@ -61,7 +62,7 @@ proj    = ["dep:proj"]
 webp    = ["image/webp"]
 jpeg    = ["image/jpeg"]
 mosaic  = ["dep:futures"]
-stac    = ["mosaic", "dep:stac-client"]
+stac    = ["mosaic", "dep:stac-client", "dep:reqwest_stac"]
 perf-tracing = []
 tokio-console = ["perf-tracing", "dep:console-subscriber", "tokio/tracing"]
 

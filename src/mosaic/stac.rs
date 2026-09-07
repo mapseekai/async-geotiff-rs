@@ -42,6 +42,10 @@ impl StacSource {
     /// `asset_key` is the key inside each item's `assets` map to use as the
     /// COG href (e.g. `"data"` or `"B04"`).
     ///
+    /// Automatic system/environment proxy discovery is disabled: macOS
+    /// headless processes may not have a SystemConfiguration session. Use
+    /// [`Self::with_client`] for an explicitly configured proxy or transport.
+    ///
     /// # Errors
     ///
     /// Returns `AgError::Mosaic` if `api_url` is not a valid URL.
@@ -50,13 +54,28 @@ impl StacSource {
         collections: Vec<String>,
         asset_key: impl Into<String>,
     ) -> AgResult<Self> {
-        let client =
-            Client::new(api_url).map_err(|e| AgError::Mosaic(format!("stac client: {e}")))?;
-        Ok(Self {
+        // Validate before constructing any platform HTTP/TLS resources.
+        url::Url::parse(api_url).map_err(|e| AgError::Mosaic(format!("stac client: {e}")))?;
+        let http = reqwest_stac::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| AgError::Mosaic(format!("stac HTTP client: {e}")))?;
+        let client = Client::with_client(api_url, http)
+            .map_err(|e| AgError::Mosaic(format!("stac client: {e}")))?;
+        Ok(Self::with_client(client, collections, asset_key))
+    }
+
+    /// Use a caller-configured STAC client, including explicit proxy settings.
+    pub fn with_client(
+        client: Client,
+        collections: Vec<String>,
+        asset_key: impl Into<String>,
+    ) -> Self {
+        Self {
             client,
             collections,
             asset_key: asset_key.into(),
-        })
+        }
     }
 }
 
