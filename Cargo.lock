@@ -140,8 +140,11 @@ dependencies = [
  "criterion",
  "enterpolation",
  "fast_image_resize",
+ "flate2",
  "futures",
+ "futures-util",
  "image",
+ "jpeg-decoder",
  "moka",
  "ndarray",
  "nom 8.0.0",
@@ -151,6 +154,7 @@ dependencies = [
  "quick-xml",
  "raffine",
  "rayon",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -162,6 +166,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "weezl",
+ "zstd",
 ]
 
 [[package]]
@@ -1487,6 +1493,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3034,6 +3041,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4283,6 +4291,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

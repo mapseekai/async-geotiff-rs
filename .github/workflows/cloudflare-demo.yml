@@ -61,7 +61,7 @@ jobs:
           npx --prefix cloudflare-demo wrangler containers images list
 
       - name: Test Rust library
-        run: cargo test --locked --lib --no-run
+        run: cargo test --locked --lib
 
       - name: Deploy demo container
         env:

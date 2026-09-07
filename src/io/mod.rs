@@ -4,6 +4,7 @@ pub mod cog;
 mod decode;
 mod point;
 mod scale_offset;
+pub(crate) mod snapshot;
 pub mod stats;
 pub mod window;
 
@@ -14,3 +15,5 @@ pub use cog::{CogReader, CogReaderBuilder, ReaderConfig};
 pub use object_store;
 pub use point::PointValue;
 pub use scale_offset::ScaleOffset;
+
+pub use snapshot::SnapshotPolicy;

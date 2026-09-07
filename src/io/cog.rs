@@ -30,6 +30,27 @@ use object_store::http::HttpBuilder;
 use object_store::path::Path;
 use object_store::{ClientOptions, ObjectStore};
 
+/// Client/TLS initialization is synchronous and may read platform trust stores.
+/// Keep it off async workers, with capacity held until a cancelled job exits.
+pub(crate) async fn build_http_transport<T: Send + 'static>(
+    build: impl FnOnce() -> AgResult<T> + Send + 'static,
+) -> AgResult<T> {
+    static LIMITER: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let limiter = LIMITER
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone();
+    let permit = limiter
+        .acquire_owned()
+        .await
+        .map_err(|_| AgError::Tiff("HTTP construction limiter closed".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        build()
+    })
+    .await
+    .map_err(|_| AgError::Tiff("HTTP construction task failed".into()))?
+}
+
 static NEXT_SOURCE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -60,6 +81,34 @@ const MAX_PREFETCH_TASKS: usize = 2;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ReaderConfig {
+    /// Maximum IFDs and entries per IFD accepted before upstream allocations.
+    pub max_ifds: usize,
+    pub max_ifd_entries: u64,
+    pub(crate) snapshot_size: Option<u64>,
+
+    /// Strong validator required for managed sources by default. Opaque
+    /// ObjectReader handles require explicit AssumeImmutable.
+    pub snapshot_policy: crate::io::SnapshotPolicy,
+    /// Maximum cumulative metadata bytes fetched while opening (default: 8 MiB).
+    pub max_metadata_bytes: u64,
+
+    /// Shared active-work byte allowance; completed caller-owned images and
+    /// resident caches have separate ownership/budgets.
+    pub work_budget: crate::resource::WorkBudget,
+    pub(crate) redact_transport_errors: bool,
+    /// Maximum pixels in a single source window (default: 16 million).
+    pub max_window_pixels: u64,
+    /// Maximum declared window data plus mask bytes, and compressed bytes
+    /// per fetch batch (default: 256 MiB).
+    pub max_window_bytes: u64,
+    /// Maximum blocks requested by one window (default: 4096).
+    pub max_window_blocks: usize,
+    /// Maximum declared uncompressed bytes in any TIFF block (default: 64 MiB).
+    pub max_decoded_block_bytes: u64,
+    /// Concurrent foreground windows per reader (default: 8).
+    pub max_concurrent_reads: usize,
+    /// Optional shared foreground read limiter, e.g. across a mosaic pool.
+    pub read_limiter: Option<Arc<tokio::sync::Semaphore>>,
     pub max_decode_tasks: usize,
     /// Caller-supplied id for this logical source (same id ⇒ shared blocks).
     pub source_id: String,
@@ -85,6 +134,19 @@ pub struct ReaderConfig {
 impl Default for ReaderConfig {
     fn default() -> Self {
         Self {
+            work_budget: crate::resource::WorkBudget::global(),
+            max_ifds: 256,
+            max_ifd_entries: 4096,
+            snapshot_size: None,
+            snapshot_policy: crate::io::SnapshotPolicy::RequireValidator,
+            max_metadata_bytes: 8 * 1024 * 1024,
+            redact_transport_errors: false,
+            max_window_pixels: 16 * 1024 * 1024,
+            max_window_bytes: 256 * 1024 * 1024,
+            max_window_blocks: 4096,
+            max_decoded_block_bytes: 64 * 1024 * 1024,
+            max_concurrent_reads: 8,
+            read_limiter: None,
             max_decode_tasks: default_blocking_permits(),
             source_id: format!("cog-{}", NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed)),
             block_cache: Arc::new(BlockCache::new(CacheConfig::default())),
@@ -101,6 +163,14 @@ impl ReaderConfig {
 }
 
 pub struct CogReader {
+    metadata_reservations: Arc<Vec<crate::resource::WorkReservation>>,
+    prefetch_tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    work_budget: crate::resource::WorkBudget,
+    redact_transport_errors: bool,
+    max_window_pixels: u64,
+    max_window_bytes: u64,
+    max_window_blocks: usize,
+    reads: Arc<tokio::sync::Semaphore>,
     pub(crate) tiff: TIFF,
     pub(crate) reader: ObjectReader,
     pub(crate) src_crs: Crs,
@@ -201,6 +271,12 @@ impl CogReaderBuilder {
         self
     }
 
+    /// Choose whether source immutability is verified or explicitly assumed.
+    pub fn snapshot_policy(mut self, policy: crate::io::SnapshotPolicy) -> Self {
+        self.config.snapshot_policy = policy;
+        self
+    }
+
     /// Override HTTP [`ClientOptions`] (timeouts, proxy, custom headers).
     /// Only consulted by [`Self::open_http`]; the default is tuned for
     /// tile-server workloads (large per-host idle pool, 30s timeout).
@@ -210,23 +286,32 @@ impl CogReaderBuilder {
     }
 
     /// Open a remote COG over HTTPS (or any URL `object_store::http` supports).
-    pub async fn open_http(self, url: &str) -> AgResult<CogReader> {
+    pub async fn open_http(mut self, url: &str) -> AgResult<CogReader> {
+        self.config.redact_transport_errors = true;
         let (base, path) = split_http_url(url)?;
         let options = self.client_options.unwrap_or_else(default_client_options);
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            HttpBuilder::new()
-                .with_url(base)
-                .with_client_options(options)
-                .build()
-                .map_err(|e| AgError::Tiff(format!("http store: {e}")))?,
-        );
+        let store: Arc<dyn ObjectStore> = build_http_transport(move || {
+            Ok(Arc::new(
+                HttpBuilder::new()
+                    .with_url(base)
+                    .with_client_options(options)
+                    .build()
+                    .map_err(|_| AgError::Tiff("HTTP store construction failed".into()))?,
+            ) as Arc<dyn ObjectStore>)
+        })
+        .await?;
         // `split_http_url` returns the percent-ENCODED URL path, so use
         // the decoding constructor. `Path::from` would treat `%` as a
         // literal and double-encode non-ASCII names (e.g. CJK filenames),
         // making the loopback GET 404 → tile 500.
         let object_path = Path::from_url_path(&path)
             .map_err(|e| AgError::Tiff(format!("invalid object path {path:?}: {e}")))?;
-        CogReader::open_impl(ObjectReader::new(store, object_path), self.config).await
+        CogReader::open_managed(store, object_path, self.config)
+            .await
+            .map_err(|e| {
+                crate::io::snapshot::resource_error(&e)
+                    .unwrap_or_else(|| AgError::Tiff("HTTP COG open failed".into()))
+            })
     }
 
     /// Open a COG through any `object_store` backend (S3/MinIO, GCS, local, …).
@@ -239,12 +324,16 @@ impl CogReaderBuilder {
         store: Arc<dyn ObjectStore>,
         key: &str,
     ) -> AgResult<CogReader> {
-        CogReader::open_impl(ObjectReader::new(store, Path::from(key)), self.config).await
+        CogReader::open_managed(store, Path::from(key), self.config).await
     }
 
-    /// Open from an existing [`ObjectReader`] (lets callers wire any
-    /// object_store themselves).
+    /// Open an opaque reader with an explicit AssumeImmutable policy. Its
+    /// underlying store cannot be inspected for conditional reads; prefer
+    /// open_object_store for managed snapshots and bounded response bodies.
     pub async fn open(self, reader: ObjectReader) -> AgResult<CogReader> {
+        if self.config.snapshot_policy != crate::io::SnapshotPolicy::AssumeImmutable {
+            return Err(AgError::Tiff("opaque ObjectReader cannot verify versions; use open_object_store or explicitly choose AssumeImmutable".into()));
+        }
         CogReader::open_impl(reader, self.config).await
     }
 }
@@ -355,18 +444,80 @@ impl CogReader {
         Self::builder().reader_config(config).open(reader).await
     }
 
+    async fn open_managed(
+        store: Arc<dyn ObjectStore>,
+        path: Path,
+        mut config: ReaderConfig,
+    ) -> AgResult<Self> {
+        let snapshot = crate::io::snapshot::SnapshotStore::open(
+            store,
+            path.clone(),
+            config.snapshot_policy,
+            config.max_window_bytes,
+            config.max_metadata_bytes,
+            config.work_budget.clone(),
+        )
+        .await
+        .map_err(crate::io::snapshot::into_ag_error)?;
+        config.source_id = snapshot.cache_identity(&config.source_id);
+        config.snapshot_size = Some(snapshot.size());
+        let result = Self::open_impl(ObjectReader::new(snapshot.clone(), path), config).await;
+        snapshot.finish_metadata();
+        result
+    }
+
     /// Shared open path: every builder terminal method and deprecated
     /// constructor funnels through here.
     async fn open_impl(reader: ObjectReader, config: ReaderConfig) -> AgResult<Self> {
         let md_cache = ReadaheadMetadataCache::new(reader.clone());
         let mut md = TiffMetadataReader::try_open(&md_cache)
             .await
-            .map_err(|e| AgError::Tiff(format!("metadata open: {e}")))?;
-        let ifds = md
-            .read_all_ifds(&md_cache)
-            .await
-            .map_err(|e| AgError::Tiff(format!("read ifds: {e}")))?;
+            .map_err(|e| transport_error(&e, config.redact_transport_errors))?;
+        let mut ifds = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut remaining_metadata = config.max_metadata_bytes;
+        let mut metadata_reservations = Vec::new();
+        while let Some(offset) = md.next_ifd_offset() {
+            if ifds.len() >= config.max_ifds || !seen.insert(offset) {
+                return Err(AgError::Tiff(
+                    "cyclic or excessive TIFF directory chain".into(),
+                ));
+            }
+            let allocation = crate::io::snapshot::preflight_ifd(
+                &md_cache,
+                offset,
+                md.bigtiff(),
+                md.endianness(),
+                &config,
+                remaining_metadata,
+            )
+            .await?;
+            remaining_metadata -= allocation;
+            metadata_reservations.push(config.work_budget.try_reserve(allocation)?);
+            use futures_util::FutureExt;
+            let ifd = std::panic::AssertUnwindSafe(md.read_next_ifd(&md_cache))
+                .catch_unwind()
+                .await
+                .map_err(|_| AgError::Tiff("malformed TIFF directory".into()))?
+                .map_err(|e| transport_error(&e, config.redact_transport_errors))?
+                .ok_or_else(|| AgError::Tiff("missing TIFF directory".into()))?;
+            ifds.push(ifd);
+        }
         let tiff = TIFF::new(ifds, md.endianness());
+        for ifd in tiff.ifds() {
+            let tw = u64::from(ifd.tile_width().unwrap_or(ifd.image_width()));
+            let th = u64::from(ifd.tile_height().unwrap_or(ifd.image_height()));
+            let bytes_per_pixel: u64 = u64::from(ifd.samples_per_pixel())
+                * u64::from(ifd.bits_per_sample().iter().copied().max().unwrap_or(8)).div_ceil(8);
+            let decoded = tw
+                .checked_mul(th)
+                .and_then(|n| n.checked_mul(bytes_per_pixel));
+            if decoded.is_none_or(|n| n > config.max_decoded_block_bytes) {
+                return Err(AgError::Tiff(
+                    "declared decoded block exceeds byte limit".into(),
+                ));
+            }
+        }
 
         let (transform, src_crs) = derive_geo(&tiff)?;
         let (data_ifds, mask_ifds) = classify_ifds(&tiff)?;
@@ -381,6 +532,18 @@ impl CogReader {
             crate::io::scale_offset::parse_scale_offset(md, bands)
         };
         let mut cog = Self {
+            metadata_reservations: Arc::new(metadata_reservations),
+            prefetch_tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
+            work_budget: config.work_budget.clone(),
+            redact_transport_errors: config.redact_transport_errors,
+            max_window_pixels: config.max_window_pixels,
+            max_window_bytes: config.max_window_bytes,
+            max_window_blocks: config.max_window_blocks,
+            reads: config.read_limiter.clone().unwrap_or_else(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    config.max_concurrent_reads.max(1),
+                ))
+            }),
             tiff,
             reader,
             src_crs,
@@ -456,6 +619,10 @@ impl CogReader {
         self.cpu.clone()
     }
 
+    pub fn work_budget(&self) -> crate::resource::WorkBudget {
+        self.work_budget.clone()
+    }
+
     pub fn src_crs(&self) -> &Crs {
         &self.src_crs
     }
@@ -465,33 +632,21 @@ impl CogReader {
     }
 
     /// Full-resolution image extent in WGS84 lon/lat as
-    /// `[west, south, east, north]`. Reprojects the four corners from the
+    /// `[west, south, east, north]`. Densifies the raster boundary from the
     /// source CRS (skipped when already 4326). Used by viewers to fly to
     /// the dataset.
     pub fn wgs84_bounds(&self) -> AgResult<[f64; 4]> {
         let (w, h) = self.level_dimensions(0)?;
         let tr = self.transform;
-        let mut corners = [
+        let corners = [
             tr.forward(0.0, 0.0),
             tr.forward(w as f64, 0.0),
             tr.forward(w as f64, h as f64),
             tr.forward(0.0, h as f64),
         ];
-        let wgs84 = Crs::epsg(4326);
-        if self.src_crs != wgs84 {
-            crate::warp::Projector::new(&self.src_crs, &wgs84)?.convert(&mut corners)?;
-        }
-        let mut west = f64::INFINITY;
-        let mut east = f64::NEG_INFINITY;
-        let mut south = f64::INFINITY;
-        let mut north = f64::NEG_INFINITY;
-        for (lon, lat) in corners {
-            west = west.min(lon);
-            east = east.max(lon);
-            south = south.min(lat);
-            north = north.max(lat);
-        }
-        Ok([west, south, east, north])
+        let bounds =
+            crate::warp::projection::reproject_boundary(corners, &self.src_crs, &Crs::epsg(4326))?;
+        Ok([bounds.xmin, bounds.ymin, bounds.xmax, bounds.ymax])
     }
 
     pub fn overview_count(&self) -> usize {
@@ -547,21 +702,19 @@ impl CogReader {
         }
     }
 
-    /// Faithful port of rio-tiler `get_overview_level`
-    /// (`rio_tiler/utils.py`, itself adapted from GDAL `gdalwarp_lib.cpp`).
+    /// Select an overview without a tolerance tied to CRS units.
     ///
     /// Level 0 is full resolution; 1.. are progressively coarser overviews
-    /// (gsd strictly increasing). The chosen level is the **finest one that
+    /// (gsd strictly increasing). The chosen level is the **coarsest one that
     /// is still no coarser than the target** — i.e. it brackets the target
     /// from below and the subsequent warp *downsamples* to the exact tile
     /// resolution. Reading a finer level and downsampling preserves detail;
     /// reading a coarser level and upsampling would blur the tile. This is
     /// the single most important quality/bandwidth decision in the pipeline.
     ///
-    /// Rules (matching upstream exactly):
+    /// Rules:
     /// - `target ≤ src_res` (zoomed in past native): use full resolution.
-    /// - otherwise walk levels; pick `L` where `gsd(L) < target < gsd(L+1)`,
-    ///   or snap to `L` if `|gsd(L) − target| < 0.1`.
+    /// - otherwise pick `L` where `gsd(L) ≤ target < gsd(L+1)`.
     /// - target coarser than every overview: use the coarsest level.
     pub fn pick_overview(&self, target_gsd: f64) -> usize {
         pick_overview_from_gsds(&self.level_gsds, target_gsd)
@@ -571,11 +724,7 @@ impl CogReader {
     /// the shared block cache (single-flight decode on a miss), and the decoded
     /// blocks are stitched into the requested window. Blocks are cached and may
     /// be shared across readers with the same `source_id`.
-    #[tracing::instrument(
-        skip(self),
-        fields(source = %self.source_id, level, width, height),
-        err
-    )]
+    #[tracing::instrument(skip(self), fields(level, width, height), err)]
     pub async fn read_window(
         &self,
         level: usize,
@@ -587,6 +736,23 @@ impl CogReader {
         #[cfg(feature = "perf-tracing")]
         let started = Instant::now();
         validate_window_shape(width, height)?;
+        let _read_permit = self
+            .reads
+            .acquire()
+            .await
+            .map_err(|_| AgError::Tiff("read limiter closed".into()))?;
+        let pixels = width
+            .checked_mul(height)
+            .ok_or_else(|| AgError::Tiff("window pixel count overflow".into()))?;
+        let ifd = self.data_ifd(level)?;
+        let bytes_per_pixel: u64 = u64::from(ifd.samples_per_pixel())
+            * u64::from(ifd.bits_per_sample().iter().copied().max().unwrap_or(8)).div_ceil(8);
+        let bytes = pixels.checked_mul(bytes_per_pixel.saturating_add(1));
+        if pixels > self.max_window_pixels || bytes.is_none_or(|n| n > self.max_window_bytes) {
+            return Err(AgError::Tiff(
+                "source window exceeds pixel/byte limit".into(),
+            ));
+        }
         checked_window_end(col_off, width, "column")?;
         checked_window_end(row_off, height, "row")?;
         // Bound the window to the level's pixel extent so a caller-supplied
@@ -611,7 +777,13 @@ impl CogReader {
             .ok_or_else(|| AgError::Tiff("ifd lacks tile dims".into()))?;
         let tile_cols = (tx1 - tx0 + 1) as usize;
         let tile_rows = (ty1 - ty0 + 1) as usize;
-        let mut coords = Vec::with_capacity(tile_cols.saturating_mul(tile_rows));
+        let block_count = tile_cols
+            .checked_mul(tile_rows)
+            .ok_or_else(|| AgError::Tiff("window block count overflow".into()))?;
+        if block_count > self.max_window_blocks {
+            return Err(AgError::Tiff("source window exceeds block limit".into()));
+        }
+        let mut coords = Vec::with_capacity(block_count);
         for x in tx0..=tx1 {
             for y in ty0..=ty1 {
                 coords.push((x as usize, y as usize));
@@ -620,17 +792,28 @@ impl CogReader {
         let data_info = IfdInfo::from(ifd).validate()?;
 
         let mask_ifd = self.mask_ifd(level)?;
+        let mut work_bytes = block_work_bytes(ifd, &coords, self.max_window_bytes)?;
+        if let Some(mask_ifd) = mask_ifd {
+            work_bytes = work_bytes
+                .checked_add(block_work_bytes(mask_ifd, &coords, self.max_window_bytes)?)
+                .ok_or_else(|| AgError::ResourceLimit("read work estimate overflow".into()))?;
+        }
+        let output_bytes = bytes.unwrap(); // checked against window limits above
+        work_bytes = work_bytes
+            .checked_add(output_bytes.saturating_mul(2))
+            .ok_or_else(|| AgError::ResourceLimit("read work estimate overflow".into()))?;
+        let work = self.work_budget.try_reserve(work_bytes)?;
         #[cfg(feature = "perf-tracing")]
         let plan_done = started.elapsed();
         let (data_blocks, mask_blocks) = if let Some(mask_ifd) = mask_ifd {
             let mask_info = IfdInfo::from(mask_ifd).validate()?;
-            let data_blocks = self.blocks_for(level, BlockKind::Data, ifd, &coords);
-            let mask_blocks = self.blocks_for(level, BlockKind::Mask, mask_ifd, &coords);
+            let data_blocks = self.blocks_for(level, BlockKind::Data, ifd, &coords, &work);
+            let mask_blocks = self.blocks_for(level, BlockKind::Mask, mask_ifd, &coords, &work);
             let (data_blocks, mask_blocks) = tokio::try_join!(data_blocks, mask_blocks)?;
             (data_blocks, Some((mask_blocks, mask_info)))
         } else {
             (
-                self.blocks_for(level, BlockKind::Data, ifd, &coords)
+                self.blocks_for(level, BlockKind::Data, ifd, &coords, &work)
                     .await?,
                 None,
             )
@@ -666,11 +849,13 @@ impl CogReader {
                 0
             });
         let stitch_all = {
+            let work = work.clone();
             let coords2 = coords.clone();
             let info = data_info;
             let (w, h) = (width, height);
             let (co, ro) = (col_off, row_off);
             move || -> AgResult<(PixelData, Option<Array2<bool>>)> {
+                let _work = work;
                 let refs: Vec<&async_tiff::Array> = data_blocks.iter().map(|b| b.array()).collect();
                 let stitched =
                     crate::io::window::stitch_with_info(&refs, &coords2, &info, co, ro, w, h)?;
@@ -774,6 +959,98 @@ fn ring_coords(
     out
 }
 
+/// Drop the transport error entirely for HTTP readers: its Display and source
+/// can contain the complete signed URL. Local/store errors retain diagnostics.
+fn transport_error(error: &async_tiff::error::AsyncTiffError, redact: bool) -> AgError {
+    if let Some(resource) = crate::io::snapshot::resource_error(error) {
+        return resource;
+    }
+    if redact {
+        AgError::Tiff("HTTP range request failed".into())
+    } else {
+        AgError::Tiff(format!("fetch_tiles: {error}"))
+    }
+}
+
+/// Validate declared compressed ranges before async-tiff indexes their arrays
+/// or constructs unchecked offset+length ranges, and before any store fetch.
+fn validate_compressed_ranges(
+    ifd: &ImageFileDirectory,
+    coords: &[(usize, usize)],
+    max_bytes: u64,
+) -> AgResult<u64> {
+    let invalid = || AgError::Tiff("invalid or oversized compressed block ranges".into());
+    let (cols, rows) = ifd.tile_count().ok_or_else(invalid)?;
+    let offsets = ifd.tile_offsets().ok_or_else(invalid)?;
+    let counts = ifd.tile_byte_counts().ok_or_else(invalid)?;
+    let planar = ifd.planar_configuration() == async_tiff::tags::PlanarConfiguration::Planar;
+    let bands = if planar {
+        usize::from(ifd.samples_per_pixel())
+    } else {
+        1
+    };
+    let tiles_per_band = cols.checked_mul(rows).ok_or_else(invalid)?;
+    let mut total = 0u64;
+    for &(x, y) in coords {
+        if x >= cols || y >= rows {
+            return Err(invalid());
+        }
+        let tile = y
+            .checked_mul(cols)
+            .and_then(|n| n.checked_add(x))
+            .ok_or_else(invalid)?;
+        for band in 0..bands {
+            let index = band
+                .checked_mul(tiles_per_band)
+                .and_then(|n| n.checked_add(tile))
+                .ok_or_else(invalid)?;
+            let offset = *offsets.get(index).ok_or_else(invalid)?;
+            let count = *counts.get(index).ok_or_else(invalid)?;
+            offset.checked_add(count).ok_or_else(invalid)?;
+            total = total.checked_add(count).ok_or_else(invalid)?;
+            if total > max_bytes {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Conservative compressed, decoded and decoder-copy allowance for a batch.
+fn block_work_bytes(
+    ifd: &ImageFileDirectory,
+    coords: &[(usize, usize)],
+    limit: u64,
+) -> AgResult<u64> {
+    let compressed = validate_compressed_ranges(ifd, coords, limit)?;
+    let sample_bytes =
+        u64::from(ifd.bits_per_sample().iter().copied().max().unwrap_or(8)).div_ceil(8);
+    let mut width = u64::from(ifd.tile_width().unwrap_or(ifd.image_width()));
+    let mut height = u64::from(ifd.tile_height().unwrap_or(ifd.image_height()));
+    if ifd.compression() == async_tiff::tags::Compression::ModernJPEG {
+        // JPEG coefficient planes are padded to MCUs (up to 32x32), which
+        // matters particularly for thin tiles. Header dimensions are checked
+        // by the bounded decoder before coefficient allocation.
+        width = width.div_ceil(32) * 32;
+        height = height.div_ceil(32) * 32;
+    }
+    let decoded = (coords.len() as u64)
+        .checked_mul(width)
+        .and_then(|n| n.checked_mul(height))
+        .and_then(|n| n.checked_mul(u64::from(ifd.samples_per_pixel())))
+        .and_then(|n| n.checked_mul(sample_bytes));
+    let workspace = if ifd.compression() == async_tiff::tags::Compression::ZSTD {
+        256 * 1024 // single-pass context; no advertised-window allocation
+    } else {
+        64 * 1024
+    };
+    decoded
+        .and_then(|n| n.checked_mul(8))
+        .and_then(|n| n.checked_add((coords.len() as u64).saturating_mul(workspace)))
+        .and_then(|n| n.checked_add(compressed.saturating_mul(2)))
+        .ok_or_else(|| AgError::ResourceLimit("block work estimate overflow".into()))
+}
+
 /// Best-effort fetch + decode of `coords` into the shared block cache.
 ///
 /// Already-cached blocks are skipped via a non-counting [`BlockCache::peek`]
@@ -793,7 +1070,21 @@ async fn prefetch_blocks(
     cache: &Arc<BlockCache>,
     cpu: &CpuLimiter,
     reader: &ObjectReader,
+    redact_errors: bool,
+    max_compressed_bytes: u64,
+    work_budget: &crate::resource::WorkBudget,
+    metadata_guard: &Arc<Vec<crate::resource::WorkReservation>>,
 ) {
+    if let Err(error) = validate_compressed_ranges(ifd, coords, max_compressed_bytes) {
+        tracing::debug!(%error, "block prefetch ranges rejected");
+        return;
+    }
+    let Ok(estimate) = block_work_bytes(ifd, coords, max_compressed_bytes) else {
+        return;
+    };
+    let Ok(work) = work_budget.try_reserve(estimate) else {
+        return;
+    };
     let mut owned: Vec<(BlockKey, InflightGuard)> = Vec::new();
     let mut fetch_coords: Vec<(usize, usize)> = Vec::new();
     for &(tx, ty) in coords {
@@ -807,13 +1098,13 @@ async fn prefetch_blocks(
         if cache.peek(&key) {
             continue;
         }
-        match cache.claim(&key) {
+        match cache.claim(&key).await {
             Claim::Owned(guard) => {
                 owned.push((key, guard));
                 fetch_coords.push((tx, ty));
             }
             // A foreground request (or another prefetch) is on it already.
-            Claim::Pending(_) => {}
+            Claim::Pending(_) | Claim::Ready(_) => {}
         }
     }
     if owned.is_empty() {
@@ -824,18 +1115,26 @@ async fn prefetch_blocks(
         Ok(t) => t,
         Err(e) => {
             // Guards drop unresolved → any waiters observe a cancel and retry.
-            tracing::debug!(error = %e, kind = ?kind, "block prefetch fetch failed");
+            tracing::debug!(error = %transport_error(&e, redact_errors), kind = ?kind, "block prefetch fetch failed");
             return;
         }
     };
+    let decode_dimensions = [
+        ifd.tile_width().unwrap_or(ifd.image_width()),
+        ifd.tile_height().unwrap_or(ifd.image_height()),
+    ];
     for ((key, guard), tile) in owned.into_iter().zip(tiles.into_iter()) {
         let cpu = cpu.clone();
+        let work = work.clone();
+        let metadata_guard = metadata_guard.clone();
         let res: AgResult<Arc<DecodedBlock>> = cache
             .try_get_with(key, async move {
                 let permit = cpu.acquire().await?;
                 let arr = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    crate::io::decode::decode_one(tile)
+                    let _work = work;
+                    let _metadata_guard = metadata_guard;
+                    crate::io::decode::decode_one(tile, decode_dimensions)
                 })
                 .await
                 .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
@@ -865,7 +1164,9 @@ impl CogReader {
         kind: BlockKind,
         ifd: &ImageFileDirectory,
         coords: &[(usize, usize)],
+        work: &crate::resource::WorkReservation,
     ) -> AgResult<Vec<Arc<DecodedBlock>>> {
+        validate_compressed_ranges(ifd, coords, self.max_window_bytes)?;
         #[cfg(feature = "perf-tracing")]
         let started = Instant::now();
         let mut keys = Vec::with_capacity(coords.len());
@@ -923,7 +1224,8 @@ impl CogReader {
             let mut to_fetch: Vec<(usize, (usize, usize), InflightGuard)> = Vec::new();
             let mut pending: Vec<(usize, (usize, usize), PendingBlock)> = Vec::new();
             for &(mi, coord) in &retry {
-                match self.block_cache.claim(&keys[mi]) {
+                match self.block_cache.claim(&keys[mi]).await {
+                    Claim::Ready(block) => resolved[mi] = Some(block),
                     Claim::Owned(guard) => to_fetch.push((mi, coord, guard)),
                     Claim::Pending(rx) => pending.push((mi, coord, rx)),
                 }
@@ -945,7 +1247,7 @@ impl CogReader {
                 let tiles = ifd
                     .fetch_tiles(&fetch_coords, &self.reader)
                     .await
-                    .map_err(|e| AgError::Tiff(format!("fetch_tiles: {e}")))?;
+                    .map_err(|e| transport_error(&e, self.redact_transport_errors))?;
                 crate::perf_trace! {
                     fetch_ms += fetch_started.elapsed();
                 }
@@ -963,7 +1265,13 @@ impl CogReader {
                     let log_tx = key.tx;
                     #[cfg(feature = "perf-tracing")]
                     let log_ty = key.ty;
+                    let decode_dimensions = [
+                        ifd.tile_width().unwrap_or(ifd.image_width()),
+                        ifd.tile_height().unwrap_or(ifd.image_height()),
+                    ];
                     let sem = self.cpu.clone();
+                    let work = work.clone();
+                    let metadata_guard = self.metadata_reservations.clone();
                     let cache = Arc::clone(&self.block_cache);
                     set.spawn(async move {
                         let block_res: AgResult<Arc<DecodedBlock>> = cache
@@ -979,7 +1287,9 @@ impl CogReader {
                                 let job_started = Instant::now();
                                 let arr = tokio::task::spawn_blocking(move || {
                                     let _permit = permit;
-                                    crate::io::decode::decode_one(tile)
+                                    let _work = work;
+                                    let _metadata_guard = metadata_guard;
+                                    crate::io::decode::decode_one(tile, decode_dimensions)
                                 })
                                 .await
                                 .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
@@ -1091,6 +1401,16 @@ impl CogReader {
         if self.prefetch_ring == 0 {
             return;
         }
+        // Speculation never queues ahead of a waiting foreground window.
+        let Ok(read_permit) = Arc::clone(&self.reads).try_acquire_owned() else {
+            return;
+        };
+        let ring_width = u64::from(self.prefetch_ring) * 2;
+        let cols = u64::from(tx_range.1 - tx_range.0 + 1) + ring_width;
+        let rows = u64::from(ty_range.1 - ty_range.0 + 1) + ring_width;
+        if cols.saturating_mul(rows) > self.max_window_blocks as u64 {
+            return;
+        }
         if self
             .prefetch_inflight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1122,7 +1442,14 @@ impl CogReader {
         let cache = Arc::clone(&self.block_cache);
         let cpu = self.cpu.clone();
         let source = Arc::clone(&self.source_id);
-        tokio::spawn(async move {
+        let redact_errors = self.redact_transport_errors;
+        let max_compressed_bytes = self.max_window_bytes;
+        let work_budget = self.work_budget.clone();
+        let metadata_guard = self.metadata_reservations.clone();
+        let mut tasks = self.prefetch_tasks.lock().unwrap();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
+            let _read_permit = read_permit;
             let _slot = slot;
             for (kind, ifd) in targets {
                 let Ok(info) = IfdInfo::from(&ifd).validate() else {
@@ -1132,7 +1459,21 @@ impl CogReader {
                 if coords.is_empty() {
                     continue;
                 }
-                prefetch_blocks(&ifd, kind, level, &coords, &source, &cache, &cpu, &reader).await;
+                prefetch_blocks(
+                    &ifd,
+                    kind,
+                    level,
+                    &coords,
+                    &source,
+                    &cache,
+                    &cpu,
+                    &reader,
+                    redact_errors,
+                    max_compressed_bytes,
+                    &work_budget,
+                    &metadata_guard,
+                )
+                .await;
             }
         });
     }
@@ -1273,6 +1614,11 @@ fn default_client_options() -> ClientOptions {
 
 fn split_http_url(url: &str) -> AgResult<(String, String)> {
     let u = url::Url::parse(url).map_err(|e| AgError::Tiff(format!("invalid url: {e}")))?;
+    if u.query().is_some() {
+        // Keep the complete signed URL as the store base. Appending an empty
+        // object path preserves the encoded path and signature query verbatim.
+        return Ok((u.to_string(), String::new()));
+    }
     let scheme = u.scheme();
     let host = u
         .host_str()
@@ -1286,7 +1632,7 @@ fn split_http_url(url: &str) -> AgResult<(String, String)> {
 fn derive_geo(tiff: &TIFF) -> AgResult<(GeoTransform, Crs)> {
     let ifd = tiff.ifds().first().ok_or(AgError::MissingGeo("no IFD"))?;
 
-    let gt = if let Some(t) = ifd.model_transformation() {
+    let mut gt = if let Some(t) = ifd.model_transformation() {
         // 4x4 row-major; for a north-up image use indices [3, 0, 1, 7, 4, 5].
         if t.len() < 16 {
             return Err(AgError::MissingGeo("model_transformation truncated"));
@@ -1308,6 +1654,11 @@ fn derive_geo(tiff: &TIFF) -> AgResult<(GeoTransform, Crs)> {
         GeoTransform::from_gdal(&[x - i * sx, sx, 0.0, y + j * sy, 0.0, -sy])
     };
 
+    if ifd.geo_key_directory().and_then(|keys| keys.raster_type) == Some(2) {
+        // GeoTIFF point coordinates locate sample centres; ImageData uses corners.
+        gt = gt.translated(-0.5, -0.5);
+    }
+
     let crs = ifd
         .geo_key_directory()
         .and_then(|gk| gk.epsg_code())
@@ -1325,7 +1676,42 @@ fn classify_ifds(tiff: &TIFF) -> AgResult<(Vec<usize>, Vec<Option<usize>>)> {
         let dims = (ifd.image_width(), ifd.image_height());
         if is_mask_ifd(ifd) {
             mask_by_dims.insert(dims, idx);
-        } else {
+        } else if ifd.new_subfile_type().is_some_and(|t| t & 1 != 0)
+            && dims.0 > 0 && dims.1 > 0
+            && dims.0 < first.image_width() && dims.1 < first.image_height()
+            && ifd.samples_per_pixel() == first.samples_per_pixel()
+            && ifd.bits_per_sample() == first.bits_per_sample()
+            && ifd.sample_format() == first.sample_format()
+            && ifd.photometric_interpretation() == first.photometric_interpretation()
+            // Allow one overview pixel of rounding when the base dimensions
+            // are not divisible by the reduction factor.
+            && (f64::from(first.image_width()) / f64::from(dims.0)
+                - f64::from(first.image_height()) / f64::from(dims.1)).abs()
+                <= f64::from(first.image_width()).max(f64::from(first.image_height()))
+                    / f64::from(dims.0) / f64::from(dims.1)
+        {
+            // Tagged overviews must describe the same grid/footprint. Untagged
+            // reduced IFDs inherit the base transform, as ordinary COGs do.
+            if ifd.model_transformation().is_some() || ifd.model_tiepoint().is_some() {
+                let base = derive_geo(tiff)?.0;
+                let candidate = derive_geo(&TIFF::new(vec![ifd.clone()], tiff.endianness()))?.0;
+                let sx = f64::from(first.image_width()) / f64::from(dims.0);
+                let sy = f64::from(first.image_height()) / f64::from(dims.1);
+                let aligned = [(0., 0.), (1., 0.), (0., 1.)].iter().all(|&(x, y)| {
+                    let a = base.forward(x * sx, y * sy);
+                    let b = candidate.forward(x, y);
+                    (a.0 - b.0).abs() <= 1e-8 * a.0.abs().max(1.)
+                        && (a.1 - b.1).abs() <= 1e-8 * a.1.abs().max(1.)
+                });
+                if !aligned {
+                    continue;
+                }
+            }
+            if let Some(epsg) = ifd.geo_key_directory().and_then(|g| g.epsg_code()) {
+                if first.geo_key_directory().and_then(|g| g.epsg_code()) != Some(epsg) {
+                    continue;
+                }
+            }
             overviews.push((dims, idx));
         }
     }
@@ -1343,7 +1729,7 @@ fn classify_ifds(tiff: &TIFF) -> AgResult<(Vec<usize>, Vec<Option<usize>>)> {
     Ok((data_ifds, mask_ifds))
 }
 
-/// Pure overview-selection logic, faithful to rio-tiler `get_overview_level`.
+/// Pure overview-selection logic, independent of coordinate units.
 /// `gsds[0]` is full-resolution; entries are non-decreasing (coarser).
 fn pick_overview_from_gsds(gsds: &[f64], target_gsd: f64) -> usize {
     let n = gsds.len();
@@ -1360,7 +1746,7 @@ fn pick_overview_from_gsds(gsds: &[f64], target_gsd: f64) -> usize {
         if cur < target_gsd && next > target_gsd {
             return level;
         }
-        if (cur - target_gsd).abs() < 0.1 {
+        if cur == target_gsd {
             return level;
         }
     }
@@ -1399,12 +1785,14 @@ mod scale_offset_reader_tests {
         use object_store::local::LocalFileSystem;
         use std::sync::Arc;
         let fs = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
-        let r = CogReader::open_with_reader(ObjectReader::new(
-            fs,
-            object_store::path::Path::from("data/cog_uint8_rgb_nodata.tif"),
-        ))
-        .await
-        .unwrap();
+        let r = CogReader::builder()
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open(ObjectReader::new(
+                fs,
+                object_store::path::Path::from("tests/fixtures/rgb_nodata.tif"),
+            ))
+            .await
+            .unwrap();
         // RGB fixture without SCALE/OFFSET metadata → identity per band.
         let so = r.band_scale_offset();
         assert!(so.iter().all(|s| s.is_identity()));
@@ -1421,7 +1809,7 @@ mod open_object_store_tests {
     #[tokio::test]
     async fn open_object_store_matches_open_with_reader() {
         let fs = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
-        let key = "data/cog_uint8_rgb_nodata.tif";
+        let key = "tests/fixtures/rgb_nodata.tif";
 
         // New convenience path.
         let via_helper = CogReader::open_object_store(fs.clone(), key)
@@ -1430,7 +1818,9 @@ mod open_object_store_tests {
 
         // Old explicit path (must still produce an equivalent reader).
         let reader = ObjectReader::new(fs, object_store::path::Path::from(key));
-        let via_reader = CogReader::open_with_reader(reader)
+        let via_reader = CogReader::builder()
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open(reader)
             .await
             .expect("open_with_reader");
 
@@ -1461,6 +1851,7 @@ mod tests {
         CogReader::builder()
             .source_id(source_id)
             .block_cache(cache)
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
             .open(reader)
             .await
             .unwrap()
@@ -1500,11 +1891,7 @@ mod tests {
 
         let tif = std::env::current_dir()
             .unwrap()
-            .join("data/cog_uint8_rgb_nodata.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
+            .join("tests/fixtures/rgb_nodata.tif");
         let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
         let os_path = OsPath::from_filesystem_path(&tif).unwrap();
         let reader = ObjectReader::new(std::sync::Arc::new(LocalFileSystem::new()), os_path);
@@ -1512,6 +1899,7 @@ mod tests {
             .source_id("prefetch-test")
             .block_cache(std::sync::Arc::clone(&cache))
             .prefetch_ring(1)
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
             .open(reader)
             .await
             .unwrap();
@@ -1519,10 +1907,7 @@ mod tests {
         // Need at least a 2-block grid at level 0 for a ring to exist.
         let info = IfdInfo::from(cog.data_ifd(0).unwrap()).validate().unwrap();
         let ring = super::ring_coords(&info, (0, 0), (0, 0), 1);
-        if ring.is_empty() {
-            eprintln!("fixture is single-block at level 0, skipping");
-            return;
-        }
+        assert!(!ring.is_empty(), "fixture must have neighboring blocks");
 
         // Read a window inside block (0, 0) only.
         cog.read_window(0, 0, 0, 16, 16).await.unwrap();
@@ -1552,11 +1937,7 @@ mod tests {
         use crate::io::cache::CacheConfig;
         let tif = std::env::current_dir()
             .unwrap()
-            .join("data/cog_uint8_rgb_nodata.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
+            .join("tests/fixtures/rgb_nodata.tif");
         let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
         let r = open_local_for_test(&tif, "src-A", cache.clone()).await;
         let a = r.read_window(0, 0, 0, 64, 64).await.unwrap();
@@ -1578,11 +1959,7 @@ mod tests {
         use crate::io::cache::CacheConfig;
         let tif = std::env::current_dir()
             .unwrap()
-            .join("data/cog_uint8_rgb_nodata.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
+            .join("tests/fixtures/rgb_nodata.tif");
         let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
         let r = open_local_for_test(&tif, "src-A", cache.clone()).await;
         let (w, h) = r.level_dimensions(0).unwrap();
@@ -1607,11 +1984,7 @@ mod tests {
         use crate::io::cache::CacheConfig;
         let tif = std::env::current_dir()
             .unwrap()
-            .join("data/cog_uint8_rgb_nodata.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
+            .join("tests/fixtures/rgb_nodata.tif");
         let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
         let a = open_local_for_test(&tif, "src-A", cache.clone()).await;
         let b = open_local_for_test(&tif, "src-B", cache.clone()).await;
@@ -1631,11 +2004,7 @@ mod tests {
         use crate::io::cache::CacheConfig;
         let tif = std::env::current_dir()
             .unwrap()
-            .join("data/cog_uint8_rgb_nodata.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
+            .join("tests/fixtures/rgb_nodata.tif");
         let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
         let r = std::sync::Arc::new(open_local_for_test(&tif, "src-sf", cache.clone()).await);
 
@@ -1675,11 +2044,7 @@ mod tests {
 
         let tif = std::env::current_dir()
             .unwrap()
-            .join("data/cog_uint8_rgb_nodata.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
+            .join("tests/fixtures/rgb_nodata.tif");
         let cache = std::sync::Arc::new(BlockCache::new(CacheConfig::default()));
         let reader = open_local_for_test(&tif, "level-gsd-cache", cache).await;
 
@@ -1732,6 +2097,15 @@ mod tests {
     }
 
     #[test]
+    fn overview_selection_is_independent_of_coordinate_units() {
+        assert_eq!(
+            pick_overview_from_gsds(&[0.0001, 0.0002, 0.0004, 0.0008], 0.0005),
+            2
+        );
+        assert_eq!(pick_overview_from_gsds(&[1.0, 2.0, 4.0, 8.0], 5.0), 2);
+    }
+
+    #[test]
     fn reader_config_clamps_decode_limit_to_one() {
         let cfg = ReaderConfig {
             max_decode_tasks: 0,
@@ -1778,5 +2152,588 @@ mod tests {
             Path::from_url_path(&path).unwrap().as_ref(),
             "data/测试-中文.tif"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_metadata_tests {
+    use super::*;
+    use async_tiff::{reader::Endianness, tags::Tag, TagValue};
+
+    fn ifd(
+        w: u32,
+        h: u32,
+        reduced: bool,
+        bands: u16,
+        point: bool,
+        matrix: bool,
+    ) -> ImageFileDirectory {
+        let mut tags = HashMap::from([
+            (Tag::ImageWidth, TagValue::Unsigned(w)),
+            (Tag::ImageLength, TagValue::Unsigned(h)),
+            (Tag::SamplesPerPixel, TagValue::Short(bands)),
+            (
+                Tag::BitsPerSample,
+                TagValue::List(vec![TagValue::Short(8); bands as usize]),
+            ),
+            (Tag::Compression, TagValue::Short(1)),
+            (Tag::PhotometricInterpretation, TagValue::Short(1)),
+            (Tag::NewSubfileType, TagValue::Unsigned(u32::from(reduced))),
+            (Tag::TileWidth, TagValue::Unsigned(16)),
+            (Tag::TileLength, TagValue::Unsigned(16)),
+            (
+                Tag::GeoKeyDirectory,
+                TagValue::List(
+                    [1, 1, 0, 1, 1025, 0, 1, if point { 2 } else { 1 }]
+                        .into_iter()
+                        .map(TagValue::Short)
+                        .collect(),
+                ),
+            ),
+        ]);
+        let doubles = |v: &[f64]| TagValue::List(v.iter().copied().map(TagValue::Double).collect());
+        if matrix {
+            tags.insert(
+                Tag::ModelTransformation,
+                doubles(&[
+                    2., 0.5, 0., 100., 0.25, -3., 0., 200., 0., 0., 1., 0., 0., 0., 0., 1.,
+                ]),
+            );
+        } else {
+            tags.insert(Tag::ModelTiepoint, doubles(&[0., 0., 0., 100., 200., 0.]));
+            tags.insert(
+                Tag::ModelPixelScale,
+                doubles(&[128. / f64::from(w), 192. / f64::from(h), 0.]),
+            );
+        }
+        ImageFileDirectory::from_tags(tags, Endianness::LittleEndian).unwrap()
+    }
+
+    #[test]
+    fn audit_pixel_is_point_normalizes_both_georeferencing_forms() {
+        for matrix in [false, true] {
+            let area = TIFF::new(
+                vec![ifd(64, 64, false, 1, false, matrix)],
+                Endianness::LittleEndian,
+            );
+            let point = TIFF::new(
+                vec![ifd(64, 64, false, 1, true, matrix)],
+                Endianness::LittleEndian,
+            );
+            let area_gt = derive_geo(&area).unwrap().0;
+            let point_gt = derive_geo(&point).unwrap().0;
+            assert_eq!(point_gt.forward(0.5, 0.5), area_gt.forward(0., 0.));
+        }
+    }
+
+    #[test]
+    fn audit_unrelated_pages_are_not_overviews() {
+        let tiff = TIFF::new(
+            vec![
+                ifd(64, 64, false, 1, false, false),
+                ifd(64, 64, false, 1, false, false),
+                ifd(128, 128, true, 1, false, false),
+                ifd(32, 32, true, 3, false, false),
+                ifd(32, 16, true, 1, false, false),
+                ifd(32, 32, false, 1, false, false),
+                ifd(32, 32, true, 1, false, false),
+            ],
+            Endianness::LittleEndian,
+        );
+        assert_eq!(classify_ifds(&tiff).unwrap().0, vec![0, 6]);
+    }
+}
+
+#[cfg(test)]
+mod audit_http_tests {
+    use super::*;
+    #[tokio::test]
+    async fn audit_signed_url_reaches_range_server_unchanged() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        let fixture = include_bytes!("../../tests/fixtures/rgb_nodata.tif");
+        let app = Router::new().route(
+            "/signed.tif",
+            get(move |uri: axum::http::Uri, headers: HeaderMap| async move {
+                assert_eq!(uri.query(), Some("signature=a%2Fb&versionId=v1"));
+                let range = headers
+                    .get("range")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix("bytes=")
+                    .unwrap();
+                let (start, end) = range.split_once('-').unwrap();
+                let start: usize = start.parse().unwrap();
+                let end: usize = end.parse::<usize>().unwrap().min(fixture.len() - 1);
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        ("etag", "\"fixture-v1\"".to_string()),
+                        (
+                            "content-range",
+                            format!("bytes {start}-{end}/{}", fixture.len()),
+                        ),
+                    ],
+                    fixture[start..=end].to_vec(),
+                )
+            }),
+        );
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+        let result = CogReader::builder()
+            .open_http(&format!(
+                "http://{addr}/signed.tif?signature=a%2Fb&versionId=v1"
+            ))
+            .await;
+        server.abort();
+        assert!(result.is_ok(), "signed URL open failed: {:?}", result.err());
+    }
+}
+
+#[cfg(test)]
+mod audit_limit_tests {
+    use super::*;
+    async fn configured(config: ReaderConfig) -> AgResult<CogReader> {
+        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap());
+        CogReader::builder()
+            .reader_config(config)
+            .open_object_store(store, "tests/fixtures/rgb_nodata.tif")
+            .await
+    }
+    #[tokio::test]
+    async fn audit_compressed_ranges_are_bounded_before_fetch() {
+        let mut bytes = include_bytes!("../../tests/fixtures/rgb_nodata.tif").to_vec();
+        let ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let entries = u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()) as usize;
+        let entry = (0..entries)
+            .map(|i| ifd + 2 + i * 12)
+            .find(|&i| u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap()) == 325)
+            .unwrap();
+        let counts = u32::from_le_bytes(bytes[entry + 8..entry + 12].try_into().unwrap()) as usize;
+        bytes[counts..counts + 4].copy_from_slice(&9000u32.to_le_bytes());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        let mut cfg = ReaderConfig::default();
+        cfg.max_window_bytes = 8000;
+        let cache = cfg.block_cache.clone();
+        let source = ObjectReader::new(
+            Arc::new(object_store::local::LocalFileSystem::new()),
+            Path::from_filesystem_path(file.path()).unwrap(),
+        );
+        let reader = CogReader::builder()
+            .reader_config(cfg)
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open(source)
+            .await
+            .unwrap();
+        let result = reader.read_window(0, 0, 0, 1, 1).await;
+        assert_eq!(
+            cache.stats().fetched,
+            0,
+            "oversized declared compressed range reached the store"
+        );
+        assert!(result.is_err());
+
+        let mut cfg = ReaderConfig::default();
+        cfg.max_window_bytes = 5000;
+        let cache = cfg.block_cache.clone();
+        let reader = configured(cfg).await.unwrap();
+        let result = reader.read_window(0, 31, 0, 2, 1).await;
+        assert_eq!(
+            cache.stats().fetched,
+            0,
+            "batch sum exceeded compressed byte limit"
+        );
+        assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn audit_window_limits_reject_before_fetch() {
+        for kind in 0..3 {
+            let mut cfg = ReaderConfig::default();
+            match kind {
+                0 => cfg.max_window_pixels = 100,
+                1 => cfg.max_window_bytes = 100,
+                _ => cfg.max_window_blocks = 1,
+            };
+            let cache = cfg.block_cache.clone();
+            let reader = configured(cfg).await.unwrap();
+            assert!(reader.read_window(0, 0, 0, 64, 64).await.is_err());
+            assert_eq!(cache.stats().fetched, 0);
+        }
+    }
+    #[tokio::test]
+    async fn audit_declared_decoded_block_limit_rejects_on_open() {
+        let mut cfg = ReaderConfig::default();
+        cfg.max_decoded_block_bytes = 100;
+        assert!(configured(cfg).await.is_err());
+    }
+    #[tokio::test]
+    async fn audit_prefetch_does_not_queue_behind_foreground() {
+        let mut cfg = ReaderConfig::default();
+        cfg.max_concurrent_reads = 1;
+        cfg.prefetch_ring = 1;
+        let cache = cfg.block_cache.clone();
+        let reader = configured(cfg).await.unwrap();
+        reader.read_window(0, 0, 0, 16, 16).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            cache.stats().fetched,
+            1,
+            "speculation must skip when foreground owns the budget"
+        );
+    }
+    #[tokio::test]
+    async fn audit_shared_read_limiter_applies_backpressure() {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut cfg = ReaderConfig::default();
+        cfg.read_limiter = Some(limiter.clone());
+        let reader = configured(cfg).await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            reader.read_window(0, 0, 0, 16, 16)
+        )
+        .await
+        .is_err());
+        limiter.add_permits(1);
+        assert!(reader.read_window(0, 0, 0, 16, 16).await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod audit_http_error_tests {
+    use super::*;
+    #[derive(Clone)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+    #[tokio::test]
+    async fn audit_http_range_errors_and_prefetch_logs_hide_signed_query() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let failing = Arc::new(AtomicBool::new(false));
+        let state = failing.clone();
+        let fixture = include_bytes!("../../tests/fixtures/rgb_nodata.tif");
+        let app = Router::new().route(
+            "/signed.tif",
+            get(move |headers: HeaderMap| {
+                let state = state.clone();
+                async move {
+                    if state.load(Ordering::SeqCst) {
+                        return (StatusCode::FORBIDDEN, HeaderMap::new(), Vec::new());
+                    }
+                    let range = headers["range"]
+                        .to_str()
+                        .unwrap()
+                        .strip_prefix("bytes=")
+                        .unwrap();
+                    let (start, end) = range.split_once('-').unwrap();
+                    let start: usize = start.parse().unwrap();
+                    let end = end.parse::<usize>().unwrap().min(fixture.len() - 1);
+                    let mut out = HeaderMap::new();
+                    out.insert("etag", "\"fixture-v1\"".parse().unwrap());
+                    out.insert(
+                        "content-range",
+                        format!("bytes {start}-{end}/{}", fixture.len())
+                            .parse()
+                            .unwrap(),
+                    );
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        out,
+                        fixture[start..=end].to_vec(),
+                    )
+                }
+            }),
+        );
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+        let url = format!("http://{addr}/signed.tif?signature=SECRET_RANGE_TOKEN");
+        let direct = Arc::new(CogReader::builder().open_http(&url).await.unwrap());
+        #[allow(unused_mut)]
+        let mut readers = vec![direct];
+        failing.store(true, Ordering::SeqCst);
+        let logs = LogBuffer(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let mut errors = Vec::new();
+        errors.push(
+            CogReader::builder()
+                .open_http(&url)
+                .await
+                .err()
+                .expect("HTTP open should now fail")
+                .to_string(),
+        );
+        for reader in readers {
+            errors.push(
+                reader
+                    .read_window(0, 0, 0, 16, 16)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            );
+            prefetch_blocks(
+                reader.data_ifd(0).unwrap(),
+                BlockKind::Data,
+                0,
+                &[(1, 1)],
+                &reader.source_id,
+                &reader.block_cache,
+                &reader.cpu,
+                &reader.reader,
+                reader.redact_transport_errors,
+                reader.max_window_bytes,
+                &reader.work_budget,
+                &reader.metadata_reservations,
+            )
+            .await;
+        }
+        server.abort();
+        let log_text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log_text.contains("block prefetch fetch failed"),
+            "prefetch failure was not captured"
+        );
+        assert!(
+            !errors.join("\n").contains("SECRET_RANGE_TOKEN"),
+            "range error leaked query: {errors:?}"
+        );
+        assert!(
+            !log_text.contains("SECRET_RANGE_TOKEN"),
+            "tracing leaked signed query: {log_text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_regression_tests {
+    use super::*;
+    use object_store::ObjectStoreExt;
+    #[tokio::test]
+    async fn snapshot_open_preserves_resource_limit_classification() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let path = Path::from("x.tif");
+        store
+            .put(
+                &path,
+                include_bytes!("../../tests/fixtures/rgb_nodata.tif")
+                    .as_slice()
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let mut config = ReaderConfig::default();
+        config.work_budget = crate::resource::WorkBudget::new(0);
+        assert!(matches!(
+            CogReader::builder()
+                .reader_config(config)
+                .open_object_store(store, path.as_ref())
+                .await,
+            Err(AgError::ResourceLimit(_))
+        ));
+    }
+    #[tokio::test]
+    async fn snapshot_rejects_object_mutation_between_metadata_and_pixels() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let path = Path::from("mutable.tif");
+        let bytes = include_bytes!("../../tests/fixtures/rgb_nodata.tif");
+        store.put(&path, bytes.as_slice().into()).await.unwrap();
+        let reader = CogReader::builder()
+            .open_object_store(store.clone(), path.as_ref())
+            .await
+            .unwrap();
+        let mut changed = bytes.to_vec();
+        let last = changed.len() - 1;
+        changed[last] ^= 1;
+        store.put(&path, changed.into()).await.unwrap();
+        assert!(
+            reader.read_window(0, 0, 0, 16, 16).await.is_err(),
+            "must not combine old metadata with a new object version"
+        );
+    }
+}
+#[tokio::test]
+async fn working_budget_rejects_read_before_fetch_and_releases_on_return() {
+    let budget = crate::resource::WorkBudget::new(256 * 1024);
+    let mut cfg = ReaderConfig::default();
+    cfg.work_budget = budget.clone();
+    let cache = cfg.block_cache.clone();
+    let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap());
+    let reader = CogReader::builder()
+        .reader_config(cfg)
+        .open_object_store(store, "tests/fixtures/rgb_nodata.tif")
+        .await
+        .unwrap();
+    let persistent = budget.used_bytes();
+    let busy = budget
+        .try_reserve(budget.limit_bytes() - persistent)
+        .unwrap();
+    assert!(reader.read_window(0, 0, 0, 16, 16).await.is_err());
+    assert_eq!(cache.stats().fetched, 0);
+    drop(busy);
+    assert!(reader.read_window(0, 0, 0, 16, 16).await.is_ok());
+    assert_eq!(budget.used_bytes(), persistent);
+    drop(reader);
+    assert_eq!(budget.used_bytes(), 0);
+    assert!(budget.peak_bytes() <= budget.limit_bytes());
+}
+
+#[cfg(test)]
+mod prefetch_shutdown_tests {
+    use super::*;
+    #[tokio::test]
+    async fn dropping_reader_cancels_inflight_prefetch() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pixels_started = Arc::new(AtomicBool::new(false));
+        let flag = pixels_started.clone();
+        let (notify, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let fixture = include_bytes!("../../tests/fixtures/rgb_nodata.tif");
+        let app = Router::new().route(
+            "/image",
+            get(move |headers: HeaderMap| {
+                let flag = flag.clone();
+                let notify = notify.clone();
+                async move {
+                    let range = headers["range"]
+                        .to_str()
+                        .unwrap()
+                        .strip_prefix("bytes=")
+                        .unwrap();
+                    let (start, end) = range.split_once('-').unwrap();
+                    let start: usize = start.parse().unwrap();
+                    let end = end.parse::<usize>().unwrap().min(fixture.len() - 1);
+                    if flag.load(Ordering::SeqCst) {
+                        let _ = notify.send(());
+                        std::future::pending::<()>().await;
+                    }
+                    let mut out = HeaderMap::new();
+                    out.insert("etag", "\"fixed\"".parse().unwrap());
+                    out.insert(
+                        "content-range",
+                        format!("bytes {start}-{end}/{}", fixture.len())
+                            .parse()
+                            .unwrap(),
+                    );
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        out,
+                        fixture[start..=end].to_vec(),
+                    )
+                }
+            }),
+        );
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+        let reader = CogReader::builder()
+            .open_http(&format!("http://{addr}/image"))
+            .await
+            .unwrap();
+        let reads = reader.reads.clone();
+        pixels_started.store(true, Ordering::SeqCst);
+        // Start exactly the reader-owned speculative operation; no foreground
+        // request owns the reader or its read permit when it is dropped below.
+        let mut reader = reader;
+        reader.prefetch_ring = 1;
+        reader.maybe_spawn_prefetch(0, (0, 0), (0, 0));
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(reader);
+        let stopped = tokio::time::timeout(Duration::from_millis(200), async {
+            while reads.available_permits() != 8 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        server.abort();
+        assert!(
+            stopped.is_ok(),
+            "reader drop must abort its speculative fetch and release its permit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_limit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn malformed_directory_cycles_and_huge_counts_are_rejected() {
+        use object_store::ObjectStoreExt;
+        let original = include_bytes!("../../tests/fixtures/rgb_nodata.tif").to_vec();
+        let offset = u32::from_le_bytes(original[4..8].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(original[offset..offset + 2].try_into().unwrap()) as usize;
+        let mut cyclic = original.clone();
+        let next = offset + 2 + count * 12;
+        cyclic[next..next + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+        let mut values = original;
+        values[offset + 2 + 4..offset + 2 + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut big = b"II".to_vec();
+        big.extend(43u16.to_le_bytes());
+        big.extend(8u16.to_le_bytes());
+        big.extend(0u16.to_le_bytes());
+        big.extend(16u64.to_le_bytes());
+        big.extend(u64::MAX.to_le_bytes());
+        for bytes in [cyclic, values, big] {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let path = Path::from("invalid.tif");
+            store.put(&path, bytes.into()).await.unwrap();
+            assert!(CogReader::builder()
+                .open_object_store(store, path.as_ref())
+                .await
+                .is_err());
+        }
+    }
+    #[tokio::test]
+    async fn parser_limits_apply_before_ifd_materialization() {
+        for entries in [false, true] {
+            let mut config = ReaderConfig::default();
+            if entries {
+                config.max_ifd_entries = 1;
+            } else {
+                config.max_ifds = 1;
+            }
+            let store =
+                Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap());
+            assert!(CogReader::builder()
+                .reader_config(config)
+                .open_object_store(store, "tests/fixtures/rgb_nodata.tif")
+                .await
+                .is_err());
+        }
     }
 }

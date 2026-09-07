@@ -17,8 +17,8 @@ use async_geotiff::tms::{TileCoord, TileMatrixSet};
 
 /// A minimal valid MosaicJSON. `quadkey_zoom` is 3, so the keys are
 /// length-3 quadkeys; each maps to the COG URLs covering that quadkey.
-/// The URLs here are placeholders — opening them fails, so the mosaic
-/// skips them and returns a transparent tile (still an `Ok`).
+/// The URLs here are placeholders — opening them fails and the mosaic
+/// returns an error, which this example prints below.
 const SAMPLE: &str = r#"{
   "mosaicjson": "0.0.3",
   "minzoom": 3,
@@ -94,10 +94,7 @@ async fn main() -> AgResult<()> {
         )
         .await
     {
-        Ok(Some(png)) => println!(
-            "rendered {} bytes (placeholder URLs are skipped → transparent tile)",
-            png.len()
-        ),
+        Ok(Some(png)) => println!("rendered {} bytes", png.len()),
         Ok(None) => println!("no tile (outside all assets)"),
         Err(e) => println!("error: {e}"),
     }

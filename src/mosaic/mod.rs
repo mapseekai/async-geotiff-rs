@@ -20,40 +20,48 @@ pub use stac::StacSource;
 use bytes::Bytes;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::error::{AgError, AgResult};
 use crate::io::BlockCache;
 use crate::pixel::ImageData;
-use crate::render::pipeline::render;
+use crate::request::{
+    RequestContext, RequestLimiter, RequestOptions, DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+    DEFAULT_REQUEST_TIMEOUT,
+};
+use crate::resource::WorkBudget;
 use crate::style::params::compile_cached;
 use crate::style::TileStyle;
+use crate::tiler::render_composite;
 use crate::tiler::Tiler;
 use crate::tms::TileCoord;
 
 pub use reader_pool::Backend;
 
-use reader_pool::{redact_query, ReaderPool};
+use reader_pool::ReaderPool;
 use selection::{NonEmptyReducer, Reducer};
 
 /// Tuning knobs for [`MosaicTiler`].
 ///
 /// `chunk_size` is the effective concurrency bound for per-asset reads/warps;
-/// each asset is processed via an independent `Tiler`, so the per-`Tiler`
-/// blocking semaphore does not bound the mosaic path — keep `chunk_size`
-/// modest under load.
+/// all assets share the reader pool CPU limiter. Median additionally rejects
+/// requests whose retained input buffers would exceed 256 MiB.
 #[derive(Clone, Copy, Debug)]
 pub struct MosaicConfig {
     /// Assets fetched+warped in parallel per chunk; `is_done` is checked
-    /// after each chunk so `First`/`Highest`/`Lowest` can short-circuit.
+    /// after each chunk so `First` can stop once coverage is complete.
     pub chunk_size: usize,
     /// Max distinct opened COGs kept in the reader pool.
     pub reader_capacity: u64,
     /// Hard cap on assets processed for a single tile. A low-zoom request whose
     /// quadkey prefix matches a large fraction of the mosaic index could
     /// otherwise fan out to thousands of remote opens/reads/warps per tile (a
-    /// fetch-amplification DoS). Excess assets past this cap are dropped with a
-    /// warning. `0` disables the cap.
+    /// fetch-amplification DoS). Requests exceeding this cap return an error. `0` disables the cap.
     pub max_assets_per_tile: usize,
+    /// Maximum active public tile requests; excess requests fail immediately.
+    pub max_in_flight_requests: usize,
+    /// Whole request deadline, including source lookup and asset IO.
+    pub request_timeout: Duration,
 }
 
 impl Default for MosaicConfig {
@@ -62,6 +70,8 @@ impl Default for MosaicConfig {
             chunk_size: 8,
             reader_capacity: 256,
             max_assets_per_tile: 64,
+            max_in_flight_requests: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 }
@@ -71,6 +81,8 @@ pub struct MosaicTiler<S: MosaicSource> {
     source: S,
     pool: ReaderPool,
     cfg: MosaicConfig,
+    requests: RequestLimiter,
+    work_budget: WorkBudget,
 }
 
 /// Builds a [`MosaicTiler`]. Every knob is optional — `build()` always
@@ -91,6 +103,8 @@ pub struct MosaicTilerBuilder<S: MosaicSource> {
     block_cache: Option<Arc<BlockCache>>,
     backend: Backend,
     http_policy: Option<HttpAccessPolicy>,
+    requests: Option<RequestLimiter>,
+    work_budget: WorkBudget,
 }
 
 impl<S: MosaicSource> MosaicTilerBuilder<S> {
@@ -129,8 +143,20 @@ impl<S: MosaicSource> MosaicTilerBuilder<S> {
         self
     }
 
+    pub fn request_limiter(mut self, requests: RequestLimiter) -> Self {
+        self.requests = Some(requests);
+        self
+    }
+
+    pub fn work_budget(mut self, budget: WorkBudget) -> Self {
+        self.work_budget = budget;
+        self
+    }
+
     pub fn build(self) -> MosaicTiler<S> {
-        let mut pool = ReaderPool::builder(self.cfg.reader_capacity).backend(self.backend);
+        let mut pool = ReaderPool::builder(self.cfg.reader_capacity)
+            .backend(self.backend)
+            .work_budget(self.work_budget.clone());
         if let Some(block_cache) = self.block_cache {
             pool = pool.block_cache(block_cache);
         }
@@ -141,6 +167,14 @@ impl<S: MosaicSource> MosaicTilerBuilder<S> {
             pool: pool.build(),
             source: self.source,
             cfg: self.cfg,
+            requests: self.requests.unwrap_or_else(|| {
+                if self.cfg.max_in_flight_requests == DEFAULT_MAX_IN_FLIGHT_REQUESTS {
+                    RequestLimiter::default()
+                } else {
+                    RequestLimiter::new(self.cfg.max_in_flight_requests)
+                }
+            }),
+            work_budget: self.work_budget,
         }
     }
 }
@@ -159,6 +193,8 @@ impl<S: MosaicSource> MosaicTiler<S> {
             block_cache: None,
             backend: Backend::Http,
             http_policy: None,
+            requests: None,
+            work_budget: WorkBudget::global(),
         }
     }
 
@@ -229,17 +265,58 @@ impl<S: MosaicSource> MosaicTiler<S> {
         self.pool.block_cache()
     }
 
+    /// Explicitly open a new asset snapshot on its next use.
+    pub async fn invalidate_source(&self, key: &str, source_id: &str) {
+        self.pool.invalidate(key, source_id).await;
+    }
+
     /// Render one mosaicked tile. `style` is shared by all assets but
     /// applies in two phases: read/warp params (resampling/reproject,
-    /// nodata via the source COGs) per-asset; render params
-    /// (rescale/colormap/color_formula/tilesize) once on the composite.
+    /// request nodata and per-source unscale) per-asset; render params once on
+    /// the composite. Multiple assets use composite-tile statistics for stretch;
+    /// one asset preserves the single-source dataset-statistics behavior.
+    /// Asset failures and fan-out overflow return errors, never partial tiles.
     pub async fn tile(
         &self,
         coord: TileCoord,
         selection: PixelSelection,
         style: &TileStyle,
     ) -> AgResult<Option<Bytes>> {
-        let mut assets = self.source.assets_for_tile(coord).await?;
+        self.tile_with_options(coord, selection, style, &RequestOptions::default())
+            .await
+    }
+
+    /// Render with a per-call deadline override and explicit cancellation handle.
+    pub async fn tile_with_options(
+        &self,
+        coord: TileCoord,
+        selection: PixelSelection,
+        style: &TileStyle,
+        options: &RequestOptions,
+    ) -> AgResult<Option<Bytes>> {
+        self.requests
+            .run(self.cfg.request_timeout, options, |context| async move {
+                self.tile_in_request(coord, selection, style, &context)
+                    .await
+            })
+            .await
+    }
+
+    async fn tile_in_request(
+        &self,
+        coord: TileCoord,
+        selection: PixelSelection,
+        style: &TileStyle,
+        context: &RequestContext,
+    ) -> AgResult<Option<Bytes>> {
+        let mut context = context.clone();
+        context.check()?;
+        let compiled = compile_cached(style).await?;
+        if self.cfg.chunk_size == 0 {
+            return Err(AgError::Mosaic("chunk_size must be non-zero".into()));
+        }
+        let assets = self.source.assets_for_tile(coord).await?;
+        context.check()?;
         if assets.is_empty() {
             return Ok(None);
         }
@@ -247,45 +324,92 @@ impl<S: MosaicSource> MosaicTiler<S> {
         // opening/warping all of them per tile is a fetch-amplification DoS.
         let cap = self.cfg.max_assets_per_tile;
         if cap > 0 && assets.len() > cap {
-            tracing::warn!(
-                coord = ?(coord.z, coord.x, coord.y),
-                matched = assets.len(),
-                cap,
-                "mosaic tile asset fan-out capped"
-            );
-            assets.truncate(cap);
+            return Err(AgError::Mosaic(format!(
+                "tile matches {} assets, exceeding limit {cap}",
+                assets.len()
+            )));
+        }
+        if assets.len() == 1 {
+            let asset = &assets[0];
+            let reader = self.pool.get_or_open(&asset.url, &asset.source_id).await?;
+            context.check()?;
+            return Tiler::new(reader)
+                .with_request_limiter(self.requests.clone())
+                .with_work_budget(self.work_budget.clone())
+                .tile_in_request(coord, style, &context)
+                .await;
         }
 
         let mut reducer: Option<Reducer<NonEmptyReducer>> = None;
         let mut fed = 0usize;
+        let mut retained_bytes = 0usize;
 
         for chunk in assets.chunks(self.cfg.chunk_size) {
-            let futs = chunk.iter().map(|a| async move {
-                let reader = self.pool.get_or_open(&a.url, &a.source_id).await?;
-                let tiler = Tiler::new(reader);
-                let img = tiler.warp_tile(coord, style).await?;
-                Ok::<Option<Arc<ImageData>>, AgError>(img)
+            context.check()?;
+            let futs = chunk.iter().map(|a| {
+                let context = &context;
+                async move {
+                    context.check()?;
+                    let reader = self.pool.get_or_open(&a.url, &a.source_id).await?;
+                    context.check()?;
+                    let bands = u64::from(reader.data_ifd(0)?.samples_per_pixel());
+                    // Warped image plus its temporary F64 reducer input.
+                    // Streaming reducers release this after the chunk is fed;
+                    // Median retains its samples until finish.
+                    let bytes = u64::from(style.tilesize)
+                        .checked_pow(2)
+                        .and_then(|pixels| {
+                            bands
+                                .checked_mul(16)
+                                .and_then(|n| n.checked_add(2))
+                                .and_then(|n| pixels.checked_mul(n))
+                        })
+                        .ok_or_else(|| {
+                            AgError::ResourceLimit("mosaic working-set estimate overflow".into())
+                        })?;
+                    let reservation = self.work_budget.try_reserve(bytes)?;
+                    let child = context.with_work(reservation.clone());
+                    let tiler = Tiler::new(reader)
+                        .with_request_limiter(self.requests.clone())
+                        .with_work_budget(self.work_budget.clone());
+                    let img = tiler.warp_tile_in_request(coord, style, &child).await?;
+                    Ok::<_, AgError>((img, reservation))
+                }
             });
-            let results = futures::future::join_all(futs).await;
+            let results = futures::future::try_join_all(futs).await?;
 
-            // Collect this chunk's warped assets on the async thread (cheap),
-            // logging skipped/failed ones here so credential-bearing URLs never
-            // cross into the blocking closure below.
+            // Propagate failures: partial output is not a successful tile.
             let mut imgs: Vec<Arc<ImageData>> = Vec::with_capacity(chunk.len());
-            for (asset, res) in chunk.iter().zip(results) {
-                match res {
-                    Ok(Some(img)) => imgs.push(img),
-                    Ok(None) => {}
-                    Err(e) => {
-                        // Redacted: presigned/query-string credentials must not
-                        // reach the logs (the error text is already redacted at
-                        // its construction site in `ReaderPool::get_or_open`).
-                        tracing::warn!(
-                            asset = %redact_query(&asset.url),
-                            error = %e,
-                            "mosaic asset skipped"
-                        );
+            let mut chunk_work = Vec::with_capacity(chunk.len());
+            context.check()?;
+            for (image, reservation) in results {
+                if let Some(img) = image {
+                    if reducer.is_none() && imgs.is_empty() {
+                        // One accumulator/final-render allowance for the entire mosaic.
+                        let bytes = (img.pixels.bands() as u64)
+                            .checked_mul(64)
+                            .and_then(|n| n.checked_add(48))
+                            .and_then(|n| n.checked_mul(img.pixels.width() as u64))
+                            .and_then(|n| n.checked_mul(img.pixels.height() as u64))
+                            .ok_or_else(|| {
+                                AgError::ResourceLimit(
+                                    "mosaic accumulator estimate overflow".into(),
+                                )
+                            })?;
+                        context = context.with_work(self.work_budget.try_reserve(bytes)?);
                     }
+                    if selection == PixelSelection::Median {
+                        context = context.with_work(reservation);
+                        retained_bytes = median_retained_bytes(
+                            retained_bytes,
+                            img.pixels.bands(),
+                            img.pixels.height(),
+                            img.pixels.width(),
+                        )?;
+                    } else {
+                        chunk_work.push(reservation);
+                    }
+                    imgs.push(img);
                 }
             }
 
@@ -297,11 +421,15 @@ impl<S: MosaicSource> MosaicTiler<S> {
                 // moves in and back out so it accumulates across chunks.
                 let permit = self.pool.cpu_limiter().acquire().await?;
                 let taken = reducer.take();
+                let cancellation = context.clone();
                 let (next, added) = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
+                    let _chunk_work = chunk_work;
+                    cancellation.check()?;
                     let mut r = taken;
                     let mut added = 0usize;
                     for img in imgs {
+                        cancellation.check()?;
                         match r.as_mut() {
                             Some(r) => r.feed(&img)?,
                             None => r = Some(Reducer::new(selection).feed(&img)?),
@@ -328,16 +456,19 @@ impl<S: MosaicSource> MosaicTiler<S> {
         let Some(reducer) = reducer else {
             return Ok(None);
         };
-        let composite = reducer.finish()?;
-        let compiled = compile_cached(style).await?;
-        let img = composite;
+
         // Bound the composite render with the same shared CPU limiter the
         // per-asset reads/warps used, so it doesn't add an unbounded blocking
         // job on top of the mosaic's CPU budget.
         let permit = self.pool.cpu_limiter().acquire().await?;
+        let style = style.clone();
+        let cancellation = context.clone();
         let bytes = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            render(&img, &compiled)
+            cancellation.check()?;
+            let img = reducer.finish()?;
+            cancellation.check()?;
+            render_composite(&img, &style, &compiled)
         })
         .await
         .map_err(|e| AgError::Mosaic(format!("render join: {e}")))??;
@@ -345,92 +476,29 @@ impl<S: MosaicSource> MosaicTiler<S> {
     }
 }
 
+fn median_retained_bytes(
+    current: usize,
+    bands: usize,
+    height: usize,
+    width: usize,
+) -> AgResult<usize> {
+    // f64 pixels plus validity masks; conservative one mask byte per band.
+    bands
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(width))
+        .and_then(|n| n.checked_mul(9))
+        .and_then(|n| current.checked_add(n))
+        .filter(|&n| n <= 256 * 1024 * 1024)
+        .ok_or_else(|| AgError::Mosaic("median retained memory budget exceeds 256 MiB".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bounds::Bbox;
     use crate::io::CogReader;
-    use async_tiff::reader::ObjectReader;
+
     use object_store::local::LocalFileSystem;
-    use object_store::path::Path as OsPath;
-
-    struct OneLocal {
-        abspath: String,
-    }
-
-    #[async_trait::async_trait]
-    impl MosaicSource for OneLocal {
-        async fn assets_for_tile(&self, _coord: TileCoord) -> AgResult<Vec<AssetRef>> {
-            Ok(vec![AssetRef {
-                url: self.abspath.clone(),
-                source_id: self.abspath.clone(),
-                bbox: Bbox::new(-180.0, -90.0, 180.0, 90.0),
-            }])
-        }
-    }
-
-    #[tokio::test]
-    async fn single_asset_mosaic_matches_single_source() {
-        let cwd = std::env::current_dir().unwrap();
-        let tif = cwd.join("data/cog_uint8_rgb_nodata.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
-
-        let fs = LocalFileSystem::new();
-        let os_path = OsPath::from_filesystem_path(&tif).unwrap();
-        let reader =
-            CogReader::open_with_reader(ObjectReader::new(std::sync::Arc::new(fs), os_path))
-                .await
-                .unwrap();
-        let tiler = Tiler::new(std::sync::Arc::new(reader));
-        let style = TileStyle::from_query("").unwrap();
-        let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
-        let bounds = [w, s, e, n];
-
-        // Derive a tile that actually covers the fixture (slippy-map formula)
-        // so both paths render real bytes; an out-of-bounds tile now returns
-        // None and would not exercise the single-vs-mosaic equivalence.
-        let z = 12u8;
-        let nz = 2f64.powi(z as i32);
-        let clon = (w + e) / 2.0;
-        let clat = (s + n) / 2.0;
-        let x = (((clon + 180.0) / 360.0 * nz).floor().clamp(0.0, nz - 1.0)) as u32;
-        let lat_rad = clat.to_radians();
-        let y = (((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0
-            * nz)
-            .floor()
-            .clamp(0.0, nz - 1.0)) as u32;
-        let coord = TileCoord {
-            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
-            z,
-            x,
-            y,
-        };
-        let single = tiler.tile(coord, &style).await;
-
-        let src = OneLocal {
-            abspath: tif.to_string_lossy().into_owned(),
-        };
-        let m = MosaicTiler::new(src);
-        let mosaic = m.tile(coord, PixelSelection::First, &style).await;
-
-        let _ = bounds;
-        // The single-source path is the assertion: an in-bounds tile renders.
-        match single {
-            Ok(Some(a)) => assert!(!a.is_empty(), "in-bounds single-source tile must render"),
-            Ok(None) => panic!("in-bounds tile unexpectedly returned None"),
-            Err(_) => {} // environment-dependent reader error; tolerate.
-        }
-        // The mosaic path opens assets through ReaderPool (open_http), so a
-        // local-FS fixture path may load nothing → None, or error. Either is
-        // acceptable here; mosaic orchestration is covered by
-        // `mosaic_with_no_assets_returns_none` and the selection unit tests.
-        if let Ok(Some(b)) = mosaic {
-            assert!(!b.is_empty());
-        }
-    }
 
     /// Source that returns one asset addressed by a decoded object key,
     /// to exercise the injected-store (MinIO/S3/local) path.
@@ -451,67 +519,226 @@ mod tests {
 
     #[tokio::test]
     async fn object_store_mosaic_renders_via_injected_store() {
-        // The feature claim: with a store injected, the mosaic opens its asset
-        // through object_store (key = decoded object key, NOT an HTTP URL) and
-        // actually renders it. The `.expect(...must render...)` below is the
-        // anti-false-green guard: a silently-skipped asset leaves `fed == 0` and
-        // returns None, which would slip past a weaker assertion.
-        //
-        // We do not assert byte-equality with the single-source `Tiler::tile`
-        // path: the mosaic composites via `warp_tile` → Reducer → render and is
-        // intentionally not byte-identical to the fused single-source pipeline
-        // (the sibling `single_asset_mosaic_matches_single_source` makes the same
-        // choice). Store-level decode equivalence is covered in cog.rs by
-        // `open_object_store_matches_open_with_reader`.
-        let key = "data/cog_uint8_rgb_nodata.tif";
-        if !std::path::Path::new(key).exists() {
-            eprintln!("fixture missing, skipping object_store_mosaic_renders_via_injected_store");
-            return;
+        for key in [
+            "tests/fixtures/rgb_nodata.tif",
+            "tests/fixtures/uint16.tif",
+            "tests/fixtures/projected.tif",
+        ] {
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+
+            // Bounds (over the same store+key) to derive a covering tile.
+            let reader = CogReader::builder()
+                .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+                .open_object_store(store.clone(), key)
+                .await
+                .expect("open via object_store");
+            let single = Tiler::new(Arc::new(reader));
+            let [w, s, e, n] = single.wgs84_bounds().unwrap();
+
+            // A tile that actually covers the fixture (slippy-map formula).
+            let z = 12u8;
+            let nz = 2f64.powi(z as i32);
+            let clon = (w + e) / 2.0;
+            let clat = (s + n) / 2.0;
+            let x = (((clon + 180.0) / 360.0 * nz).floor().clamp(0.0, nz - 1.0)) as u32;
+            let lat_rad = clat.to_radians();
+            let y = (((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI)
+                / 2.0
+                * nz)
+                .floor()
+                .clamp(0.0, nz - 1.0)) as u32;
+
+            let src = OneKey {
+                key: key.to_string(),
+            };
+            let m = MosaicTiler::builder(src)
+                .backend(Backend::Store(store.clone()))
+                .build();
+            let coord = TileCoord {
+                tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+                z,
+                x,
+                y,
+            };
+            for query in [
+                "",
+                "bidx=1",
+                "stretch=minmax",
+                "stretch=percent&pc=10,90",
+                "unscale=true",
+                "expression=b1*2",
+                "bidx=1&rescale=0,200&colormap_name=viridis",
+                "nodata=100&reproject=bilinear",
+            ] {
+                let style = TileStyle::from_query(query).unwrap();
+                let expected = single
+                    .tile(coord, &style)
+                    .await
+                    .unwrap()
+                    .expect("fixture must cover tile");
+                let actual = m
+                    .tile(coord, PixelSelection::First, &style)
+                    .await
+                    .unwrap()
+                    .expect("asset must render");
+                assert_eq!(expected, actual, "single asset equivalence: {key} {query}");
+            }
         }
-        let store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+    }
 
-        // Bounds (over the same store+key) to derive a covering tile.
-        let reader = CogReader::open_object_store(store.clone(), key)
-            .await
-            .expect("open via object_store");
-        let style = TileStyle::from_query("").unwrap();
-        let [w, s, e, n] = Tiler::new(Arc::new(reader)).wgs84_bounds().unwrap();
+    struct Keys(Vec<String>);
 
-        // A tile that actually covers the fixture (slippy-map formula).
-        let z = 12u8;
-        let nz = 2f64.powi(z as i32);
-        let clon = (w + e) / 2.0;
-        let clat = (s + n) / 2.0;
-        let x = (((clon + 180.0) / 360.0 * nz).floor().clamp(0.0, nz - 1.0)) as u32;
-        let lat_rad = clat.to_radians();
-        let y = (((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0
-            * nz)
-            .floor()
-            .clamp(0.0, nz - 1.0)) as u32;
-
-        let src = OneKey {
-            key: key.to_string(),
-        };
-        let m = MosaicTiler::builder(src)
-            .backend(Backend::Store(store.clone()))
+    #[tokio::test]
+    async fn streaming_reducers_release_finished_chunk_reservations() {
+        let budget = WorkBudget::new(64 * 1024 * 1024);
+        let store = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+        let mosaic = MosaicTiler::builder(Keys(vec!["tests/fixtures/rgb_nodata.tif".into(); 20]))
+            .backend(Backend::Store(store))
+            .work_budget(budget.clone())
+            .config(MosaicConfig {
+                chunk_size: 1,
+                ..Default::default()
+            })
             .build();
-        let mosaic = m
-            .tile(
-                TileCoord {
-                    tms: crate::tms::TileMatrixSet::WebMercatorQuad,
-                    z,
-                    x,
-                    y,
-                },
-                PixelSelection::First,
-                &style,
-            )
+        let coord = TileCoord {
+            tms: crate::tms::TileMatrixSet::WorldCrs84Quad,
+            z: 10,
+            x: 1081,
+            y: 398,
+        };
+        assert!(mosaic
+            .tile(coord, PixelSelection::Mean, &TileStyle::default())
             .await
-            .expect("mosaic tile")
-            .expect("object_store asset must render, not be skipped");
+            .unwrap()
+            .is_some());
+        assert!(budget.peak_bytes() <= budget.limit_bytes());
+        drop(mosaic);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+    #[async_trait::async_trait]
+    impl MosaicSource for Keys {
+        async fn assets_for_tile(&self, _: TileCoord) -> AgResult<Vec<AssetRef>> {
+            Ok(self
+                .0
+                .iter()
+                .map(|key| AssetRef {
+                    url: key.clone(),
+                    source_id: key.clone(),
+                    bbox: Bbox::new(-180.0, -90.0, 180.0, 90.0),
+                })
+                .collect())
+        }
+    }
 
-        assert!(!mosaic.is_empty(), "rendered tile must be non-empty");
+    #[tokio::test]
+    async fn cap_overflow_is_error_before_assets_are_opened() {
+        let mosaic = MosaicTiler::builder(Keys(vec!["missing-a".into(), "missing-b".into()]))
+            .config(MosaicConfig {
+                max_assets_per_tile: 1,
+                ..Default::default()
+            })
+            .build();
+        let coord = TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z: 1,
+            x: 0,
+            y: 0,
+        };
+        let error = mosaic
+            .tile(coord, PixelSelection::Mean, &TileStyle::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeding limit"));
+    }
+
+    #[tokio::test]
+    async fn failed_asset_does_not_return_a_partial_composite() {
+        let store = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+        let mosaic = MosaicTiler::builder(Keys(vec![
+            "tests/fixtures/rgb_nodata.tif".into(),
+            "missing.tif".into(),
+        ]))
+        .backend(Backend::Store(store))
+        .config(MosaicConfig {
+            chunk_size: 1,
+            ..Default::default()
+        })
+        .build();
+        // Fixture is near 10E,20N; first chunk contributes pixels before failure.
+        let coord = TileCoord {
+            tms: crate::tms::TileMatrixSet::WorldCrs84Quad,
+            z: 10,
+            x: 1081,
+            y: 398,
+        };
+        assert!(mosaic
+            .tile(coord, PixelSelection::Mean, &TileStyle::default())
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn median_budget_counts_all_chunks_and_checks_overflow() {
+        let first = median_retained_bytes(0, 3, 2048, 2048).unwrap();
+        let second = median_retained_bytes(first, 3, 2048, 2048).unwrap();
+        assert!(median_retained_bytes(second, 3, 2048, 2048).is_err());
+        assert!(median_retained_bytes(0, usize::MAX, 2, 2).is_err());
+    }
+
+    struct StalledSource;
+    #[async_trait::async_trait]
+    impl MosaicSource for StalledSource {
+        async fn assets_for_tile(&self, _: TileCoord) -> AgResult<Vec<AssetRef>> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_io_stall_obeys_request_deadline() {
+        let mosaic = MosaicTiler::builder(StalledSource)
+            .config(MosaicConfig {
+                request_timeout: Duration::from_millis(10),
+                ..Default::default()
+            })
+            .build();
+        let coord = TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z: 1,
+            x: 0,
+            y: 0,
+        };
+        assert!(matches!(
+            mosaic
+                .tile(coord, PixelSelection::First, &TileStyle::default())
+                .await,
+            Err(AgError::DeadlineExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn child_assets_share_one_admission_without_reentering() {
+        let limiter = RequestLimiter::new(1);
+        let store = Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
+        for count in [1, 2] {
+            let mosaic =
+                MosaicTiler::builder(Keys(vec!["tests/fixtures/rgb_nodata.tif".into(); count]))
+                    .backend(Backend::Store(store.clone()))
+                    .request_limiter(limiter.clone())
+                    .build();
+            let coord = TileCoord {
+                tms: crate::tms::TileMatrixSet::WorldCrs84Quad,
+                z: 10,
+                x: 1081,
+                y: 398,
+            };
+            assert!(mosaic
+                .tile(coord, PixelSelection::Mean, &TileStyle::default())
+                .await
+                .unwrap()
+                .is_some());
+            assert_eq!(limiter.available_permits(), 1);
+        }
     }
 
     struct NoAssets;
@@ -542,6 +769,52 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none(), "mosaic tile with no assets must return None");
+    }
+
+    #[tokio::test]
+    async fn invalid_style_and_config_fail_before_source_lookup() {
+        let coord = TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z: 1,
+            x: 0,
+            y: 0,
+        };
+        let mut style = TileStyle::default();
+        style.tilesize = 0;
+        assert!(MosaicTiler::new(NoAssets)
+            .tile(coord, PixelSelection::First, &style)
+            .await
+            .is_err());
+        let mosaic = MosaicTiler::builder(NoAssets)
+            .config(MosaicConfig {
+                chunk_size: 0,
+                ..Default::default()
+            })
+            .build();
+        assert!(mosaic
+            .tile(coord, PixelSelection::First, &TileStyle::default())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_asset_is_error_not_empty_coverage() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let mosaic = MosaicTiler::builder(OneKey {
+            key: "missing.tif".into(),
+        })
+        .backend(Backend::Store(store))
+        .build();
+        let coord = TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z: 1,
+            x: 0,
+            y: 0,
+        };
+        assert!(mosaic
+            .tile(coord, PixelSelection::First, &TileStyle::default())
+            .await
+            .is_err());
     }
 
     #[test]

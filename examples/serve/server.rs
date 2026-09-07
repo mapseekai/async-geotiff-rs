@@ -3,8 +3,9 @@ use std::path::PathBuf;
 #[cfg(feature = "perf-tracing")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "perf-tracing")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -187,6 +188,8 @@ pub struct AppState {
     max_decode_tasks: usize,
     max_tile_tasks: usize,
     slow_tile_ms: Option<u64>,
+    request_slots: Arc<tokio::sync::Semaphore>,
+    request_timeout: Duration,
 }
 
 impl AppState {
@@ -209,7 +212,18 @@ impl AppState {
             max_decode_tasks: ReaderConfig::default().max_decode_tasks,
             max_tile_tasks: TilerConfig::default().max_blocking_tasks,
             slow_tile_ms: None,
+            request_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            request_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Bounds HTTP tile requests including lazy reader selection/opening.
+    pub fn with_request_tuning(mut self, max_in_flight: usize, timeout: Duration) -> Self {
+        self.request_slots = Arc::new(tokio::sync::Semaphore::new(
+            max_in_flight.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
+        ));
+        self.request_timeout = timeout;
+        self
     }
 
     pub fn with_runtime_tuning(
@@ -298,6 +312,11 @@ pub fn router(state: AppState) -> Router {
             "/mosaic/tiles/{tms}/{z}/{x}/{ye}",
             get(mosaic_tile_handler).options(cors_preflight),
         )
+        // Only tile routes: upstream /data self-fetches must not reacquire this pool.
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            request_admission,
+        ))
         .route("/datasets", get(datasets_handler))
         .route("/cache/stats", get(cache_stats_handler))
         .route("/formats", get(formats_handler))
@@ -309,6 +328,20 @@ pub fn router(state: AppState) -> Router {
                 .options(cors_preflight),
         )
         .with_state(state)
+}
+
+async fn request_admission(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Ok(_permit) = state.request_slots.clone().try_acquire_owned() else {
+        return error_response(AgError::Overloaded);
+    };
+    match tokio::time::timeout(state.request_timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => error_response(AgError::DeadlineExceeded),
+    }
 }
 
 pub async fn tile_handler(
@@ -675,10 +708,18 @@ pub async fn bounds_handler(
         Ok(t) => t,
         Err(e) => return error_response(e),
     };
+    let bands = match tiler.band_count() {
+        Ok(bands) => bands,
+        Err(error) => return error_response(error),
+    };
     match tiler.wgs84_bounds() {
         Ok([w, s, e, n]) => with_cors(
             (
-                [("content-type", "application/json")],
+                [
+                    ("content-type", "application/json".to_owned()),
+                    ("x-raster-bands", bands.to_string()),
+                    ("access-control-expose-headers", "x-raster-bands".to_owned()),
+                ],
                 format!("[{w},{s},{e},{n}]"),
             )
                 .into_response(),
@@ -724,7 +765,8 @@ fn parse_byte_range(h: &str, total: u64) -> Option<(u64, u64)> {
 
 /// `GET /data/{name}` serves a discovered local `*.tif` with bounded `Range`
 /// support so object_store's HTTP store can do ranged reads. Only names in
-/// the startup dataset list are served.
+/// the startup dataset list are served. Local validators assume files are
+/// replaced atomically; in-place mutation while serving is unsupported.
 pub async fn data_file_handler(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -737,19 +779,71 @@ pub async fn data_file_handler(
     let Some(dir) = state.data_dir.clone() else {
         return with_cors((StatusCode::NOT_FOUND, "no data dir").into_response());
     };
-    let path = dir.join(&name);
-    let mut file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => return with_cors((StatusCode::NOT_FOUND, format!("open: {e}")).into_response()),
-    };
-    let total = match file.metadata().await {
-        Ok(m) => m.len(),
+    use object_store::ObjectStore;
+    let store = match object_store::local::LocalFileSystem::new_with_prefix(&dir) {
+        Ok(store) => store,
         Err(e) => {
             return with_cors(
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("stat: {e}")).into_response(),
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("data dir: {e}")).into_response(),
             )
         }
     };
+    // LocalFileSystem obtains metadata and payload from the same opened file.
+    // Retain that handle through the range read, so an atomic path replacement
+    // cannot pair a new file's bytes with an old file's validator.
+    let result = match store
+        .get_opts(
+            &object_store::path::Path::from(name.as_str()),
+            Default::default(),
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return with_cors((StatusCode::NOT_FOUND, format!("open: {e}")).into_response()),
+    };
+    let total = result.meta.size;
+    let Some(tag) = result.meta.e_tag else {
+        return with_cors(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "local file has no validator",
+            )
+                .into_response(),
+        );
+    };
+    let etag = format!("\"{tag}\"");
+    if let Some(condition) = headers.get(header::IF_MATCH) {
+        let Ok(condition) = condition.to_str() else {
+            return with_cors((StatusCode::BAD_REQUEST, "invalid If-Match").into_response());
+        };
+        if condition.trim() != "*"
+            && !condition
+                .split(',')
+                .any(|candidate| candidate.trim() == etag)
+        {
+            return with_cors(
+                (
+                    StatusCode::PRECONDITION_FAILED,
+                    [
+                        (header::ETAG, etag),
+                        (header::CACHE_CONTROL, "no-store".into()),
+                    ],
+                    "snapshot changed",
+                )
+                    .into_response(),
+            );
+        }
+    }
+    let object_store::GetResultPayload::File(file, _) = result.payload else {
+        return with_cors(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "expected local file payload",
+            )
+                .into_response(),
+        );
+    };
+    let mut file = tokio::fs::File::from_std(file);
 
     // object_store's HTTP store issues a HEAD to learn the object size
     // before it ever does a ranged read. The size must be discoverable
@@ -761,6 +855,7 @@ pub async fn data_file_handler(
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CONTENT_LENGTH, total)
+            .header(header::ETAG, etag)
             .body(Body::empty());
         return match resp {
             Ok(r) => with_cors(r),
@@ -806,7 +901,8 @@ pub async fn data_file_handler(
         .status(status)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_LENGTH, len);
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::ETAG, etag);
     if status == StatusCode::PARTIAL_CONTENT {
         builder = builder.header(
             header::CONTENT_RANGE,
@@ -838,13 +934,16 @@ fn range_not_satisfiable(total: u64) -> Response {
 
 fn error_response(e: AgError) -> Response {
     let status = match &e {
+        AgError::Overloaded | AgError::ResourceLimit(_) => StatusCode::SERVICE_UNAVAILABLE,
+        AgError::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
+        AgError::Cancelled => StatusCode::REQUEST_TIMEOUT,
         AgError::Query { .. } | AgError::TileOutOfBounds { .. } => StatusCode::BAD_REQUEST,
         AgError::UnknownTms(_) | AgError::UnknownColormap(_) | AgError::UnsupportedPixel(_) => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    with_cors((status, e.to_string()).into_response())
+    with_cors((status, [("cache-control", "no-store")], e.to_string()).into_response())
 }
 
 fn with_cors(mut response: Response) -> Response {
@@ -871,6 +970,110 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn bounds_report_single_band_for_viewer_presets() {
+        let reader = CogReader::builder()
+            .snapshot_policy(async_geotiff::io::SnapshotPolicy::AssumeImmutable)
+            .open_object_store(
+                Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap()),
+                "tests/fixtures/uint16.tif",
+            )
+            .await
+            .unwrap();
+        let cache = Arc::new(BlockCache::new(async_geotiff::io::CacheConfig::default()));
+        let state = AppState::new(
+            Some(Arc::new(Tiler::new(Arc::new(reader)))),
+            None,
+            vec![],
+            "http://127.0.0.1:0",
+            cache,
+        );
+        let response = bounds_handler(State(state), Query(vec![])).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-raster-bands")
+                .expect("viewer needs actual band count"),
+            "1"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<Vec<f64>>(&body).unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn local_ranges_return_validators_and_reject_stale_if_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sample.tif"), b"abcdefgh").unwrap();
+        let cache = Arc::new(BlockCache::new(async_geotiff::io::CacheConfig::default()));
+        let state = AppState::new(
+            None,
+            Some(dir.path().to_owned()),
+            vec!["sample.tif".into()],
+            "http://127.0.0.1:0",
+            cache,
+        );
+        let head = data_file_handler(
+            State(state.clone()),
+            Path("sample.tif".into()),
+            Method::HEAD,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::OK);
+        let etag = head
+            .headers()
+            .get(header::ETAG)
+            .expect("HEAD must expose snapshot validator")
+            .clone();
+        assert!(!etag.to_str().unwrap().starts_with("W/"));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-4"));
+        headers.insert(header::IF_MATCH, etag.clone());
+        let response = data_file_handler(
+            State(state.clone()),
+            Path("sample.tif".into()),
+            Method::GET,
+            headers.clone(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::ETAG], etag);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-4/8");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"cde"
+        );
+        // Atomic replacement changes the opened file identity without an in-place mutation.
+        std::fs::write(dir.path().join("replacement.tif"), b"ABCDEFGH").unwrap();
+        std::fs::rename(
+            dir.path().join("replacement.tif"),
+            dir.path().join("sample.tif"),
+        )
+        .unwrap();
+        let stale = data_file_handler(
+            State(state.clone()),
+            Path("sample.tif".into()),
+            Method::GET,
+            headers,
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        let fresh = data_file_handler(
+            State(state),
+            Path("sample.tif".into()),
+            Method::HEAD,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_ne!(fresh.headers()[header::ETAG], etag);
     }
 
     #[test]

@@ -10,22 +10,18 @@ pub enum Resampling {
     /// Catmull-Rom bicubic (4-tap). Sharper than bilinear, sharper than
     /// Mitchell, default for most XYZ tile servers.
     Cubic,
-    /// Mitchell-Netravali bicubic (4-tap, B=1/3 C=1/3). Smoother than
-    /// Catmull-Rom — slightly blurrier but less ringing on edges.
-    /// Matches titiler's `resampling=cubic_spline`.
+    /// Cubic B-spline convolution (4-tap, B=1, C=0).
     CubicSpline,
-    /// Lanczos3 windowed sinc (6-tap). Highest quality, slowest of the
-    /// SIMD kernels. Matches titiler's `resampling=lanczos`.
+    /// Lanczos3 windowed sinc (6-tap).
     Lanczos,
     /// Box-filter mean over the source footprint a destination pixel
     /// covers: correct averaging antialiasing when downsampling, but
-    /// degrades to nearest-neighbour when upsampling (same behaviour as
-    /// GDAL / titiler `resampling=average`).
+    /// degrades to nearest-neighbour when both footprint axes are sub-pixel.
     Average,
     /// Majority (most-frequent) value over the source footprint a destination
     /// pixel covers — for categorical/classification rasters. Downsample-only:
     /// a sub-pixel footprint degrades to Nearest (never interpolates). Ties
-    /// resolve to the lowest value. Matches GDAL/titiler `resampling=mode`.
+    /// resolve to the lowest value.
     Mode,
 }
 
@@ -35,7 +31,7 @@ impl Resampling {
             "nearest" => Some(Self::Nearest),
             "bilinear" => Some(Self::Bilinear),
             "cubic" | "bicubic" => Some(Self::Cubic),
-            "cubic_spline" | "mitchell" => Some(Self::CubicSpline),
+            "cubic_spline" | "cubicspline" => Some(Self::CubicSpline),
             "lanczos" | "lanczos3" => Some(Self::Lanczos),
             "average" => Some(Self::Average),
             "mode" => Some(Self::Mode),
@@ -54,10 +50,9 @@ impl Resampling {
         self.sample_masked(view, None, col, row, fill)
     }
 
-    /// Like [`sample`] but bilinear/cubic skip neighbours marked invalid in
-    /// `valid` (and renormalises the remaining weights). When all 4
-    /// neighbours are invalid, returns `fill`. Matches GDAL `gdalwarp -wo
-    /// SAMPLE_GRID=YES` semantics for nodata-aware interpolation.
+    /// Like [`sample`] but skips invalid neighbours and renormalizes weights.
+    /// Cubic/Lanczos retain signed weights; non-positive or near-zero total
+    /// support returns `fill` to avoid unstable division at mask boundaries.
     #[inline]
     pub fn sample_masked(
         self,
@@ -69,6 +64,9 @@ impl Resampling {
     ) -> f64 {
         let (h, w) = (view.shape()[0] as i64, view.shape()[1] as i64);
         if w == 0 || h == 0 {
+            return fill;
+        }
+        if !col.is_finite() || !row.is_finite() {
             return fill;
         }
         if col < -0.5 || row < -0.5 || col > (w - 1) as f64 + 0.5 || row > (h - 1) as f64 + 0.5 {
@@ -105,7 +103,7 @@ impl Resampling {
         // not the mask reads. Kept strided to avoid complexity for no gain.
 
         match self {
-            Self::Nearest | Self::Mode => {
+            Self::Nearest | Self::Mode | Self::Average => {
                 let c = cf.round().clamp(0.0, (w - 1) as f64) as usize;
                 let r = rf.round().clamp(0.0, (h - 1) as f64) as usize;
                 if let Some(m) = valid {
@@ -115,10 +113,47 @@ impl Resampling {
                 }
                 get(r, c)
             }
-            // Cross-CRS sampler: all non-nearest kernels share the 4-tap
-            // bilinear path (PROJ error dominates; the SIMD wide kernels
-            // are exercised only in the same-CRS / subtile-affine fast path).
-            Self::Cubic | Self::Bilinear | Self::CubicSpline | Self::Lanczos | Self::Average => {
+            Self::Cubic | Self::CubicSpline | Self::Lanczos => {
+                let radius = if self == Self::Lanczos { 3 } else { 2 };
+                let weight = |x: f64| {
+                    let x = x.abs();
+                    match self {
+                        Self::Cubic if x < 1.0 => (1.5 * x - 2.5) * x * x + 1.0,
+                        Self::Cubic if x < 2.0 => ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0,
+                        Self::CubicSpline if x < 1.0 => (4.0 - 6.0 * x * x + 3.0 * x * x * x) / 6.0,
+                        Self::CubicSpline if x < 2.0 => (2.0 - x).powi(3) / 6.0,
+                        Self::Lanczos if x == 0.0 => 1.0,
+                        Self::Lanczos if x < 3.0 => {
+                            let p = std::f64::consts::PI * x;
+                            (p.sin() / p) * ((p / 3.0).sin() / (p / 3.0))
+                        }
+                        _ => 0.0,
+                    }
+                };
+                let mut sum = 0.0;
+                let mut total = 0.0;
+                for y in (rf.floor() as i64 - radius + 1)..=(rf.floor() as i64 + radius) {
+                    for x in (cf.floor() as i64 - radius + 1)..=(cf.floor() as i64 + radius) {
+                        let r = y.clamp(0, h - 1) as usize;
+                        let c = x.clamp(0, w - 1) as usize;
+                        if valid.is_some_and(|m| !m[[r, c]]) {
+                            continue;
+                        }
+                        let k = weight(cf - x as f64) * weight(rf - y as f64);
+                        if k == 0.0 {
+                            continue;
+                        }
+                        sum += k * get(r, c);
+                        total += k;
+                    }
+                }
+                if total > 1e-12 {
+                    sum / total
+                } else {
+                    fill
+                }
+            }
+            Self::Bilinear => {
                 let c0 = cf.floor() as usize;
                 let r0 = rf.floor() as usize;
                 let c1 = (c0 + 1).min(w as usize - 1);
@@ -178,7 +213,7 @@ impl Resampling {
     /// Box-mean over the source footprint `[sc-rx, sc+rx] x [sr-ry, sr+ry]`.
     /// `rx`/`ry` are half-footprint sizes in source pixels (from the warp
     /// Jacobian). When the footprint is below one source pixel the result
-    /// degenerates to bilinear (no pixel blocks on upsample). Averages only
+    /// degenerates to nearest. Partial source pixels use overlap area. Averages only
     /// `valid` pixels; all-invalid (or empty box) returns `fill`.
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -200,14 +235,16 @@ impl Resampling {
         if !sc.is_finite() || !sr.is_finite() {
             return fill;
         }
-        // Sub-pixel footprint => bilinear (reuses edge-clamp + mask logic).
-        if rx < 0.5 && ry < 0.5 {
-            return Self::Bilinear.sample_masked(view, valid, sc, sr, fill);
+        if !rx.is_finite() || !ry.is_finite() || rx <= 0.0 || ry <= 0.0 {
+            return fill;
         }
-        let c_lo = (sc - rx).floor().max(0.0) as usize;
-        let c_hi = ((sc + rx).ceil() as i64).clamp(0, w as i64 - 1) as usize;
-        let r_lo = (sr - ry).floor().max(0.0) as usize;
-        let r_hi = ((sr + ry).ceil() as i64).clamp(0, h as i64 - 1) as usize;
+        if rx < 0.5 && ry < 0.5 {
+            return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
+        }
+        let c_lo = (sc - rx + 0.5).floor().max(0.0) as usize;
+        let c_hi = ((sc + rx + 0.5).ceil() as i64).clamp(0, w as i64) as usize;
+        let r_lo = (sr - ry + 0.5).floor().max(0.0) as usize;
+        let r_hi = ((sr + ry + 0.5).ceil() as i64).clamp(0, h as i64) as usize;
 
         let contig = view.as_slice();
         let mask_contig = valid.as_ref().and_then(|m| m.as_slice());
@@ -216,9 +253,9 @@ impl Resampling {
             .as_ref()
             .is_none_or(|m| mask_contig.is_none() || m.is_standard_layout()));
         let mut sum = 0.0;
-        let mut count = 0usize;
-        for r in r_lo..=r_hi {
-            for c in c_lo..=c_hi {
+        let mut total = 0.0;
+        for r in r_lo..r_hi {
+            for c in c_lo..c_hi {
                 let ok = match (mask_contig, valid) {
                     (Some(s), _) => s[r * w + c],
                     (None, Some(m)) => m[[r, c]],
@@ -231,14 +268,136 @@ impl Resampling {
                     Some(s) => s[r * w + c],
                     None => view[[r, c]],
                 };
-                sum += val;
-                count += 1;
+                let dx = ((sc + rx).min(c as f64 + 0.5) - (sc - rx).max(c as f64 - 0.5)).max(0.0);
+                let dy = ((sr + ry).min(r as f64 + 0.5) - (sr - ry).max(r as f64 - 0.5)).max(0.0);
+                let area = dx * dy;
+                if area > 0.0 {
+                    sum += val * area;
+                    total += area;
+                }
             }
         }
-        if count == 0 {
-            fill
+        if total > 0.0 {
+            sum / total
         } else {
-            sum / count as f64
+            fill
+        }
+    }
+
+    /// Area-weighted sampling of a four-corner source pixel footprint.
+    pub fn sample_average_polygon(
+        self,
+        view: ArrayView2<f64>,
+        valid: Option<ArrayView2<bool>>,
+        corners: [(f64, f64); 4],
+        fill: f64,
+    ) -> f64 {
+        if corners
+            .iter()
+            .any(|&(x, y)| !x.is_finite() || !y.is_finite())
+        {
+            return fill;
+        }
+        let xmin = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let xmax = corners
+            .iter()
+            .map(|p| p.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let ymin = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let ymax = corners
+            .iter()
+            .map(|p| p.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let (sc, sr) = ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5);
+        if xmax - xmin < 1.0 && ymax - ymin < 1.0 {
+            return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
+        }
+        if corners[0].1 == corners[1].1
+            && corners[2].1 == corners[3].1
+            && corners[0].0 == corners[3].0
+            && corners[1].0 == corners[2].0
+        {
+            return self.sample_average(
+                view,
+                valid,
+                sc,
+                sr,
+                (xmax - xmin) * 0.5,
+                (ymax - ymin) * 0.5,
+                fill,
+            );
+        }
+        let (h, w) = view.dim();
+        let c0 = (xmin + 0.5).floor().max(0.0) as usize;
+        let c1 = (xmax + 0.5).ceil().clamp(0.0, w as f64) as usize;
+        let r0 = (ymin + 0.5).floor().max(0.0) as usize;
+        let r1 = (ymax + 0.5).ceil().clamp(0.0, h as f64) as usize;
+        let mut polygon = Vec::with_capacity(12);
+        let mut next = Vec::with_capacity(12);
+        let mut total = 0.0;
+        let mut sum = 0.0;
+        for r in r0..r1 {
+            for c in c0..c1 {
+                if valid.is_some_and(|m| !m[[r, c]]) {
+                    continue;
+                }
+                polygon.clear();
+                polygon.extend_from_slice(&corners);
+                for (axis, bound, keep_greater) in [
+                    (0, c as f64 - 0.5, true),
+                    (0, c as f64 + 0.5, false),
+                    (1, r as f64 - 0.5, true),
+                    (1, r as f64 + 0.5, false),
+                ] {
+                    next.clear();
+                    let coord = |p: (f64, f64)| if axis == 0 { p.0 } else { p.1 };
+                    let inside = |p: (f64, f64)| {
+                        if keep_greater {
+                            coord(p) >= bound
+                        } else {
+                            coord(p) <= bound
+                        }
+                    };
+                    if let Some(&last) = polygon.last() {
+                        let mut previous = last;
+                        for &point in &polygon {
+                            if inside(point) != inside(previous) {
+                                let t =
+                                    (bound - coord(previous)) / (coord(point) - coord(previous));
+                                next.push((
+                                    previous.0 + t * (point.0 - previous.0),
+                                    previous.1 + t * (point.1 - previous.1),
+                                ));
+                            }
+                            if inside(point) {
+                                next.push(point);
+                            }
+                            previous = point;
+                        }
+                    }
+                    std::mem::swap(&mut polygon, &mut next);
+                }
+                if polygon.len() < 3 {
+                    continue;
+                }
+                let mut twice_area = 0.0;
+                for i in 0..polygon.len() {
+                    let a = polygon[i];
+                    let b = polygon[(i + 1) % polygon.len()];
+                    twice_area +=
+                        (a.0 - c as f64) * (b.1 - r as f64) - (b.0 - c as f64) * (a.1 - r as f64);
+                }
+                let area = twice_area.abs() * 0.5;
+                if area > 0.0 {
+                    sum += area * view[[r, c]];
+                    total += area;
+                }
+            }
+        }
+        if total > 0.0 {
+            sum / total
+        } else {
+            fill
         }
     }
 
@@ -339,6 +498,63 @@ mod tests {
     }
 
     #[test]
+    fn convolution_kernels_have_distinct_reference_weights() {
+        let a = array![[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]];
+        assert_relative_eq!(
+            Resampling::Cubic.sample(a.view(), 2.5, 0.0, -1.0),
+            0.5625,
+            epsilon = 1e-12
+        );
+        assert_relative_eq!(
+            Resampling::CubicSpline.sample(a.view(), 2.5, 0.0, -1.0),
+            23.0 / 48.0,
+            epsilon = 1e-12
+        );
+        assert_relative_eq!(
+            Resampling::Lanczos.sample(a.view(), 2.5, 0.0, -1.0),
+            0.6114130434782609,
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn average_weights_partial_source_pixel_coverage() {
+        let a = array![[0.0, 10.0, 100.0]];
+        // Footprint [-0.25, 1.25] intersects pixel 0 by .75 and pixel 1 by .75;
+        // pixel 2 has no overlap at all.
+        assert_relative_eq!(
+            Resampling::Average.sample_average(a.view(), None, 0.5, 0.0, 0.75, 0.5, -1.0),
+            5.0
+        );
+        // Footprint [0, 1.5] weights pixel 0 by .5 and pixel 1 by 1.
+        assert_relative_eq!(
+            Resampling::Average.sample_average(a.view(), None, 0.75, 0.0, 0.75, 0.5, -1.0),
+            20.0 / 3.0
+        );
+    }
+
+    #[test]
+    fn average_rotated_footprint_uses_polygon_overlap() {
+        let a = array![[10.0, 10.0, 10.0], [10.0, 100.0, 10.0], [10.0, 10.0, 10.0]];
+        // Diamond area2: central cell area1, four axial cells area.25 each.
+        let corners = [(1.0, 0.0), (2.0, 1.0), (1.0, 2.0), (0.0, 1.0)];
+        assert_relative_eq!(
+            Resampling::Average.sample_average_polygon(a.view(), None, corners, -1.0),
+            55.0,
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn average_subpixel_uses_nearest() {
+        let a = array![[0.0, 10.0]];
+        assert_eq!(
+            Resampling::Average.sample_average(a.view(), None, 0.25, 0.0, 0.1, 0.1, -1.0),
+            0.0
+        );
+    }
+
+    #[test]
     fn out_of_bounds_returns_fill() {
         let a = array![[1.0]];
         assert_eq!(Resampling::Nearest.sample(a.view(), 5.0, 5.0, -1.0), -1.0);
@@ -351,6 +567,15 @@ mod tests {
         assert_eq!(Resampling::parse("bicubic"), Some(Resampling::Cubic));
         assert_eq!(Resampling::parse("foo"), None);
         assert_eq!(Resampling::parse("average"), Some(Resampling::Average));
+    }
+
+    #[test]
+    fn spline_name_does_not_alias_a_different_kernel() {
+        assert_eq!(
+            Resampling::parse("cubicspline"),
+            Some(Resampling::CubicSpline)
+        );
+        assert_eq!(Resampling::parse("mitchell"), None);
     }
 
     #[test]
@@ -391,11 +616,10 @@ mod tests {
     }
 
     #[test]
-    fn average_degenerates_to_bilinear() {
+    fn average_degenerates_to_nearest() {
         let a = array![[0.0, 10.0], [0.0, 10.0]];
         let avg = Resampling::Average.sample_average(a.view(), None, 0.5, 0.0, 0.3, 0.3, 0.0);
-        let bil = Resampling::Bilinear.sample_masked(a.view(), None, 0.5, 0.0, 0.0);
-        assert_eq!(avg, bil); // sub-1px footprint delegates to bilinear
+        assert_eq!(avg, 10.0); // sub-1px footprint chooses the nearest center
     }
 
     #[test]

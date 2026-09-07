@@ -88,16 +88,18 @@ impl GeoTransform {
         let inv = self.inverse()?;
         let (c0, r0) = inv.forward(bbox.xmin, bbox.ymax);
         let (c1, r1) = inv.forward(bbox.xmax, bbox.ymin);
+        let (c2, r2) = inv.forward(bbox.xmin, bbox.ymin);
+        let (c3, r3) = inv.forward(bbox.xmax, bbox.ymax);
         // Integer pixel cover of the projected footprint is
         // [floor(min), ceil(max)). Using ceil(max-min) (the raw span)
         // undercounts by 1 px whenever both endpoints are fractional —
         // the normal post-reprojection case — leaving the tile's
         // right/bottom edge unread → transparent seams between tiles,
         // amplified at coarse overviews by the upsample factor.
-        let cmin = c0.min(c1);
-        let cmax = c0.max(c1);
-        let rmin = r0.min(r1);
-        let rmax = r0.max(r1);
+        let cmin = c0.min(c1).min(c2).min(c3);
+        let cmax = c0.max(c1).max(c2).max(c3);
+        let rmin = r0.min(r1).min(r2).min(r3);
+        let rmax = r0.max(r1).max(r2).max(r3);
         let col_off = cmin.floor() as i64;
         let row_off = rmin.floor() as i64;
         let width = (cmax.ceil() - cmin.floor()) as u64;
@@ -108,6 +110,14 @@ impl GeoTransform {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sheared_window_covers_all_four_corners() {
+        let transform = super::GeoTransform::from_gdal(&[0.0, 1.0, 0.25, 0.0, 0.0, -1.0]);
+        assert_eq!(
+            transform.window_for_bbox(&super::Bbox::new(10.0, -20.0, 20.0, -10.0)),
+            Some((5, 10, 13, 10))
+        );
+    }
     use super::*;
     use approx::assert_relative_eq;
 

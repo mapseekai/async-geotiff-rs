@@ -1,6 +1,7 @@
 //! Top-level orchestrator: HTTP request → tile bytes.
 
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(feature = "perf-tracing")]
 use std::time::Instant;
 
@@ -16,6 +17,10 @@ use crate::perf::duration_ms;
 use crate::pixel::{ImageData, PixelData};
 use crate::render::composite::CompositeKind;
 use crate::render::pipeline::{render, CompiledTileStyle};
+use crate::request::{
+    RequestContext, RequestLimiter, RequestOptions, DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+    DEFAULT_REQUEST_TIMEOUT,
+};
 use crate::style::params::compile_cached;
 use crate::style::stretch::{fallback_rescale, resolve_rescale, Stretch};
 use crate::style::TileStyle;
@@ -30,10 +35,14 @@ const PASSTHROUGH_PIXEL_TOLERANCE: f64 = 1e-3;
 /// inserted — per-tile fallback/expression stretches never enter it.
 type EffectiveMemo = moka::sync::Cache<String, Arc<CompiledTileStyle>>;
 
+#[derive(Clone)]
 pub struct Tiler {
     reader: Arc<CogReader>,
     cpu: CpuLimiter,
-    stats: OnceCell<Option<Arc<DatasetStats>>>,
+    stats: Arc<OnceCell<Option<Arc<DatasetStats>>>>,
+    requests: RequestLimiter,
+    request_timeout: Duration,
+    work_budget: crate::resource::WorkBudget,
     /// See [`EffectiveMemo`]. Shared into the fused CPU job per tile; reused
     /// across tiles so per-style work (rescale resolution, render LUT builds
     /// hanging off the compiled style) amortizes instead of repeating per tile.
@@ -47,12 +56,18 @@ pub struct Tiler {
 #[derive(Clone, Copy, Debug)]
 pub struct TilerConfig {
     pub max_blocking_tasks: usize,
+    /// Maximum admitted public requests; excess requests fail immediately.
+    pub max_in_flight_requests: usize,
+    /// Includes IO and waits for CPU permits. Blocking work stops at stage boundaries.
+    pub request_timeout: Duration,
 }
 
 impl Default for TilerConfig {
     fn default() -> Self {
         Self {
             max_blocking_tasks: default_blocking_permits(),
+            max_in_flight_requests: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 }
@@ -104,10 +119,14 @@ impl Tiler {
     /// [`Self::with_config`] to give a single-source tiler its own bound.
     pub fn new(reader: Arc<CogReader>) -> Self {
         let cpu = reader.cpu_limiter();
+        let work_budget = reader.work_budget();
         Self {
             reader,
             cpu,
-            stats: OnceCell::new(),
+            stats: Arc::new(OnceCell::new()),
+            requests: RequestLimiter::default(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            work_budget,
             effective_memo: Arc::new(EffectiveMemo::new(32)),
         }
     }
@@ -116,12 +135,45 @@ impl Tiler {
     /// `config.max_blocking_tasks` (does not share the reader's limiter). Prefer
     /// [`Self::new`] when you want one shared process/mosaic-wide budget.
     pub fn with_config(reader: Arc<CogReader>, config: TilerConfig) -> Self {
+        let work_budget = reader.work_budget();
         Self {
             reader,
             cpu: CpuLimiter::new(config.blocking_task_limit()),
-            stats: OnceCell::new(),
+            stats: Arc::new(OnceCell::new()),
+            requests: RequestLimiter::new(config.max_in_flight_requests),
+            request_timeout: config.request_timeout,
+            work_budget,
             effective_memo: Arc::new(EffectiveMemo::new(32)),
         }
+    }
+
+    /// Share admission across multiple datasets or a serving application.
+    pub fn with_request_limiter(mut self, requests: RequestLimiter) -> Self {
+        self.requests = requests;
+        self
+    }
+
+    /// Share a byte budget for active source, warp, and render buffers.
+    pub fn with_work_budget(mut self, work_budget: crate::resource::WorkBudget) -> Self {
+        self.work_budget = work_budget;
+        self
+    }
+
+    /// Number of renderable bands after an ExtraSamples alpha channel is removed.
+    pub fn band_count(&self) -> AgResult<usize> {
+        use async_tiff::tags::ExtraSamples;
+        let ifd = self.reader.data_ifd(0)?;
+        let samples = usize::from(ifd.samples_per_pixel());
+        let alpha = ifd.extra_samples().is_some_and(|extras| {
+            extras.len() <= samples
+                && extras.iter().any(|sample| {
+                    matches!(
+                        sample,
+                        ExtraSamples::AssociatedAlpha | ExtraSamples::UnassociatedAlpha
+                    )
+                })
+        });
+        Ok(samples - usize::from(alpha))
     }
 
     /// WGS84 `[west, south, east, north]` extent of the dataset.
@@ -203,11 +255,28 @@ impl Tiler {
             }
         }
 
-        let raw = if aligned {
-            (rc, rr, rw, rh)
+        let kernel = if same_crs {
+            style.resampling
         } else {
-            (rc - 1, rr - 1, rw + 2, rh + 2)
+            style.reproject
         };
+        let halo = match kernel {
+            crate::warp::resampler::Resampling::Lanczos => 3,
+            crate::warp::resampler::Resampling::Cubic
+            | crate::warp::resampler::Resampling::CubicSpline => 2,
+            crate::warp::resampler::Resampling::Nearest => 0,
+            _ => 1,
+        };
+        let raw = (
+            rc.checked_sub(halo)
+                .ok_or_else(|| AgError::Warp("column halo overflow".into()))?,
+            rr.checked_sub(halo)
+                .ok_or_else(|| AgError::Warp("row halo overflow".into()))?,
+            rw.checked_add(2 * halo as u64)
+                .ok_or_else(|| AgError::Warp("width halo overflow".into()))?,
+            rh.checked_add(2 * halo as u64)
+                .ok_or_else(|| AgError::Warp("height halo overflow".into()))?,
+        );
         let (col, row, w, h) = self.clamp_window(level, raw.0, raw.1, raw.2, raw.3)?;
         if w == 0 || h == 0 {
             return Ok(None);
@@ -233,17 +302,50 @@ impl Tiler {
         coord: TileCoord,
         style: &TileStyle,
     ) -> AgResult<Option<Arc<ImageData>>> {
+        self.warp_tile_with_options(coord, style, &RequestOptions::default())
+            .await
+    }
+
+    /// Warp with a per-call deadline override and explicit cancellation handle.
+    pub async fn warp_tile_with_options(
+        &self,
+        coord: TileCoord,
+        style: &TileStyle,
+        options: &RequestOptions,
+    ) -> AgResult<Option<Arc<ImageData>>> {
+        self.requests
+            .run(self.request_timeout, options, |context| async move {
+                self.warp_tile_in_request(coord, style, &context).await
+            })
+            .await
+    }
+
+    pub(crate) async fn warp_tile_in_request(
+        &self,
+        coord: TileCoord,
+        style: &TileStyle,
+        context: &RequestContext,
+    ) -> AgResult<Option<Arc<ImageData>>> {
+        context.check()?;
         #[cfg(feature = "perf-tracing")]
         let started = Instant::now();
-        let Some(plan) = self.plan_tile(coord, style)? else {
+        compile_cached(style).await?;
+        let Some(plan) = self.plan_tile_async(coord, style, context).await? else {
             return Ok(None);
         };
+        let bands = u64::from(self.reader.data_ifd(plan.level)?.samples_per_pixel());
+        let bytes = tile_work_bytes(plan.w, plan.h, bands, u64::from(style.tilesize))?;
+        let context = &context.with_work(self.work_budget.try_reserve(bytes)?);
         #[cfg(feature = "perf-tracing")]
         let planned = started.elapsed();
-        let src: Arc<ImageData> = self
+        let mut src: Arc<ImageData> = self
             .reader
             .read_window(plan.level, plan.col, plan.row, plan.w, plan.h)
             .await?;
+        context.check()?;
+        if let Some(nodata) = style.nodata {
+            Arc::make_mut(&mut src).nodata = Some(nodata);
+        }
         #[cfg(feature = "perf-tracing")]
         let read_done = started.elapsed();
         if plan.passthrough {
@@ -261,6 +363,14 @@ impl Tiler {
                     "warp_tile timing"
                 );
             }
+            if style.unscale {
+                let scales = self.reader.band_scale_offset().to_vec();
+                return self
+                    .run_tile_cpu(context, "unscale", move || {
+                        Ok(Some(Arc::new(unscale_image(&src, &scales))))
+                    })
+                    .await;
+            }
             return Ok(Some(src));
         }
 
@@ -272,9 +382,18 @@ impl Tiler {
         };
         let dst_crs = plan.dst_crs.clone();
         let dst_bbox = plan.dst_bbox;
+        let scales = self.reader.band_scale_offset().to_vec();
+        let unscale = style.unscale;
+        let cancellation = context.clone();
         let warped: ImageData = match self
-            .run_tile_cpu("warp", move || {
-                warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)
+            .run_tile_cpu(context, "warp", move || {
+                let image = warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)?;
+                cancellation.check()?;
+                Ok(if unscale {
+                    unscale_image(&image, &scales)
+                } else {
+                    image
+                })
             })
             .await
         {
@@ -314,9 +433,38 @@ impl Tiler {
         err
     ))]
     pub async fn tile(&self, coord: TileCoord, style: &TileStyle) -> AgResult<Option<Bytes>> {
+        self.tile_with_options(coord, style, &RequestOptions::default())
+            .await
+    }
+
+    /// Render with a per-call deadline override and explicit cancellation handle.
+    pub async fn tile_with_options(
+        &self,
+        coord: TileCoord,
+        style: &TileStyle,
+        options: &RequestOptions,
+    ) -> AgResult<Option<Bytes>> {
+        self.requests
+            .run(self.request_timeout, options, |context| async move {
+                self.tile_in_request(coord, style, &context).await
+            })
+            .await
+    }
+
+    pub(crate) async fn tile_in_request(
+        &self,
+        coord: TileCoord,
+        style: &TileStyle,
+        context: &RequestContext,
+    ) -> AgResult<Option<Bytes>> {
+        context.check()?;
         #[cfg(feature = "perf-tracing")]
         let started = Instant::now();
-        let Some(plan) = self.plan_tile(coord, style)? else {
+        let mut compiled = compile_cached(style).await?;
+        if style.unscale {
+            Arc::make_mut(&mut compiled).nodata = None;
+        }
+        let Some(plan) = self.plan_tile_async(coord, style, context).await? else {
             crate::perf_trace! {
                 tracing::debug!(
                     total_ms = duration_ms(started.elapsed()),
@@ -325,16 +473,22 @@ impl Tiler {
             }
             return Ok(None);
         };
+        let bands = u64::from(self.reader.data_ifd(plan.level)?.samples_per_pixel());
+        let bytes = tile_work_bytes(plan.w, plan.h, bands, u64::from(style.tilesize))?;
+        let context = &context.with_work(self.work_budget.try_reserve(bytes)?);
         #[cfg(feature = "perf-tracing")]
         let planned = started.elapsed();
-        let src: Arc<ImageData> = self
+        let mut src: Arc<ImageData> = self
             .reader
             .read_window(plan.level, plan.col, plan.row, plan.w, plan.h)
             .await?;
+        context.check()?;
+        if let Some(nodata) = style.nodata {
+            Arc::make_mut(&mut src).nodata = Some(nodata);
+        }
         #[cfg(feature = "perf-tracing")]
         let read_done = started.elapsed();
 
-        let compiled = compile_cached(style).await?;
         // Prefetch dataset stats (memoized after the first tile) whenever the
         // effective style may need them, so the fused CPU job below resolves
         // the style synchronously. The u8-no-stretch default never loads them
@@ -358,8 +512,9 @@ impl Tiler {
         let compiled2 = Arc::clone(&compiled);
         let scale_offset = self.reader.band_scale_offset().to_vec();
         let memo = Arc::clone(&self.effective_memo);
+        let cancellation = context.clone();
         let fused = self
-            .run_tile_cpu("tile", move || {
+            .run_tile_cpu(context, "tile", move || {
                 let img: Arc<ImageData> = if plan.passthrough {
                     src
                 } else {
@@ -374,11 +529,13 @@ impl Tiler {
                         Err(e) => return Err(e),
                     }
                 };
+                cancellation.check()?;
                 let img = if style_owned.unscale {
                     Arc::new(unscale_image(&img, &scale_offset))
                 } else {
                     img
                 };
+                cancellation.check()?;
                 let effective = match effective_compiled_sync(
                     &style_owned,
                     &compiled2,
@@ -390,6 +547,7 @@ impl Tiler {
                     EffectiveOutcome::Ready(c) => c,
                     EffectiveOutcome::NeedStats => return Ok(FusedOut::NeedStats(img)),
                 };
+                cancellation.check()?;
                 Ok(FusedOut::Bytes(render(&img, &effective)?))
             })
             .await?;
@@ -401,21 +559,28 @@ impl Tiler {
                 // to f64) so stats weren't prefetched. Load them and re-render
                 // — the warp is NOT repeated, only the style+render hop.
                 let stats = self.dataset_stats().await?;
-                let effective = match effective_compiled_sync(
-                    style,
-                    &compiled,
-                    &img,
-                    Some(&stats),
-                    self.reader.band_scale_offset(),
-                    &self.effective_memo,
-                )? {
-                    EffectiveOutcome::Ready(c) => c,
-                    EffectiveOutcome::NeedStats => {
-                        return Err(AgError::Warp("effective style demanded stats twice".into()))
-                    }
-                };
-                self.run_tile_cpu("render", move || render(&img, &effective))
-                    .await?
+                let style = style.clone();
+                let scales = self.reader.band_scale_offset().to_vec();
+                let memo = self.effective_memo.clone();
+                self.run_tile_cpu(context, "render", move || {
+                    let effective = match effective_compiled_sync(
+                        &style,
+                        &compiled,
+                        &img,
+                        Some(&stats),
+                        &scales,
+                        &memo,
+                    )? {
+                        EffectiveOutcome::Ready(c) => c,
+                        EffectiveOutcome::NeedStats => {
+                            return Err(AgError::Warp(
+                                "effective style demanded stats twice".into(),
+                            ))
+                        }
+                    };
+                    render(&img, &effective)
+                })
+                .await?
             }
         };
         #[cfg(feature = "perf-tracing")]
@@ -433,6 +598,18 @@ impl Tiler {
         Ok(Some(bytes))
     }
 
+    async fn plan_tile_async(
+        &self,
+        coord: TileCoord,
+        style: &TileStyle,
+        context: &RequestContext,
+    ) -> AgResult<Option<ReadyPlan>> {
+        let this = self.clone();
+        let style = style.clone();
+        self.run_tile_cpu(context, "plan", move || this.plan_tile(coord, &style))
+            .await
+    }
+
     /// Run a pure-CPU closure `f` under one [`CpuLimiter`] permit.
     ///
     /// INVARIANT (deadlock-freedom): `f` must be **pure synchronous CPU** and
@@ -443,19 +620,29 @@ impl Tiler {
     /// their decode permits in the async layer *before* `run_tile_cpu` is called,
     /// so warp/render here never nest acquisition. Were `f` to await a second
     /// permit, N permit-holding jobs could starve all remaining acquisitions.
-    async fn run_tile_cpu<T, F>(&self, label: &'static str, f: F) -> AgResult<T>
+    async fn run_tile_cpu<T, F>(
+        &self,
+        context: &RequestContext,
+        label: &'static str,
+        f: F,
+    ) -> AgResult<T>
     where
         T: Send + 'static,
         F: FnOnce() -> AgResult<T> + Send + 'static,
     {
+        context.check()?;
         let permit = self
             .cpu
             .acquire()
             .await
             .map_err(|_| AgError::Warp(format!("{label} cpu limiter closed")))?;
+        let context = context.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            f()
+            context.check()?;
+            let result = f();
+            context.check()?;
+            result
         })
         .await
         .map_err(|e| AgError::Warp(format!("{label} join: {e}")))?
@@ -474,6 +661,12 @@ impl Tiler {
         dst_bbox: &Bbox,
         ts: usize,
     ) -> Option<(i64, i64)> {
+        let (x0, y0) = level_tr.forward(0.0, 0.0);
+        let (x1, y1) = level_tr.forward(1.0, 0.0);
+        let (x2, y2) = level_tr.forward(0.0, 1.0);
+        if !(x1 > x0 && y2 < y0 && y1 == y0 && x2 == x0) {
+            return None;
+        }
         let inv = level_tr.inverse()?;
         // Top-left and bottom-right corners → source pixel coords.
         let (c0, r0) = inv.forward(dst_bbox.xmin, dst_bbox.ymax);
@@ -492,23 +685,24 @@ impl Tiler {
         Some((c0.round() as i64, r0.round() as i64))
     }
 
-    /// Reproject a bbox synchronously — 4 corner points through PROJ (or the
-    /// 4326↔3857 direct formula). At a microsecond or two of work it's far
-    /// cheaper to run inline than to pay tokio's spawn_blocking dispatch.
+    /// Reproject a bbox boundary synchronously, sampling curved edges and
+    /// retaining valid portions of partially out-of-domain requests.
     /// Used only on the cross-CRS path; same-CRS callers don't reach here.
     fn reproject_bbox_sync(
         bbox: &crate::bounds::Bbox,
         from_crs: &crate::crs::Crs,
         src_crs: &crate::crs::Crs,
     ) -> AgResult<Bbox> {
-        let mut pts = [
-            (bbox.xmin, bbox.ymin),
-            (bbox.xmax, bbox.ymin),
-            (bbox.xmax, bbox.ymax),
-            (bbox.xmin, bbox.ymax),
-        ];
-        crate::warp::projection::convert_batch(from_crs, src_crs, &mut pts)?;
-        Ok(Bbox::from_corners(&pts))
+        crate::warp::projection::reproject_boundary(
+            [
+                (bbox.xmin, bbox.ymin),
+                (bbox.xmax, bbox.ymin),
+                (bbox.xmax, bbox.ymax),
+                (bbox.xmin, bbox.ymax),
+            ],
+            from_crs,
+            src_crs,
+        )
     }
 
     /// Clamp pixel window to the IFD extent; returns (0, 0, 0, 0)-equivalent
@@ -532,6 +726,27 @@ impl Tiler {
         let h = (row_end - row).max(0) as u64;
         Ok((col, row, w, h))
     }
+}
+
+/// Conservative live working-set estimate: source/promotion and overlapping
+/// warp rows, output, unscale, render, encoding and coordinate/mask buffers.
+fn tile_work_bytes(width: u64, height: u64, bands: u64, tile_size: u64) -> AgResult<u64> {
+    width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(bands))
+        .and_then(|n| n.checked_mul(16))
+        .and_then(|source| {
+            tile_size
+                .checked_mul(tile_size)
+                .and_then(|pixels| {
+                    bands
+                        .checked_mul(48)
+                        .and_then(|per_band| per_band.checked_add(48))
+                        .and_then(|per_pixel| pixels.checked_mul(per_pixel))
+                })
+                .and_then(|tile| source.checked_add(tile))
+        })
+        .ok_or_else(|| AgError::ResourceLimit("tile working-set estimate overflow".into()))
 }
 
 /// Resolve the effective rescale and inject it into a cloned
@@ -588,7 +803,7 @@ fn effective_compiled_sync(
                 } else {
                     compiled.bidx.clone()
                 };
-                let ranges = fallback_rescale(&image.pixels, image.nodata, &bidx);
+                let ranges = fallback_image_rescale(image, &bidx);
                 let mut next = (**compiled).clone();
                 next.rescale = ranges.clone();
                 next.composite.vmin = Some(ranges.iter().map(|range| range.0).collect());
@@ -631,16 +846,16 @@ fn effective_compiled_sync(
             let r = resolve_rescale(&spec, stats, &bidx);
             // Empty → malformed stats (no bands); degrade gracefully.
             if r.is_empty() {
-                fallback_rescale(&image.pixels, image.nodata, &bidx)
+                fallback_image_rescale(image, &bidx)
             } else {
                 from_stats = true;
                 r
             }
         }
-        None => fallback_rescale(&image.pixels, image.nodata, &bidx),
+        None => fallback_image_rescale(image, &bidx),
     };
 
-    let ranges = if style.unscale {
+    let ranges = if style.unscale && from_stats {
         unscale_ranges(&ranges, &bidx, scale_offset)
     } else {
         ranges
@@ -659,6 +874,53 @@ fn effective_compiled_sync(
         memo.insert(memo_key, Arc::clone(&next));
     }
     Ok(Ready(next))
+}
+
+fn fallback_image_rescale(image: &ImageData, bidx: &[usize]) -> Vec<(f64, f64)> {
+    if !matches!(image.pixels, PixelData::F32(_) | PixelData::F64(_)) {
+        return fallback_rescale(&image.pixels, image.nodata, bidx);
+    }
+    let stats = crate::io::stats::band_stats_from_image(image, 1);
+    bidx.iter()
+        .map(|&b| match stats.get(b) {
+            Some(s) if s.max > s.min => (s.min, s.max),
+            _ => (0.0, 1.0),
+        })
+        .collect()
+}
+
+/// Mosaic stretches are derived from the reduced tile; source dataset stats
+/// cannot be mixed when assets have different scale/offset metadata.
+#[cfg(feature = "mosaic")]
+pub(crate) fn render_composite(
+    image: &ImageData,
+    style: &TileStyle,
+    compiled: &Arc<CompiledTileStyle>,
+) -> AgResult<Bytes> {
+    let memo = EffectiveMemo::new(1);
+    let mut physical_style = style.clone();
+    physical_style.unscale = false;
+    let mut compiled = (**compiled).clone();
+    // Request nodata was applied before warping, so reduction's mask/NaNs
+    // carry validity even when per-source values have been unscaled.
+    compiled.nodata = None;
+    let stats = (style.rescale.is_empty() && style.expression.is_none()).then(|| {
+        Arc::new(DatasetStats {
+            bands: crate::io::stats::band_stats_from_image(image, 256),
+            provenance: crate::io::stats::Provenance::Estimated,
+        })
+    });
+    match effective_compiled_sync(
+        &physical_style,
+        &Arc::new(compiled),
+        image,
+        Some(&stats),
+        &[],
+        &memo,
+    )? {
+        EffectiveOutcome::Ready(effective) => render(image, &effective),
+        EffectiveOutcome::NeedStats => unreachable!("stats explicitly supplied"),
+    }
 }
 
 /// Stable per-variant tag for memo keys.
@@ -708,6 +970,9 @@ fn expression_rescale(
     let mut hi = f64::NEG_INFINITY;
     for r in 0..h {
         for c in 0..w {
+            if image.mask.as_ref().is_some_and(|mask| !mask[[r, c]]) {
+                continue;
+            }
             for b in 0..bands {
                 px[b] = src[[b, r, c]];
             }
@@ -738,27 +1003,24 @@ fn unscale_image(img: &ImageData, scale_offset: &[ScaleOffset]) -> ImageData {
             .get(b)
             .copied()
             .unwrap_or(ScaleOffset::IDENTITY);
-        if !so.is_identity() {
-            band.mapv_inplace(|v| so.apply(v));
-        }
+        band.mapv_inplace(|v| {
+            if !v.is_finite()
+                || img
+                    .nodata
+                    .is_some_and(|nd| v == nd || (v - nd).abs() < 1e-9)
+            {
+                f64::NAN
+            } else {
+                so.apply(v)
+            }
+        });
     }
-    // The nodata sentinel is compared by VALUE in render's compute_valid_mask.
-    // Pixels are unscaled, so the sentinel must move to physical space too, or
-    // interior nodata pixels (for COGs without a mask IFD) render opaque.
-    // GDAL stores one nodata value for all bands → use band 0's affine.
-    let nodata_physical = img.nodata.map(|nd| {
-        scale_offset
-            .first()
-            .copied()
-            .unwrap_or(ScaleOffset::IDENTITY)
-            .apply(nd)
-    });
     ImageData {
         pixels: PixelData::F64(data),
         mask: img.mask.clone(),
         crs: img.crs.clone(),
         transform: img.transform,
-        nodata: nodata_physical,
+        nodata: Some(f64::NAN),
         bbox: img.bbox,
     }
 }
@@ -779,13 +1041,29 @@ fn unscale_ranges(
                 .get(b)
                 .copied()
                 .unwrap_or(ScaleOffset::IDENTITY);
-            (so.apply(lo), so.apply(hi))
+            let (lo, hi) = (so.apply(lo), so.apply(hi));
+            (lo.min(hi), lo.max(hi))
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passthrough_rejects_flipped_and_rotated_grids() {
+        let bbox = crate::bounds::Bbox::new(0.0, 0.0, 256.0, 256.0);
+        for gt in [
+            [256.0, -1.0, 0.0, 256.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0, 256.0, -1.0, 0.0],
+        ] {
+            assert!(super::Tiler::passthrough_window(
+                &crate::bounds::GeoTransform::from_gdal(&gt),
+                &bbox,
+                256
+            )
+            .is_none());
+        }
+    }
     use super::{expression_rescale, unscale_image, unscale_ranges, Tiler, TilerConfig};
     use crate::bounds::{Bbox, GeoTransform};
     use crate::io::ScaleOffset;
@@ -823,18 +1101,14 @@ mod tests {
 
         let tif = std::env::current_dir()
             .unwrap()
-            .join("data/cog_uint8_rgb_nodata.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
+            .join("tests/fixtures/rgb_nodata.tif");
+
         let os_path = OsPath::from_filesystem_path(&tif).unwrap();
-        let reader = CogReader::open_with_reader(ObjectReader::new(
-            Arc::new(LocalFileSystem::new()),
-            os_path,
-        ))
-        .await
-        .unwrap();
+        let reader = CogReader::builder()
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open(ObjectReader::new(Arc::new(LocalFileSystem::new()), os_path))
+            .await
+            .unwrap();
         let tiler = Tiler::new(Arc::new(reader));
         let style = TileStyle::from_query("").unwrap();
         let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
@@ -885,6 +1159,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires optional 904 MiB local JL1 fixture"]
     async fn local_jl1_cog_center_tile_is_not_opaque_black() {
         use crate::io::CogReader;
         use crate::style::TileStyle;
@@ -897,17 +1172,13 @@ mod tests {
         let tif = std::env::current_dir()
             .unwrap()
             .join("data/JL1GF04A_PMS_20230301124138_3857_cog.tif");
-        if !tif.exists() {
-            eprintln!("fixture missing, skipping");
-            return;
-        }
+
         let os_path = OsPath::from_filesystem_path(&tif).unwrap();
-        let reader = CogReader::open_with_reader(ObjectReader::new(
-            Arc::new(LocalFileSystem::new()),
-            os_path,
-        ))
-        .await
-        .unwrap();
+        let reader = CogReader::builder()
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open(ObjectReader::new(Arc::new(LocalFileSystem::new()), os_path))
+            .await
+            .unwrap();
         let tiler = Tiler::new(Arc::new(reader));
         let style =
             TileStyle::from_query("bidx=1&resampling=bilinear&reproject=bilinear&tilesize=256")
@@ -937,6 +1208,7 @@ mod tests {
     fn tiler_config_clamps_blocking_limit_to_one() {
         let cfg = TilerConfig {
             max_blocking_tasks: 0,
+            ..Default::default()
         };
         assert_eq!(cfg.blocking_task_limit(), 1);
     }
@@ -989,7 +1261,7 @@ mod tests {
         assert_eq!(f[[0, 0, 0]], 10.0 * 0.1 + 1.0);
         assert_eq!(f[[0, 0, 1]], 20.0 * 0.1 + 1.0);
         assert_eq!(f[[1, 0, 0]], 1.0 * 2.0);
-        assert_eq!(out.nodata, Some(-9999.0 * 0.1 + 1.0)); // sentinel moved to physical space
+        assert!(out.nodata.unwrap().is_nan());
     }
 
     #[test]
@@ -1007,11 +1279,206 @@ mod tests {
         };
         let out = unscale_image(&img, &[so(0.1, 1.0)]);
         let f = out.pixels.to_f64();
-        // the transformed nodata pixel must still equal the transformed sentinel,
-        // so render's value-based nodata masking keeps working.
-        assert_eq!(f[[0, 0, 1]], out.nodata.unwrap());
+        // Invalid raw samples stay invalid across different band affines.
+        assert!(f[[0, 0, 1]].is_nan());
         // and a valid pixel is unaffected by the sentinel.
         assert_eq!(f[[0, 0, 0]], 50.0 * 0.1 + 1.0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_cpu_stage_keeps_all_permits_until_it_exits() {
+        use crate::request::{RequestLimiter, RequestOptions};
+        let reader = crate::io::CogReader::builder()
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open_object_store(
+                std::sync::Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(".").unwrap(),
+                ),
+                "tests/fixtures/rgb_nodata.tif",
+            )
+            .await
+            .unwrap();
+        let tiler = Tiler::with_config(
+            std::sync::Arc::new(reader),
+            TilerConfig {
+                max_blocking_tasks: 1,
+                ..Default::default()
+            },
+        );
+        let cpu = tiler.cpu.clone();
+        let admission = RequestLimiter::new(1);
+        let task_admission = admission.clone();
+        let budget = crate::resource::WorkBudget::new(100);
+        let task_budget = budget.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            task_admission
+                .run(
+                    std::time::Duration::from_secs(30),
+                    &RequestOptions::default(),
+                    |context| async move {
+                        let context = context.with_work(task_budget.try_reserve(70).unwrap());
+                        tiler
+                            .run_tile_cpu(&context, "held test stage", move || {
+                                entered_tx.send(()).unwrap();
+                                release_rx.recv().unwrap();
+                                Ok(())
+                            })
+                            .await
+                    },
+                )
+                .await
+        });
+        entered_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(cpu.available_permits(), 0);
+        assert_eq!(admission.available_permits(), 0);
+        assert_eq!(budget.used_bytes(), 70);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while cpu.available_permits() != 1
+                || admission.available_permits() != 1
+                || budget.used_bytes() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tile_rejects_work_budget_before_reading_pixels() {
+        let reader = crate::io::CogReader::builder()
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open_object_store(
+                std::sync::Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(".").unwrap(),
+                ),
+                "tests/fixtures/rgb_nodata.tif",
+            )
+            .await
+            .unwrap();
+        let budget = crate::resource::WorkBudget::new(1);
+        let tiler = Tiler::new(std::sync::Arc::new(reader)).with_work_budget(budget.clone());
+        let (x, y) = lonlat_to_tile(10.032, 20.032, 18);
+        let coord = crate::tms::TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z: 18,
+            x,
+            y,
+        };
+        assert!(matches!(
+            tiler.tile(coord, &crate::style::TileStyle::default()).await,
+            Err(crate::error::AgError::ResourceLimit(_))
+        ));
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn lanczos_plan_reads_full_kernel_halo() {
+        let reader = crate::io::CogReader::builder()
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open_object_store(
+                std::sync::Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(".").unwrap(),
+                ),
+                "tests/fixtures/rgb_nodata.tif",
+            )
+            .await
+            .unwrap();
+        let tiler = Tiler::new(std::sync::Arc::new(reader));
+        let (x, y) = lonlat_to_tile(10.032, 20.032, 18);
+        let coord = crate::tms::TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z: 18,
+            x,
+            y,
+        };
+        let nearest = tiler
+            .plan_tile(coord, &crate::style::TileStyle::default())
+            .unwrap()
+            .unwrap();
+        let lanczos = tiler
+            .plan_tile(
+                coord,
+                &crate::style::TileStyle::from_query("reproject=lanczos").unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(lanczos.col <= nearest.col - 3 && lanczos.row <= nearest.row - 3);
+        assert!(lanczos.w >= nearest.w + 6 && lanczos.h >= nearest.h + 6);
+    }
+
+    #[tokio::test]
+    async fn request_nodata_is_applied_before_interpolation() {
+        let store = std::sync::Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(".").unwrap(),
+        );
+        let reader = crate::io::CogReader::builder()
+            .snapshot_policy(crate::io::SnapshotPolicy::AssumeImmutable)
+            .open_object_store(store, "tests/fixtures/rgb_nodata.tif")
+            .await
+            .unwrap();
+        let tiler = Tiler::new(std::sync::Arc::new(reader));
+        let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
+        let (x, y) = lonlat_to_tile((w + e) / 2.0, (s + n) / 2.0, 12);
+        let coord = crate::tms::TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z: 12,
+            x,
+            y,
+        };
+        let style = crate::style::TileStyle::from_query("nodata=100&reproject=bilinear").unwrap();
+        let plan = tiler.plan_tile(coord, &style).unwrap().unwrap();
+        let mut source = (*tiler
+            .reader
+            .read_window(plan.level, plan.col, plan.row, plan.w, plan.h)
+            .await
+            .unwrap())
+        .clone();
+        source.nodata = Some(100.0);
+        let expected = crate::warp::warp(
+            &source,
+            &plan.dst_crs,
+            plan.dst_bbox,
+            256,
+            256,
+            style.reproject,
+        )
+        .unwrap();
+        let actual = tiler.warp_tile(coord, &style).await.unwrap().unwrap();
+        for (a, b) in actual
+            .pixels
+            .to_f64()
+            .iter()
+            .zip(expected.pixels.to_f64().iter())
+        {
+            assert!(a == b || (a.is_nan() && b.is_nan()));
+        }
+    }
+
+    #[test]
+    fn unscale_preserves_invalidity_with_different_band_affines() {
+        let img = crate::pixel::ImageData {
+            pixels: crate::pixel::PixelData::F64(ndarray::array![
+                [[10.0, -9999.0]],
+                [[-9999.0, 20.0]]
+            ]),
+            mask: None,
+            crs: crate::crs::Crs::epsg(4326),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 1.0, 0.0, -1.0]),
+            nodata: Some(-9999.0),
+            bbox: Bbox::new(0.0, 0.0, 2.0, 1.0),
+        };
+        let out = unscale_image(&img, &[so(0.1, 1.0), so(2.0, 5.0)]);
+        let pixels = out.pixels.to_f64();
+        assert!(pixels[[0, 0, 1]].is_nan());
+        assert!(pixels[[1, 0, 0]].is_nan());
+        assert_eq!(pixels[[0, 0, 0]], 2.0);
+        assert_eq!(pixels[[1, 0, 1]], 45.0);
     }
 
     #[test]
@@ -1021,6 +1488,43 @@ mod tests {
         let out = unscale_ranges(&ranges, &bidx, &[so(0.01, 5.0), so(2.0, 0.0)]);
         assert_eq!(out[0], (0.0 * 0.01 + 5.0, 1000.0 * 0.01 + 5.0));
         assert_eq!(out[1], (10.0 * 2.0, 20.0 * 2.0));
+    }
+
+    #[test]
+    fn negative_scale_keeps_stretch_bounds_ordered() {
+        assert_eq!(
+            unscale_ranges(&[(10.0, 20.0)], &[0], &[so(-2.0, 100.0)]),
+            vec![(60.0, 80.0)]
+        );
+    }
+
+    #[test]
+    fn masked_pixels_do_not_expand_expression_or_fallback_stretch() {
+        let image = crate::pixel::ImageData {
+            pixels: crate::pixel::PixelData::F64(ndarray::array![[[1.0, 2.0, 10000.0]]]),
+            mask: Some(ndarray::array![[true, true, false]]),
+            crs: crate::crs::Crs::epsg(4326),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 1.0, 0.0, -1.0]),
+            nodata: None,
+            bbox: Bbox::new(0.0, 0.0, 3.0, 1.0),
+        };
+        let rpn = crate::render::expression::parse_expression("b1").unwrap();
+        assert_eq!(expression_rescale(&image, &rpn, None), Some((1.0, 2.0)));
+        let style = crate::style::TileStyle::default();
+        let compiled = std::sync::Arc::new(crate::style::params::compile(&style).unwrap());
+        let outcome = super::effective_compiled_sync(
+            &style,
+            &compiled,
+            &image,
+            Some(&None),
+            &[],
+            &super::EffectiveMemo::new(1),
+        )
+        .unwrap();
+        let super::EffectiveOutcome::Ready(result) = outcome else {
+            panic!("stats supplied")
+        };
+        assert_eq!(result.rescale, vec![(1.0, 2.0)]);
     }
 
     #[test]
@@ -1071,6 +1575,43 @@ mod tests {
         assert!((lo - 0.0).abs() < 1e-9, "lo={lo}");
         assert!((hi - 0.5).abs() < 1e-9, "hi={hi}");
         assert!(hi < 1.0, "range must be NDVI units, not DN");
+    }
+
+    #[tokio::test]
+    async fn fallback_stretch_does_not_unscale_physical_values_twice() {
+        use super::*;
+        use crate::crs::Crs;
+        let style = TileStyle {
+            unscale: true,
+            ..TileStyle::default()
+        };
+        let compiled = compile_cached(&style).await.unwrap();
+        let image = ImageData {
+            pixels: PixelData::F64(
+                ndarray::Array3::from_shape_vec((1, 1, 2), vec![10.0, 20.0]).unwrap(),
+            ),
+            mask: None,
+            crs: Crs::epsg(3857),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 1.0, 0.0, -1.0]),
+            nodata: None,
+            bbox: Bbox::new(0.0, 0.0, 2.0, 1.0),
+        };
+        let outcome = effective_compiled_sync(
+            &style,
+            &compiled,
+            &image,
+            Some(&None),
+            &[ScaleOffset {
+                scale: 0.1,
+                offset: 0.0,
+            }],
+            &EffectiveMemo::new(1),
+        )
+        .unwrap();
+        let EffectiveOutcome::Ready(result) = outcome else {
+            panic!("unexpected stats request")
+        };
+        assert_eq!(result.rescale, vec![(10.0, 20.0)]);
     }
 
     #[test]

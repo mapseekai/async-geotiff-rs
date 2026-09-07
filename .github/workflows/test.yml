@@ -1,0 +1,43 @@
+name: Rust correctness
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flags:
+          - ""
+          - "--no-default-features"
+          - "--no-default-features --features mosaic"
+          - "--features stac,webp,jpeg"
+          - "--all-features"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config libsqlite3-dev sqlite3 libtiff-dev libcurl4-openssl-dev
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Verify fixture reproducibility
+        run: |
+          python3 tests/fixtures/generate.py
+          git diff --exit-code -- tests/fixtures
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Test viewer startup ordering
+        run: node tests/viewer_bootstrap.cjs
+      - name: Check all targets
+        run: cargo +stable check --locked --all-targets ${{ matrix.flags }}
+      - name: Run unit and integration tests
+        run: cargo +stable test --locked --all-targets ${{ matrix.flags }}
+      - name: Run documentation tests
+        run: cargo +stable test --locked --doc ${{ matrix.flags }}

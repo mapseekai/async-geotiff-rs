@@ -209,16 +209,11 @@ mod tests {
     // ---- integration tests against a local fixture ----
 
     async fn rgb_reader() -> CogReader {
-        use async_tiff::reader::ObjectReader;
         use object_store::local::LocalFileSystem;
-        use object_store::path::Path;
         let fs = std::sync::Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
-        CogReader::open_with_reader(ObjectReader::new(
-            fs,
-            Path::from("data/cog_uint8_rgb_nodata.tif"),
-        ))
-        .await
-        .unwrap()
+        CogReader::open_object_store(fs, "tests/fixtures/rgb_nodata.tif")
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -277,21 +272,17 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "proj")]
     #[tokio::test]
     async fn point_reprojects_lonlat_onto_non_4326_dataset() {
         // Fixture is EPSG:3857; querying in lon/lat (4326) forces the
         // reprojection branch in `coord_to_pixel` (Projector::new + convert),
         // unlike the 4326 fixture where the equal-CRS short-circuit fires.
-        use async_tiff::reader::ObjectReader;
         use object_store::local::LocalFileSystem;
-        use object_store::path::Path;
         let fs = std::sync::Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
-        let r = CogReader::open_with_reader(ObjectReader::new(
-            fs,
-            Path::from("data/output_3857_cog.tif"),
-        ))
-        .await
-        .unwrap();
+        let r = CogReader::open_object_store(fs, "tests/fixtures/projected.tif")
+            .await
+            .unwrap();
         assert_ne!(r.src_crs(), &Crs::epsg(4326), "fixture should be non-4326");
         let [w, s, e, n] = r.wgs84_bounds().unwrap();
         let (lon, lat) = ((w + e) / 2.0, (s + n) / 2.0);

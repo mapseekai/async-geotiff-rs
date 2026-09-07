@@ -10,9 +10,8 @@
 //! - The mosaic **document** fetch and the STAC **search** endpoint are
 //!   operator-configured, not per-asset, so they are NOT guarded here — only
 //!   asset opens go through the pool.
-//! - There is an inherent resolve-then-connect TOCTOU: we resolve the host and
-//!   check the returned IPs, but `object_store` reconnects independently. This
-//!   blocks the common static-DNS SSRF, not an active DNS-rebinding attacker.
+//! - Asset connections pin the validated addresses and do not follow redirects.
+//!   DNS work has a shared concurrency bound and a deadline.
 
 use std::net::{IpAddr, ToSocketAddrs};
 
@@ -139,7 +138,10 @@ impl HttpAccessPolicy {
 /// pool's open (miss) path only, so it never adds latency to cached-reader
 /// hits. Error text carries only the reason, never the URL, so presigned
 /// credentials in a query string cannot leak.
-pub(crate) async fn validate_http_url(url: &str, policy: &HttpAccessPolicy) -> AgResult<()> {
+pub(crate) async fn validate_http_url(
+    url: &str,
+    policy: &HttpAccessPolicy,
+) -> AgResult<Vec<std::net::SocketAddr>> {
     let u = url::Url::parse(url).map_err(|e| AgError::Mosaic(format!("invalid asset url: {e}")))?;
     match u.scheme() {
         "https" => {}
@@ -160,36 +162,50 @@ pub(crate) async fn validate_http_url(url: &str, policy: &HttpAccessPolicy) -> A
         Some(url::Host::Ipv4(a)) => vec![IpAddr::V4(a)],
         Some(url::Host::Ipv6(a)) => vec![IpAddr::V6(a)],
         Some(url::Host::Domain(d)) => {
-            let host_lc = d.to_ascii_lowercase();
-            if policy.allow_hosts.iter().any(|h| h == &host_lc) {
-                return Ok(());
-            }
             let port = u.port_or_known_default().unwrap_or(443);
             let hostname = d.to_string();
-            // `ToSocketAddrs` DNS is blocking — the `tokio` build here has no
-            // `net` feature, so resolve on the blocking pool. Resolution
-            // failure yields no IPs and is allowed through: a non-resolving
-            // host is not an SSRF hit, and the subsequent connect fails anyway.
-            tokio::task::spawn_blocking(move || {
+            // Fail closed, and pass these exact addresses to the connector.
+            static DNS_LIMITER: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+                std::sync::OnceLock::new();
+            let limiter = DNS_LIMITER
+                .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+                .clone();
+            resolve_bounded(limiter, std::time::Duration::from_secs(10), move || {
                 (hostname.as_str(), port)
                     .to_socket_addrs()
                     .map(|it| it.map(|s| s.ip()).collect::<Vec<_>>())
-                    .unwrap_or_default()
+                    .map_err(|_| AgError::Mosaic("asset host DNS resolution failed".into()))
             })
-            .await
-            .map_err(|e| AgError::Mosaic(format!("asset host resolve join: {e}")))?
+            .await?
         }
         None => return Err(AgError::Mosaic("asset url missing host".into())),
     };
 
-    for ip in ips {
+    if ips.is_empty() {
+        return Err(AgError::Mosaic(
+            "asset host DNS returned no addresses".into(),
+        ));
+    }
+    let allowlisted = u.host_str().is_some_and(|host| {
+        policy
+            .allow_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(host))
+    });
+    for &ip in &ips {
+        if allowlisted {
+            continue;
+        }
         if let Some(reason) = policy.ip_blocked(ip) {
             return Err(AgError::Mosaic(format!(
                 "asset host resolves to blocked {reason}"
             )));
         }
     }
-    Ok(())
+    Ok(ips
+        .into_iter()
+        .map(|ip| std::net::SocketAddr::new(ip, u.port_or_known_default().unwrap_or(443)))
+        .collect())
 }
 
 #[cfg(test)]
@@ -264,5 +280,118 @@ mod tests {
         assert!(validate_http_url("http://localhost:9000/x.tif", &p)
             .await
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn audit_dns_failure_is_closed() {
+        assert!(validate_http_url(
+            "https://no-such-host.invalid/x.tif",
+            &HttpAccessPolicy::default()
+        )
+        .await
+        .is_err());
+    }
+}
+
+/// Transport for one validated URL. DNS is pinned for the reader lifetime;
+/// redirects and environment proxies cannot bypass the destination policy.
+#[derive(Debug)]
+pub(crate) struct PinnedConnector(pub reqwest::Client);
+
+impl object_store::client::HttpConnector for PinnedConnector {
+    fn connect(
+        &self,
+        _: &object_store::ClientOptions,
+    ) -> object_store::Result<object_store::client::HttpClient> {
+        Ok(object_store::client::HttpClient::new(self.0.clone()))
+    }
+}
+
+pub(crate) async fn checked_http_store(
+    url: &str,
+    policy: &HttpAccessPolicy,
+) -> AgResult<std::sync::Arc<dyn object_store::ObjectStore>> {
+    let addresses = validate_http_url(url, policy).await?;
+    let parsed = url::Url::parse(url).map_err(|_| AgError::Mosaic("invalid asset URL".into()))?;
+    let url = url.to_owned();
+    crate::io::cog::build_http_transport(move || {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(parsed.host_str().unwrap(), &addresses)
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|_| AgError::Mosaic("HTTP client construction failed".into()))?;
+        let store = object_store::http::HttpBuilder::new()
+            .with_url(url)
+            .with_http_connector(PinnedConnector(client))
+            .build()
+            .map_err(|_| AgError::Mosaic("HTTP store construction failed".into()))?;
+        Ok(std::sync::Arc::new(store) as std::sync::Arc<dyn object_store::ObjectStore>)
+    })
+    .await
+}
+
+async fn resolve_bounded(
+    limiter: std::sync::Arc<tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+    resolve: impl FnOnce() -> AgResult<Vec<IpAddr>> + Send + 'static,
+) -> AgResult<Vec<IpAddr>> {
+    tokio::time::timeout(timeout, async move {
+        let permit = limiter
+            .acquire_owned()
+            .await
+            .map_err(|_| AgError::Mosaic("DNS resolver closed".into()))?;
+        tokio::task::spawn_blocking(move || {
+            // A timed-out OS resolver cannot be stopped. Keep its capacity
+            // owned by the blocking job until it really returns.
+            let _permit = permit;
+            resolve()
+        })
+        .await
+        .map_err(|_| AgError::Mosaic("DNS resolver task failed".into()))?
+    })
+    .await
+    .map_err(|_| AgError::Mosaic("DNS resolution deadline exceeded".into()))?
+}
+#[cfg(test)]
+mod dns_limit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn dns_timeout_keeps_capacity_until_blocking_resolver_finishes() {
+        let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            resolve_bounded(
+                limiter.clone(),
+                std::time::Duration::from_millis(10),
+                move || {
+                    let _ = wait.recv();
+                    Ok(vec!["127.0.0.1".parse().unwrap()])
+                },
+            ),
+        )
+        .await;
+        let available = limiter.available_permits();
+        let _ = release.send(());
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "resolver must return its own bounded timeout"
+        );
+        assert_eq!(
+            available, 0,
+            "timeout must not release still-running blocking DNS capacity"
+        );
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(1), limiter.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
     }
 }

@@ -128,8 +128,47 @@ impl<State> Reducer<State> {
     /// the composite is narrowed back at render time. The asset's mask is
     /// borrowed — it is only copied where a method must retain it.
     fn feed_impl(&mut self, img: &ImageData) -> AgResult<()> {
+        let shape = (img.pixels.bands(), img.pixels.height(), img.pixels.width());
+        let previous = self
+            .acc
+            .as_ref()
+            .or_else(|| self.stack.first().map(|(a, _)| a));
+        if shape.0 == 0
+            || shape.1 == 0
+            || shape.2 == 0
+            || img
+                .mask
+                .as_ref()
+                .is_some_and(|m| m.dim() != (shape.1, shape.2))
+            || previous.is_some_and(|a| a.dim() != shape)
+            || self.bbox.is_some_and(|bbox| bbox != img.bbox)
+            || self.crs.as_ref().is_some_and(|crs| crs != &img.crs)
+            || self.transform.is_some_and(|tr| {
+                [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
+                    .iter()
+                    .any(|&(c, r)| tr.forward(c, r) != img.transform.forward(c, r))
+            })
+        {
+            return Err(AgError::Mosaic(
+                "assets must have matching nonempty shapes, masks, CRS and pixel grids".into(),
+            ));
+        }
         let arr = img.pixels.to_f64(); // (bands, h, w)
-        let m = img.mask.as_ref();
+                                       // Normalize declared numeric nodata once for every selection method.
+        let normalized_mask = img.nodata.map(|nd| {
+            Array2::from_shape_fn((shape.1, shape.2), |(r, c)| {
+                valid(img.mask.as_ref(), r, c)
+                    && (0..shape.0).all(|b| {
+                        let v = arr[[b, r, c]];
+                        if nd.is_nan() {
+                            !v.is_nan()
+                        } else {
+                            v != nd
+                        }
+                    })
+            })
+        });
+        let m = normalized_mask.as_ref().or(img.mask.as_ref());
         if self.bbox.is_none() {
             self.bbox = Some(img.bbox);
             self.crs = Some(img.crs.clone());
@@ -534,6 +573,42 @@ mod tests {
             reducer.feed(image).unwrap();
         }
         reducer.finish().unwrap()
+    }
+
+    #[test]
+    fn numeric_nodata_without_mask_does_not_occupy_mosaic() {
+        for method in [
+            PixelSelection::First,
+            PixelSelection::Highest,
+            PixelSelection::Lowest,
+            PixelSelection::Mean,
+            PixelSelection::Median,
+        ] {
+            for nd in [-9999.0, f64::NAN] {
+                let mut first = img(&[nd], &[true]);
+                first.mask = None;
+                first.nodata = Some(nd);
+                let out = reduce(method, &[first, img(&[100.0], &[true])]);
+                assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 100.0, "{method:?}");
+                assert!(out.mask.unwrap()[[0, 0]]);
+            }
+        }
+    }
+
+    #[test]
+    fn incompatible_asset_grid_returns_error() {
+        for method in [
+            PixelSelection::First,
+            PixelSelection::Highest,
+            PixelSelection::Lowest,
+            PixelSelection::Mean,
+            PixelSelection::Median,
+        ] {
+            let mut reducer = Reducer::new(method).feed(&img(&[1.0], &[true])).unwrap();
+            let mut shifted = img(&[2.0], &[true]);
+            shifted.transform = shifted.transform.translated(1.0, 0.0);
+            assert!(reducer.feed(&shifted).is_err(), "{method:?}");
+        }
     }
 
     fn assert_reduction(method: PixelSelection, images: &[ImageData], expected: &[f64]) {

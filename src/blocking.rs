@@ -40,7 +40,9 @@ impl CpuLimiter {
     /// Build a limiter allowing `permits` concurrent blocking jobs (clamped to
     /// at least 1).
     pub fn new(permits: usize) -> Self {
-        Self(Arc::new(Semaphore::new(permits.max(1))))
+        Self(Arc::new(Semaphore::new(
+            permits.clamp(1, Semaphore::MAX_PERMITS),
+        )))
     }
 
     /// Acquire one permit, awaited asynchronously so excess work yields the
@@ -73,6 +75,14 @@ mod tests {
     fn new_clamps_zero_permits_to_one() {
         assert_eq!(CpuLimiter::new(0).available_permits(), 1);
         assert_eq!(CpuLimiter::new(4).available_permits(), 4);
+    }
+
+    #[test]
+    fn oversized_cpu_limit_does_not_panic() {
+        assert_eq!(
+            CpuLimiter::new(usize::MAX).available_permits(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
     }
 
     #[tokio::test]

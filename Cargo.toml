@@ -25,7 +25,7 @@ bytemuck          = "1"
 nom               = "8"
 bitflags          = "2"
 moka              = { version = "0.12", features = ["future", "sync"] }
-tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 rayon             = "1"
 thiserror         = "2"
 serde             = { version = "1", features = ["derive"] }
@@ -34,9 +34,15 @@ serde_urlencoded  = "0.7"
 tracing           = "0.1"
 console-subscriber = { version = "0.5", optional = true }
 url               = "2"
+reqwest           = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 quick-xml         = "0.39"
+flate2           = "1.1"
+zstd             = "0.13"
+weezl            = "0.1"
+jpeg-decoder     = { version = "0.3", default-features = false }
 stac-client       = { version = "0.3", optional = true }
 futures = { version = "0.3.32", optional = true }
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio             = { version = "1", features = ["macros", "rt-multi-thread", "sync", "test-util", "fs", "io-util"] }

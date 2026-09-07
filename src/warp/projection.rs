@@ -48,7 +48,11 @@ impl Projector {
             // similar latitude/longitude-range messages) for coords a
             // tile may legitimately cover near the CRS edge. Tag these
             // so the tiler can blank the tile instead of 500-ing.
-            if lower.contains("outside") || lower.contains("domain") || lower.contains("range") {
+            if lower.contains("outside")
+                || lower.contains("domain")
+                || lower.contains("range")
+                || lower.contains("invalid coordinate")
+            {
                 AgError::ProjectionDomain(msg)
             } else {
                 AgError::Warp(format!("convert: {msg}"))
@@ -146,6 +150,75 @@ fn is_epsg(crs: &Crs, code: u32) -> bool {
     digits.parse::<u32>().map(|c| c == code).unwrap_or(false)
 }
 
+/// Reproject a boundary with 64 segments per edge. This samples curved
+/// projection edges rather than assuming their extrema occur at corners.
+/// Longitude discontinuities produce a broad envelope rather than a wrapped
+/// bbox, so callers using a single rectangle do not discard either side.
+pub(crate) fn reproject_boundary(
+    corners: [(f64, f64); 4],
+    from: &Crs,
+    to: &Crs,
+) -> AgResult<crate::bounds::Bbox> {
+    let mut points = Vec::with_capacity(256);
+    for edge in 0..4 {
+        let a = corners[edge];
+        let b = corners[(edge + 1) % 4];
+        for step in 0..64 {
+            let t = step as f64 / 64.0;
+            points.push((a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
+        }
+    }
+    convert_batch_partial(from, to, &mut points)?;
+    let mut bounds = crate::bounds::Bbox::new(
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for (x, y) in points
+        .into_iter()
+        .filter(|(x, y)| x.is_finite() && y.is_finite())
+    {
+        bounds.xmin = bounds.xmin.min(x);
+        bounds.ymin = bounds.ymin.min(y);
+        bounds.xmax = bounds.xmax.max(x);
+        bounds.ymax = bounds.ymax.max(y);
+    }
+    if !bounds.xmin.is_finite() {
+        return Err(AgError::ProjectionDomain(
+            "boundary has no projectable points".into(),
+        ));
+    }
+    Ok(bounds)
+}
+
+/// Preserve projectable points when only part of a grid is outside the CRS
+/// domain. Invalid samples are NaN; configuration/initialization errors pass
+/// through unchanged. Retry original inputs because a failed batch may have
+/// partially mutated its output.
+pub(crate) fn convert_batch_partial(
+    from: &Crs,
+    to: &Crs,
+    points: &mut [(f64, f64)],
+) -> AgResult<()> {
+    let original = points.to_vec();
+    match convert_batch(from, to, points) {
+        Ok(()) => Ok(()),
+        Err(AgError::ProjectionDomain(_)) => {
+            for (output, input) in points.iter_mut().zip(original) {
+                *output = input;
+                match convert_batch(from, to, std::slice::from_mut(output)) {
+                    Ok(()) => {}
+                    Err(AgError::ProjectionDomain(_)) => *output = (f64::NAN, f64::NAN),
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(not(feature = "proj"))]
 pub fn with_cached<R>(
     _src: &Crs,
@@ -174,6 +247,28 @@ impl Projector {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn polar_boundary_includes_extremum_between_corners() {
+        let bbox = reproject_boundary(
+            [(-90.0, 60.0), (0.0, 60.0), (0.0, 80.0), (-90.0, 80.0)],
+            &Crs::epsg(4326),
+            &Crs::epsg(3413),
+        )
+        .unwrap();
+        assert!(bbox.ymin < -3_323_160.0, "{}", bbox.ymin);
+    }
+
+    #[test]
+    fn boundary_retains_partly_projectable_coverage() {
+        let bbox = reproject_boundary(
+            [(-10.0, 80.0), (10.0, 80.0), (10.0, 100.0), (-10.0, 100.0)],
+            &Crs::epsg(4326),
+            &Crs::epsg(3413),
+        )
+        .unwrap();
+        assert!(bbox.xmin.is_finite() && bbox.xmax > bbox.xmin);
+    }
 
     #[test]
     fn lonlat_to_webmercator_origin() {

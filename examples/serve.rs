@@ -83,7 +83,7 @@ impl ServerRuntimeConfig {
             get("ASYNC_GEOTIFF_BLOCK_CACHE_MB"),
         )? {
             block_cache.max_bytes = mb
-                .checked_shl(20)
+                .checked_mul(1 << 20)
                 .ok_or_else(|| "ASYNC_GEOTIFF_BLOCK_CACHE_MB is too large".to_string())?;
         }
         if let Some(tasks) = parse_positive_usize_env(
@@ -97,6 +97,18 @@ impl ServerRuntimeConfig {
             get("ASYNC_GEOTIFF_MAX_TILE_TASKS"),
         )? {
             tiler.max_blocking_tasks = tasks;
+        }
+        if let Some(requests) = parse_positive_usize_env(
+            "ASYNC_GEOTIFF_MAX_IN_FLIGHT_REQUESTS",
+            get("ASYNC_GEOTIFF_MAX_IN_FLIGHT_REQUESTS"),
+        )? {
+            tiler.max_in_flight_requests = requests;
+        }
+        if let Some(milliseconds) = parse_positive_u64_env(
+            "ASYNC_GEOTIFF_REQUEST_TIMEOUT_MS",
+            get("ASYNC_GEOTIFF_REQUEST_TIMEOUT_MS"),
+        )? {
+            tiler.request_timeout = std::time::Duration::from_millis(milliseconds);
         }
         // Speculative neighbour-block prefetch radius. Defaults to 1 in the
         // example server: browsing patterns make the surrounding ring exactly
@@ -133,9 +145,7 @@ impl ServerRuntimeConfig {
     }
 
     fn tiler_config(&self) -> TilerConfig {
-        TilerConfig {
-            max_blocking_tasks: self.tiler.max_blocking_tasks,
-        }
+        self.tiler
     }
 }
 
@@ -275,6 +285,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime.reader.max_decode_tasks,
         runtime.tiler.max_blocking_tasks,
         runtime.slow_tile_ms,
+    )
+    .with_request_tuning(
+        runtime.tiler.max_in_flight_requests,
+        runtime.tiler.request_timeout,
     );
     let mut mosaic_loaded = false;
     if let Ok(path) = std::env::var("ASYNC_GEOTIFF_MOSAIC") {
@@ -453,6 +467,36 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_preserves_request_limits() {
+        let cfg = ServerRuntimeConfig::from_env_values(env(&[
+            ("ASYNC_GEOTIFF_MAX_IN_FLIGHT_REQUESTS", "7"),
+            ("ASYNC_GEOTIFF_REQUEST_TIMEOUT_MS", "250"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.tiler_config().max_in_flight_requests, 7);
+        assert_eq!(
+            cfg.tiler_config().request_timeout,
+            std::time::Duration::from_millis(250)
+        );
+        for key in [
+            "ASYNC_GEOTIFF_MAX_IN_FLIGHT_REQUESTS",
+            "ASYNC_GEOTIFF_REQUEST_TIMEOUT_MS",
+        ] {
+            assert!(ServerRuntimeConfig::from_env_values(env(&[(key, "0")])).is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_config_rejects_cache_megabyte_overflow() {
+        let overflow = (u64::MAX / (1 << 20) + 1).to_string();
+        assert!(ServerRuntimeConfig::from_env_values(env(&[(
+            "ASYNC_GEOTIFF_BLOCK_CACHE_MB",
+            &overflow
+        )]))
+        .is_err());
+    }
+
+    #[test]
     fn runtime_config_overrides_cache_and_cpu_tuning_from_env() {
         let cfg = ServerRuntimeConfig::from_env_values(env(&[
             ("ASYNC_GEOTIFF_BLOCK_CACHE_MB", "1024"),
@@ -563,7 +607,7 @@ mod tests {
     #[cfg(feature = "stac")]
     async fn fixture_tile_coord() -> TileCoord {
         let store = Arc::new(LocalFileSystem::new_with_prefix(".").expect("fixture store"));
-        let reader = CogReader::open_object_store(store, "data/cog_uint8_rgb_nodata.tif")
+        let reader = CogReader::open_object_store(store, "tests/fixtures/rgb_nodata.tif")
             .await
             .expect("open fixture COG");
         let [west, south, east, north] = Tiler::new(Arc::new(reader))
@@ -594,11 +638,13 @@ mod tests {
     #[cfg(feature = "stac")]
     #[tokio::test]
     async fn stac_demo_queries_a_local_asset_and_renders_a_tile() {
-        let data_name = "cog_uint8_rgb_nodata.tif";
-        assert!(std::path::Path::new("data").join(data_name).exists());
+        let data_name = "rgb_nodata.tif";
+        assert!(std::path::Path::new("tests/fixtures")
+            .join(data_name)
+            .exists());
         let data_state = server::AppState::new(
             None,
-            Some(std::path::PathBuf::from("data")),
+            Some(std::path::PathBuf::from("tests/fixtures")),
             vec![data_name.to_string()],
             "http://127.0.0.1:0",
             Arc::new(BlockCache::new(CacheConfig::default())),
@@ -660,6 +706,63 @@ mod tests {
         }));
         data_task.abort();
         stac_task.abort();
+    }
+
+    #[tokio::test]
+    async fn single_band_auto_style_renders_http_viewport() {
+        let reader = CogReader::open_object_store(
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap()),
+            "tests/fixtures/uint16.tif",
+        )
+        .await
+        .unwrap();
+        let tiler = Tiler::new(Arc::new(reader));
+        let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
+        let zoom = 14;
+        let grid = 2_f64.powi(zoom);
+        let x = (((w + e) / 2.0 + 180.0) / 360.0 * grid).floor() as u32;
+        let lat = ((s + n) / 2.0).to_radians();
+        let y = ((1.0 - (lat.tan() + 1.0 / lat.cos()).ln() / std::f64::consts::PI) / 2.0 * grid)
+            .floor() as u32;
+        let state = server::AppState::new(
+            Some(Arc::new(tiler)),
+            None,
+            vec![],
+            "http://127.0.0.1:0",
+            Arc::new(BlockCache::new(CacheConfig::default())),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, server::router(state)).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let mut visible = false;
+        for ty in y - 1..=y + 1 {
+            for tx in x - 1..=x + 1 {
+                let response = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{tx}/{ty}.png?stretch=stddev&resampling=bilinear&reproject=bilinear")).send().await.unwrap();
+                assert!(
+                    response.status() == reqwest::StatusCode::OK
+                        || response.status() == reqwest::StatusCode::NO_CONTENT,
+                    "viewport tile failed: {}",
+                    response.status()
+                );
+                if response.status() == reqwest::StatusCode::OK {
+                    let pixels = image::load_from_memory(&response.bytes().await.unwrap())
+                        .unwrap()
+                        .to_rgba8();
+                    assert_eq!(pixels.dimensions(), (256, 256));
+                    visible |= pixels.pixels().any(|p| p[3] > 0);
+                }
+            }
+        }
+        assert!(
+            visible,
+            "single-band viewport must retain visible source pixels"
+        );
+        let invalid = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{x}/{y}.png?bidx=1&bidx=2&bidx=3&stretch=stddev")).send().await.unwrap();
+        assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+        task.abort();
     }
 
     #[test]

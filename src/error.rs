@@ -4,6 +4,18 @@ pub type AgResult<T> = Result<T, AgError>;
 
 #[derive(Debug, Error)]
 pub enum AgError {
+    #[error("work resource limit: {0}")]
+    ResourceLimit(String),
+
+    #[error("request admission limit reached")]
+    Overloaded,
+
+    #[error("request deadline exceeded")]
+    DeadlineExceeded,
+
+    #[error("request cancelled")]
+    Cancelled,
+
     #[error("invalid query parameter `{name}`: {msg}")]
     Query { name: String, msg: String },
 

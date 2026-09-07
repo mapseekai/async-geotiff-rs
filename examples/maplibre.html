@@ -194,7 +194,8 @@
       </div>
       <div class="field">
         <label for="bidx">Bands</label>
-        <input id="bidx" name="bidx" type="text" autocomplete="off" spellcheck="false">
+        <input id="bidx" name="bidx" type="text" autocomplete="off" spellcheck="false" placeholder="Auto">
+        <small id="band-note" role="status" hidden></small>
       </div>
       <div class="field wide">
         <label for="expression">Expression</label>
@@ -292,7 +293,8 @@
       controls.stretchArg.value =
         pageParams.get("pc") ?? pageParams.get("sigma") ?? "";
       controls.rescale.value = pageParams.getAll("rescale").join(";") || "0,255;0,255;0,255";
-      controls.bidx.value = pageParams.getAll("bidx").join(",") || "1,2,3";
+      controls.bidx.value = pageParams.getAll("bidx").join(",");
+      let rgbPresetPending = pageParams.get("mode") !== "mosaic" && controls.bidx.value.replace(/\s/g, "") === "1,2,3";
       controls.expression.value = pageParams.get("expression") ?? "";
       controls.resampling.value = pageParams.get("resampling") ?? "bilinear";
       controls.tilesize.value = pageParams.get("tilesize") ?? "256";
@@ -356,7 +358,9 @@
         if (expression) {
           params.set("expression", expression);
         } else {
-          appendRepeated(params, "bidx", controls.bidx.value, ",");
+          if (!(rgbPresetPending && controls.bidx.value.replace(/\s/g, "") === "1,2,3")) {
+            appendRepeated(params, "bidx", controls.bidx.value, ",");
+          }
         }
         // Auto means the advertised global mean ± 2σ stretch, not the U8 raw-value fast path.
         // Explicitly send it so every tile resolves the same dataset statistics.
@@ -402,6 +406,7 @@
       // otherwise cached overview/child tiles keep the previous style on
       // zoom. The server ignores unknown query keys, so `_v` is inert.
       let styleVersion = 0;
+      let rasterReady = false;
 
       function tileUrl() {
         const params = tileParams();
@@ -443,26 +448,9 @@
               minzoom: 0,
               maxzoom: 19,
               attribution: '<a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
-            },
-            "cog-raster": {
-              type: "raster",
-              tiles: [tileUrl()],
-              tileSize: 256,
-              minzoom: 0,
-              maxzoom: 22,
-              attribution: "async-geotiff"
             }
           },
-          layers: [
-          {
-            id: "cog-raster",
-            type: "raster",
-              source: "cog-raster",
-              paint: {
-                "raster-opacity": Number(controls.opacity.value)
-              }
-            }
-          ],
+          layers: [],
           id: "async-geotiff-maplibre"
         },
         center: parseCenter(),
@@ -474,7 +462,7 @@
         if (controls.basemap.value === "osm") {
           map.addLayer(
             { id: "osm-raster", type: "raster", source: "osm-raster" },
-            "cog-raster",
+            map.getLayer("cog-raster") ? "cog-raster" : undefined,
           );
         }
       }
@@ -486,6 +474,11 @@
 
       document.getElementById("style-form").addEventListener("submit", (event) => {
         event.preventDefault();
+        if (!rasterReady && !isMosaic()) return;
+        if (!map.isStyleLoaded()) {
+          map.once("load", () => document.getElementById("style-form").requestSubmit());
+          return;
+        }
         styleVersion += 1;
         // setTiles() only refreshes currently-visible tiles; MapLibre's
         // per-zoom tile pyramid keeps tiles fetched with the old URL, so
@@ -518,7 +511,7 @@
       });
 
       controls.opacity.addEventListener("input", () => {
-        map.setPaintProperty("cog-raster", "raster-opacity", Number(controls.opacity.value));
+        if (map.getLayer("cog-raster")) map.setPaintProperty("cog-raster", "raster-opacity", Number(controls.opacity.value));
       });
 
       // Populate the Format switcher from /formats. The server lists only
@@ -566,7 +559,7 @@
           const resp = await fetch(`${tileOrigin()}/datasets`);
           if (!resp.ok) return;
           const names = await resp.json();
-          if (!Array.isArray(names) || names.length === 0) return;
+          if (!Array.isArray(names)) return;
           const wanted = pageParams.get("dataset");
           controls.dataset.innerHTML = "";
           for (const name of names) {
@@ -576,10 +569,10 @@
             controls.dataset.appendChild(opt);
           }
           controls.dataset.value =
-            wanted && names.includes(wanted) ? wanted : names[0];
+            wanted && names.includes(wanted) ? wanted : (names[0] ?? "");
           if (!isMosaic()) {
+            await flyToDataset();
             document.getElementById("style-form").requestSubmit();
-            flyToDataset();
           }
         } catch (err) {
           console.warn("dataset list unavailable", err);
@@ -588,14 +581,25 @@
 
       async function flyToDataset() {
         const ds = controls.dataset && controls.dataset.value;
-        if (!ds) return;
         try {
           const r = await fetch(
-            `${tileOrigin()}/bounds?dataset=${encodeURIComponent(ds)}`
+            `${tileOrigin()}/bounds${ds ? `?dataset=${encodeURIComponent(ds)}` : ""}`
           );
           if (!r.ok) return;
+          if (controls.dataset.value !== ds) return;
+          const bands = Number(r.headers.get("x-raster-bands"));
+          if (Number.isInteger(bands) && bands > 0) {
+            if (bands < 3 && controls.bidx.value.replace(/\s/g, "") === "1,2,3") {
+              controls.bidx.value = "";
+              const note = document.getElementById("band-note");
+              note.textContent = `${bands} band${bands === 1 ? "" : "s"}: RGB preset changed to Auto.`;
+              note.hidden = false;
+            }
+            rgbPresetPending = false;
+          }
           const b = await r.json();
           if (Array.isArray(b) && b.length === 4 && b.every(Number.isFinite)) {
+            rasterReady = true;
             map.fitBounds(
               [
                 [b[0], b[1]],
@@ -611,18 +615,21 @@
 
 
       controls.basemap.addEventListener("change", applyBasemap);
-      controls.dataset.addEventListener("change", () => {
+      controls.dataset.addEventListener("change", async () => {
+        rasterReady = false;
         if (!isMosaic()) {
+          rgbPresetPending = controls.bidx.value.replace(/\s/g, "") === "1,2,3";
+          await flyToDataset();
           document.getElementById("style-form").requestSubmit();
-          flyToDataset();
         }
       });
-      controls.mode.addEventListener("change", () => {
+      controls.mode.addEventListener("change", async () => {
         syncSourceUi();
-        document.getElementById("style-form").requestSubmit();
         if (!isMosaic()) {
-          flyToDataset();
+          rasterReady = false;
+          await flyToDataset();
         }
+        document.getElementById("style-form").requestSubmit();
       });
 
 
@@ -644,9 +651,6 @@
       function syncExpressionUi() {
         const active = isExpressionMode();
         controls.bidx.disabled = active;
-        if (!active && !controls.bidx.value.trim()) {
-          controls.bidx.value = "1,2,3";
-        }
       }
 
       function applyNdvi() {
@@ -676,7 +680,10 @@
       });
 
       map.on("moveend", syncPermalink);
-      map.on("load", syncStatus);
+      map.on("load", () => {
+        syncStatus();
+        if (isMosaic()) document.getElementById("style-form").requestSubmit();
+      });
       syncStatus();
     </script>
   </body>

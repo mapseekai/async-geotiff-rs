@@ -12,13 +12,12 @@ use crate::error::{AgError, AgResult};
 use crate::pixel::{ImageData, PixelData};
 use crate::warp::resampler::Resampling;
 
-const WARP_EDGE_EPS: f64 = 0.5;
+const WARP_EDGE_EPS: f64 = 1e-9;
 const WARP_GRID_SIZE: usize = 32;
 const SUBTILE_MAX_ERR_PX: f64 = 0.33;
 
 /// Source-pixel coords `(sc, sr)` for every dst column of dst row `r`,
-/// using the warp grid. Extracted so the average kernel can difference
-/// row `r` against row `r+1` for the vertical Jacobian.
+/// using the warp grid, converted from corner coordinates to sample centers.
 fn row_src_coords(
     r: usize,
     dst_h: usize,
@@ -44,7 +43,8 @@ fn row_src_coords(
         let w11 = di * dj;
         let sc = p00.0 * w00 + p01.0 * w01 + p10.0 * w10 + p11.0 * w11;
         let sr = p00.1 * w00 + p01.1 * w01 + p10.1 * w10 + p11.1 * w11;
-        out.push((sc, sr));
+        // GeoTransform uses pixel corners; samplers use integer centers.
+        out.push((sc - 0.5, sr - 0.5));
     }
     out
 }
@@ -57,6 +57,26 @@ pub fn warp(
     dst_h: usize,
     resampling: Resampling,
 ) -> AgResult<ImageData> {
+    let source_shape = (src.pixels.bands(), src.pixels.height(), src.pixels.width());
+    if dst_w == 0
+        || dst_h == 0
+        || source_shape.0 == 0
+        || source_shape.1 == 0
+        || source_shape.2 == 0
+        || src
+            .mask
+            .as_ref()
+            .is_some_and(|m| m.dim() != (source_shape.1, source_shape.2))
+        || ![dst_bbox.xmin, dst_bbox.ymin, dst_bbox.xmax, dst_bbox.ymax]
+            .iter()
+            .all(|v| v.is_finite())
+        || dst_bbox.width() <= 0.0
+        || dst_bbox.height() <= 0.0
+    {
+        return Err(AgError::Warp(
+            "invalid source shape, mask, or target grid".into(),
+        ));
+    }
     let dst_transform = GeoTransform::from_gdal(&[
         dst_bbox.xmin,
         dst_bbox.width() / dst_w as f64,
@@ -77,10 +97,19 @@ pub fn warp(
     // into the full dst tile, so a boundary tile (mapping partly outside
     // the COG) would stretch the valid strip across the whole tile. Such
     // tiles fall through to the scalar grid path below, which returns
-    // transparent fill for out-of-bounds source coords. EDGE_EPS matches
-    // the resampler's sub-pixel seam-halo tolerance so fully-interior
-    // tiles still take the SIMD path.
-    if &src.crs == dst_crs {
+    // transparent fill for out-of-bounds source coords. WARP_EDGE_EPS
+    // permits only numerical rounding, not a cropped half-pixel halo.
+    let origin = src.transform.forward(0.0, 0.0);
+    let col_axis = src.transform.forward(1.0, 0.0);
+    let row_axis = src.transform.forward(0.0, 1.0);
+    let north_up = col_axis.0 > origin.0
+        && row_axis.1 < origin.1
+        && col_axis.1 == origin.1
+        && row_axis.0 == origin.0;
+    let can_resize = matches!(src.pixels, PixelData::U8(_) | PixelData::U16(_))
+        && matches!(resampling, Resampling::Nearest)
+        && src.nodata.is_none();
+    if &src.crs == dst_crs && north_up && can_resize {
         let (lx, ty) = src_inv.forward(dst_bbox.xmin, dst_bbox.ymax);
         let (rx, by) = src_inv.forward(dst_bbox.xmax, dst_bbox.ymin);
         let (x0, x1) = (lx.min(rx), lx.max(rx));
@@ -118,7 +147,7 @@ pub fn warp(
             grid_dst.push((dx, dy));
         }
     }
-    crate::warp::projection::convert_batch(dst_crs, &src.crs, &mut grid_dst)?;
+    crate::warp::projection::convert_batch_partial(dst_crs, &src.crs, &mut grid_dst)?;
 
     let grid_src_pix: Vec<(f64, f64)> = grid_dst
         .into_iter()
@@ -132,7 +161,7 @@ pub fn warp(
     // CropBox derived from the grid corners. We accept the path when the
     // max residual at the interior grid samples is below 0.5 src pixels —
     // i.e. sub-pixel error, invisible after resampling.
-    if !matches!(resampling, Resampling::Mode) {
+    if can_resize && (&src.crs != dst_crs || north_up) && !matches!(resampling, Resampling::Mode) {
         if let Some(out) = try_subtile_affine(
             src,
             dst_crs,
@@ -187,7 +216,19 @@ pub fn warp(
     let band_views: Vec<ndarray::ArrayView2<f64>> = (0..bands)
         .map(|b| src_f64.index_axis(ndarray::Axis(0), b))
         .collect();
-    let src_mask_view = src.mask.as_ref().map(|m| m.view());
+    let needs_numeric_mask =
+        src.nodata.is_some() || matches!(src.pixels, PixelData::F32(_) | PixelData::F64(_));
+    let numeric_mask = needs_numeric_mask.then(|| {
+        Array2::from_shape_fn((src_h, src_w), |(r, c)| {
+            src.mask.as_ref().is_none_or(|m| m[[r, c]])
+                && (0..bands).all(|b| {
+                    let v = src_f64[[b, r, c]];
+                    v.is_finite() && src.nodata.is_none_or(|nd| nd.is_nan() || v != nd)
+                })
+        })
+    });
+    let source_mask = numeric_mask.as_ref().or(src.mask.as_ref());
+    let src_mask_view = source_mask.map(|m| m.view());
 
     // Process each row in parallel. Output band slices are disjoint along
     // the row dimension, so we collect per-row (mask_row, [band_row,...])
@@ -195,6 +236,22 @@ pub fn warp(
     use rayon::prelude::*;
     let is_average = matches!(resampling, Resampling::Average);
     let is_mode = matches!(resampling, Resampling::Mode);
+    let average_corners = if is_average {
+        let mut points = Vec::with_capacity((dst_w + 1) * (dst_h + 1));
+        for r in 0..=dst_h {
+            for c in 0..=dst_w {
+                points.push(dst_transform.forward(c as f64, r as f64));
+            }
+        }
+        crate::warp::projection::convert_batch_partial(dst_crs, &src.crs, &mut points)?;
+        for point in &mut points {
+            let (c, r) = src_inv.forward(point.0, point.1);
+            *point = (c - 0.5, r - 0.5);
+        }
+        Some(points)
+    } else {
+        None
+    };
     let coord_rows: Vec<Vec<(f64, f64)>> = (0..dst_h)
         .map(|r| row_src_coords(r, dst_h, dst_w, &col_table, &grid_src_pix))
         .collect();
@@ -206,70 +263,66 @@ pub fn warp(
             let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
 
             if is_average || is_mode {
-                // Footprint Jacobian by finite difference of source coords.
-                // Forward difference where a forward neighbour exists,
-                // backward difference at the trailing row/column — a clamped
-                // one-sided diff would collapse to zero and silently degrade
-                // the edge strip to bilinear (visible as tile-edge seams).
-                let r_fwd = (r + 1).min(dst_h - 1);
-                let r_bwd = r.saturating_sub(1);
-                let coords_r_fwd = &coord_rows[r_fwd];
-                let coords_r_bwd = (r_bwd != r).then_some(&coord_rows[r_bwd]);
+                // Differentiate the same bilinear control cell used for the
+                // center coordinate. This works even when either target axis
+                // has a single pixel (there is no neighbor to difference).
+                let gi = (r as f64 + 0.5) * WARP_GRID_SIZE as f64 / dst_h as f64;
+                let i0 = (gi.floor() as usize).min(WARP_GRID_SIZE - 1);
+                let di = gi - i0 as f64;
                 for c in 0..dst_w {
                     let (sc, sr) = coords[c];
-
-                    // Column step: source displacement per one dst-column.
-                    // (dx_col is the on-axis term, dy_col the shear term;
-                    //  both feed the axis-aligned footprint below.)
-                    let (col_a, col_b) = if c + 1 < dst_w {
-                        (coords[c + 1], coords[c])
-                    } else if c > 0 {
-                        (coords[c], coords[c - 1])
-                    } else {
-                        (coords[c], coords[c]) // dst_w == 1: no neighbour
-                    };
-                    let dx_col = (col_a.0 - col_b.0).abs();
-                    let dy_col = (col_a.1 - col_b.1).abs();
-
-                    // Row step: source displacement per one dst-row.
-                    let (row_a, row_b) = if r + 1 < dst_h {
-                        (coords_r_fwd[c], coords[c])
-                    } else if let Some(cb) = coords_r_bwd {
-                        (coords[c], cb[c])
-                    } else {
-                        (coords[c], coords[c]) // dst_h == 1: no neighbour
-                    };
-                    let dx_row = (row_a.0 - row_b.0).abs();
-                    let dy_row = (row_a.1 - row_b.1).abs();
-
-                    // Axis-aligned footprint half-extent: max source-x (and
-                    // source-y) displacement contributed by either step.
-                    let rx = (dx_col.max(dx_row) * 0.5).max(1e-6);
-                    let ry = (dy_col.max(dy_row) * 0.5).max(1e-6);
-
-                    mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
+                    let (j0, j1, dj) = col_table[c];
+                    let p00 = grid_src_pix[i0 * (WARP_GRID_SIZE + 1) + j0];
+                    let p01 = grid_src_pix[i0 * (WARP_GRID_SIZE + 1) + j1];
+                    let p10 = grid_src_pix[(i0 + 1) * (WARP_GRID_SIZE + 1) + j0];
+                    let p11 = grid_src_pix[(i0 + 1) * (WARP_GRID_SIZE + 1) + j1];
+                    let sx = WARP_GRID_SIZE as f64 / dst_w as f64;
+                    let sy = WARP_GRID_SIZE as f64 / dst_h as f64;
+                    let dx_col = ((p01.0 - p00.0) * (1.0 - di) + (p11.0 - p10.0) * di) * sx;
+                    let dy_col = ((p01.1 - p00.1) * (1.0 - di) + (p11.1 - p10.1) * di) * sx;
+                    let dx_row = ((p10.0 - p00.0) * (1.0 - dj) + (p11.0 - p01.0) * dj) * sy;
+                    let dy_row = ((p10.1 - p00.1) * (1.0 - dj) + (p11.1 - p01.1) * dj) * sy;
+                    // Axis-aligned envelope of the local pixel parallelogram.
+                    let rx = ((dx_col.abs() + dx_row.abs()) * 0.5).max(1e-6);
+                    let ry = ((dy_col.abs() + dy_row.abs()) * 0.5).max(1e-6);
                     for (b, band_view) in band_views.iter().enumerate() {
-                        band_rows[b][c] = if is_mode {
-                            resampling.sample_mode(*band_view, src_mask_view, sc, sr, rx, ry, fill)
-                        } else {
-                            resampling.sample_average(
+                        let value = if is_mode {
+                            resampling.sample_mode(
                                 *band_view,
                                 src_mask_view,
                                 sc,
                                 sr,
                                 rx,
                                 ry,
-                                fill,
+                                f64::NAN,
+                            )
+                        } else {
+                            let corners = average_corners.as_ref().unwrap();
+                            let top = r * (dst_w + 1) + c;
+                            let bottom = (r + 1) * (dst_w + 1) + c;
+                            resampling.sample_average_polygon(
+                                *band_view,
+                                src_mask_view,
+                                [
+                                    corners[top],
+                                    corners[top + 1],
+                                    corners[bottom + 1],
+                                    corners[bottom],
+                                ],
+                                f64::NAN,
                             )
                         };
+                        mask_row[c] &= value.is_finite();
+                        band_rows[b][c] = if value.is_finite() { value } else { fill };
                     }
                 }
             } else {
                 for (c, &(sc, sr)) in coords.iter().enumerate() {
-                    mask_row[c] = sample_valid(src.mask.as_ref(), src_w, src_h, sc, sr);
                     for (b, band_view) in band_views.iter().enumerate() {
-                        band_rows[b][c] =
-                            resampling.sample_masked(*band_view, src_mask_view, sc, sr, fill);
+                        let value =
+                            resampling.sample_masked(*band_view, src_mask_view, sc, sr, f64::NAN);
+                        mask_row[c] &= value.is_finite();
+                        band_rows[b][c] = if value.is_finite() { value } else { fill };
                     }
                 }
             }
@@ -292,8 +345,17 @@ pub fn warp(
         }
     }
 
+    // Preserve the native display dtype across geometry paths. Otherwise an
+    // interpolated U8 RGB image would unexpectedly enter float auto-stretch.
+    // Wide integer/F64 sources retain F64 rather than losing bits via F32.
+    let pixels = match src.pixels {
+        PixelData::U8(_) => PixelData::U8(out.mapv(|v| v.round().clamp(0.0, 255.0) as u8)),
+        PixelData::U16(_) => PixelData::U16(out.mapv(|v| v.round().clamp(0.0, 65535.0) as u16)),
+        PixelData::F32(_) => PixelData::F32(out.mapv(|v| v as f32)),
+        _ => PixelData::F64(out),
+    };
     Ok(ImageData {
-        pixels: PixelData::F64(out),
+        pixels,
         mask: Some(mask),
         bbox: dst_bbox,
         crs: dst_crs.clone(),
@@ -310,9 +372,8 @@ pub fn warp(
 /// from the poles). Returns `Ok(None)` and lets the caller fall through to
 /// the per-pixel scalar sampler when the approximation fails.
 ///
-/// Mirrors GDAL `gdalwarp`'s default "approx_transformer" heuristic: do
-/// one PROJ sweep at the corners, validate against an interior grid, and
-/// promote to the rectilinear fast path when error is sub-pixel.
+/// Validates the rectangular approximation against the control grid; this
+/// is a bounded approximation, not a claim of exact GDAL transformer parity.
 #[allow(clippy::too_many_arguments)]
 fn try_subtile_affine(
     src: &ImageData,
@@ -331,22 +392,27 @@ fn try_subtile_affine(
     let pn0 = grid_src_pix[idx(n, 0)];
     let pnn = grid_src_pix[idx(n, n)];
 
-    // The samples at the four grid corners give us the linear approximation
-    // src = lerp(corners; di, dj). Check that this linear model approximates
-    // every interior grid point within SUBTILE_MAX_ERR_PX.
+    // Crop/resize only represents increasing, axis-aligned source axes.
+    // A bilinear four-corner fit can be exact for shear and still be an
+    // incorrect model for the rectangular crop actually sent to resize.
+    if !grid_src_pix
+        .iter()
+        .all(|&(x, y)| x.is_finite() && y.is_finite())
+        || p0n.0 <= p00.0
+        || pn0.1 <= p00.1
+    {
+        return Ok(None);
+    }
+
+    // Compare every control point with the axis-aligned rectangle actually
+    // supplied to resize, rather than with a potentially sheared quadrilateral.
     let mut max_err2 = 0.0_f64;
     for i in 0..=n {
         let di = i as f64 / n as f64;
         for j in 0..=n {
             let dj = j as f64 / n as f64;
-            let predict_x = p00.0 * (1.0 - di) * (1.0 - dj)
-                + p0n.0 * (1.0 - di) * dj
-                + pn0.0 * di * (1.0 - dj)
-                + pnn.0 * di * dj;
-            let predict_y = p00.1 * (1.0 - di) * (1.0 - dj)
-                + p0n.1 * (1.0 - di) * dj
-                + pn0.1 * di * (1.0 - dj)
-                + pnn.1 * di * dj;
+            let predict_x = p00.0 + (p0n.0 - p00.0) * dj;
+            let predict_y = p00.1 + (pn0.1 - p00.1) * di;
             let actual = grid_src_pix[idx(i, j)];
             let dx = predict_x - actual.0;
             let dy = predict_y - actual.1;
@@ -386,9 +452,8 @@ fn try_subtile_affine(
     // full dst tile stretches the valid strip across the whole tile
     // (smeared edges on COG-perimeter tiles at deep zoom). Fall back to the
     // scalar sampler, which returns transparent fill for out-of-bounds src
-    // coords. WARP_EDGE_EPS keeps the same sub-pixel seam-halo tolerance
-    // as the resampler edge handling, so fully-interior tiles still take
-    // this SIMD fast path.
+    // coords. Only floating-point rounding tolerance is allowed here:
+    // clamping a half-pixel halo would change the extent being resized.
     if min_x < -WARP_EDGE_EPS
         || min_y < -WARP_EDGE_EPS
         || max_x > src_w + WARP_EDGE_EPS
@@ -404,41 +469,13 @@ fn try_subtile_affine(
     let crop_w = (crop_right - crop_left).max(1e-9);
     let crop_h = (crop_bot - crop_top).max(1e-9);
 
-    use fast_image_resize as fr;
-    let alg = match resampling {
-        Resampling::Nearest => fr::ResizeAlg::Nearest,
-        Resampling::Bilinear => fr::ResizeAlg::Convolution(fr::FilterType::Bilinear),
-        Resampling::Cubic => fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom),
-        Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
-        Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
-        Resampling::Average => fr::ResizeAlg::Convolution(fr::FilterType::Box),
-        Resampling::Mode => fr::ResizeAlg::Nearest, // unreachable: Mode bypasses fr (routed to scalar majority path)
-    };
-    let options = fr::ResizeOptions::new()
-        .resize_alg(alg)
-        .crop(crop_left, crop_top, crop_w, crop_h);
-    // Dispatch on source dtype — same fan-out as warp_affine.
-    let pixels = match &src.pixels {
-        PixelData::U8(a) => {
-            PixelData::U8(resize_bands(a, fr::PixelType::U8, dst_w, dst_h, &options)?)
-        }
-        PixelData::U16(a) => {
-            PixelData::U16(resize_bands(a, fr::PixelType::U16, dst_w, dst_h, &options)?)
-        }
-        PixelData::F32(a) => {
-            PixelData::F32(resize_bands(a, fr::PixelType::F32, dst_w, dst_h, &options)?)
-        }
-        other => {
-            let f32_arr = other.to_f64().mapv(|v| v as f32);
-            PixelData::F32(resize_bands(
-                &f32_arr,
-                fr::PixelType::F32,
-                dst_w,
-                dst_h,
-                &options,
-            )?)
-        }
-    };
+    let pixels = resize_nearest_pixels(
+        src,
+        dst_w,
+        dst_h,
+        (crop_left, crop_top, crop_w, crop_h),
+        resampling,
+    )?;
 
     tracing::debug!(
         max_err_px = max_err2.sqrt(),
@@ -467,9 +504,8 @@ fn try_subtile_affine(
 ///
 /// Dispatches on the source `PixelData` variant so each band is fed to
 /// `fast_image_resize` in its native dtype — U8/U16 use the integer SIMD
-/// kernels directly, F32 uses the float kernel. F64/I16/I32/U32 are
-/// cast once to F32 (matching GDAL's default working type) so the SIMD
-/// path stays in scope.
+/// kernels directly, F32 uses the float kernel. Other dtypes and all
+/// interpolating kernels use the shared F64 scalar sampler.
 #[allow(clippy::too_many_arguments)]
 fn warp_affine(
     src: &ImageData,
@@ -481,8 +517,6 @@ fn warp_affine(
     src_inv: GeoTransform,
     dst_transform: GeoTransform,
 ) -> AgResult<ImageData> {
-    use fast_image_resize as fr;
-
     let (left_a, top_a) = src_inv.forward(dst_bbox.xmin, dst_bbox.ymax);
     let (right_a, bot_a) = src_inv.forward(dst_bbox.xmax, dst_bbox.ymin);
     let crop_left = left_a.min(right_a).max(0.0);
@@ -502,44 +536,13 @@ fn warp_affine(
     let crop_w_clamped = (crop_right - crop_left).max(1e-9);
     let crop_h_clamped = (crop_bot - crop_top).max(1e-9);
 
-    let alg = match resampling {
-        Resampling::Nearest => fr::ResizeAlg::Nearest,
-        Resampling::Bilinear => fr::ResizeAlg::Convolution(fr::FilterType::Bilinear),
-        Resampling::Cubic => fr::ResizeAlg::Convolution(fr::FilterType::CatmullRom),
-        Resampling::CubicSpline => fr::ResizeAlg::Convolution(fr::FilterType::Mitchell),
-        Resampling::Lanczos => fr::ResizeAlg::Convolution(fr::FilterType::Lanczos3),
-        Resampling::Average => fr::ResizeAlg::Convolution(fr::FilterType::Box),
-        Resampling::Mode => fr::ResizeAlg::Nearest, // unreachable: Mode bypasses fr (routed to scalar majority path)
-    };
-    let options = fr::ResizeOptions::new().resize_alg(alg).crop(
-        crop_left,
-        crop_top,
-        crop_w_clamped,
-        crop_h_clamped,
-    );
-    let pixels = match &src.pixels {
-        PixelData::U8(a) => {
-            PixelData::U8(resize_bands(a, fr::PixelType::U8, dst_w, dst_h, &options)?)
-        }
-        PixelData::U16(a) => {
-            PixelData::U16(resize_bands(a, fr::PixelType::U16, dst_w, dst_h, &options)?)
-        }
-        PixelData::F32(a) => {
-            PixelData::F32(resize_bands(a, fr::PixelType::F32, dst_w, dst_h, &options)?)
-        }
-        // I16/I32/U32/F64 cast to F32 once — fast_image_resize has no
-        // native signed-int or f64 SIMD kernel, but f32 keeps SIMD on.
-        other => {
-            let f32_arr = other.to_f64().mapv(|v| v as f32);
-            PixelData::F32(resize_bands(
-                &f32_arr,
-                fr::PixelType::F32,
-                dst_w,
-                dst_h,
-                &options,
-            )?)
-        }
-    };
+    let pixels = resize_nearest_pixels(
+        src,
+        dst_w,
+        dst_h,
+        (crop_left, crop_top, crop_w_clamped, crop_h_clamped),
+        resampling,
+    )?;
 
     let mask = resample_mask_nearest(
         src.mask.as_ref(),
@@ -557,6 +560,51 @@ fn warp_affine(
         transform: dst_transform,
         nodata: src.nodata,
     })
+}
+
+/// One native-dtype executor for both verified crop geometries. Interpolating
+/// kernels deliberately use the common scalar implementation for identical
+/// mask, precision and kernel semantics at interior and boundary pixels.
+fn resize_nearest_pixels(
+    src: &ImageData,
+    width: usize,
+    height: usize,
+    crop: (f64, f64, f64, f64),
+    resampling: Resampling,
+) -> AgResult<PixelData> {
+    use fast_image_resize as fr;
+    if resampling != Resampling::Nearest {
+        return Err(AgError::Warp("native resize supports nearest only".into()));
+    }
+    let options = fr::ResizeOptions::new()
+        .resize_alg(fr::ResizeAlg::Nearest)
+        .crop(crop.0, crop.1, crop.2, crop.3);
+    match &src.pixels {
+        PixelData::U8(a) => Ok(PixelData::U8(resize_bands(
+            a,
+            fr::PixelType::U8,
+            width,
+            height,
+            &options,
+        )?)),
+        PixelData::U16(a) => Ok(PixelData::U16(resize_bands(
+            a,
+            fr::PixelType::U16,
+            width,
+            height,
+            &options,
+        )?)),
+        PixelData::F32(a) => Ok(PixelData::F32(resize_bands(
+            a,
+            fr::PixelType::F32,
+            width,
+            height,
+            &options,
+        )?)),
+        _ => Err(AgError::Warp(
+            "dtype requires precision-preserving scalar warp".into(),
+        )),
+    }
 }
 
 /// Resample an `Array2<bool>` validity mask through the same crop+resize
@@ -661,31 +709,252 @@ fn resize_bands<T: bytemuck::Pod + Default + Send + Sync>(
         .map_err(|e| AgError::Warp(format!("resize output reshape: {e}")))
 }
 
-fn sample_valid(
-    mask: Option<&Array2<bool>>,
-    width: usize,
-    height: usize,
-    col: f64,
-    row: f64,
-) -> bool {
-    // NaN guard: PROJ at antimeridian / pole can return NaN. Without the
-    // `is_finite` check the `as i64` cast silently produces 0, marking the
-    // tile corner as a "valid" sample at (0, 0).
-    if !col.is_finite() || !row.is_finite() {
-        return false;
-    }
-    let c = col.round() as i64;
-    let r = row.round() as i64;
-    if c < 0 || r < 0 || c >= width as i64 || r >= height as i64 {
-        return false;
-    }
-    mask.map(|m| m[[r as usize, c as usize]]).unwrap_or(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::Array3;
+
+    #[test]
+    fn average_warp_integrates_rotated_pixel_footprint() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::F64(Array3::from_shape_fn((1, 3, 3), |(_, r, c)| {
+            if r == 1 && c == 1 {
+                100.0
+            } else {
+                10.0
+            }
+        }));
+        src.transform = GeoTransform::from_gdal(&[-1.0, 0.5, 0.5, 0.5, 0.5, -0.5]);
+        let out = warp(
+            &src,
+            &src.crs,
+            Bbox::new(0.0, 0.0, 1.0, 1.0),
+            1,
+            1,
+            Resampling::Average,
+        )
+        .unwrap();
+        assert!((out.pixels.to_f64()[[0, 0, 0]] - 55.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boundary_warp_samples_pixel_centers() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::F64(Array3::from_shape_fn((1, 4, 4), |(_, r, c)| {
+            (r * 40 + c * 10) as f64
+        }));
+        // One extra column forces the scalar path. The first four columns
+        // still have exactly the source pixel centers.
+        for kernel in [Resampling::Nearest, Resampling::Bilinear] {
+            let out = warp(&src, &src.crs, Bbox::new(0.0, 0.0, 5.0, 4.0), 5, 4, kernel).unwrap();
+            let values = out.pixels.to_f64();
+            assert_eq!(values[[0, 0, 0]], 0.0, "{kernel:?}");
+            assert_eq!(values[[0, 3, 3]], 150.0, "{kernel:?}");
+            assert!(out.mask.as_ref().unwrap()[[3, 3]]);
+            assert!(!out.mask.as_ref().unwrap()[[0, 4]]);
+        }
+    }
+
+    #[test]
+    fn warp_rejects_empty_target_grid() {
+        let src = dummy_src(Crs::epsg(3857));
+        assert!(warp(&src, &src.crs, src.bbox, 0, 4, Resampling::Nearest).is_err());
+    }
+
+    #[test]
+    fn average_single_pixel_covers_source() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::F64(Array3::from_shape_fn((1, 4, 4), |(_, r, c)| {
+            (r * 4 + c) as f64
+        }));
+        let out = warp(&src, &src.crs, src.bbox, 1, 1, Resampling::Average).unwrap();
+        assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 7.5);
+    }
+
+    #[test]
+    fn interpolated_valid_support_sets_output_mask() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::F64(Array3::from_elem((1, 4, 4), 100.0));
+        src.mask = Some(Array2::from_shape_fn((4, 4), |(_, c)| c != 0));
+        let out = warp(
+            &src,
+            &src.crs,
+            Bbox::new(0.25, 2.0, 1.25, 3.0),
+            1,
+            1,
+            Resampling::Bilinear,
+        )
+        .unwrap();
+        assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 100.0);
+        assert!(out.mask.unwrap()[[0, 0]]);
+    }
+
+    #[test]
+    fn zero_weight_nan_neighbor_does_not_pollute_warp() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::F32(Array3::from_shape_fn((1, 4, 4), |(_, _, c)| {
+            if c == 1 {
+                f32::NAN
+            } else {
+                100.0
+            }
+        }));
+        let out = warp(&src, &src.crs, src.bbox, 4, 4, Resampling::Bilinear).unwrap();
+        assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 100.0);
+    }
+
+    #[test]
+    fn boundary_nearest_does_not_resize_clipped_extent() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::U8(Array3::from_shape_fn((1, 4, 4), |(_, _, c)| c as u8));
+        let out = warp(
+            &src,
+            &src.crs,
+            Bbox::new(-0.5, 0.0, 4.5, 4.0),
+            5,
+            4,
+            Resampling::Nearest,
+        )
+        .unwrap();
+        assert_eq!(
+            out.pixels.to_f64().slice(ndarray::s![0, 0, ..]).to_vec(),
+            vec![0.0, 1.0, 2.0, 3.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn warp_rejects_mask_shape_mismatch() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.mask = Some(Array2::from_elem((1, 1), true));
+        assert!(warp(&src, &src.crs, src.bbox, 4, 4, Resampling::Nearest).is_err());
+    }
+
+    #[cfg(feature = "proj")]
+    #[test]
+    fn warp_keeps_valid_part_of_projection_domain() {
+        let mut src = dummy_src(Crs::epsg(3413));
+        src.pixels = PixelData::F64(Array3::from_elem((1, 4, 4), 100.0));
+        src.transform = GeoTransform::from_gdal(&[-2e6, 1e6, 0.0, 2e6, 0.0, -1e6]);
+        let out = warp(
+            &src,
+            &Crs::epsg(4326),
+            Bbox::new(-10.0, 80.0, 10.0, 100.0),
+            10,
+            10,
+            Resampling::Nearest,
+        )
+        .unwrap();
+        assert!(out.mask.unwrap().iter().any(|&v| v));
+    }
+
+    #[test]
+    fn flipped_source_preserves_world_orientation() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::U8(Array3::from_shape_fn((1, 4, 4), |(_, _, c)| c as u8 * 10));
+        src.transform = GeoTransform::from_gdal(&[4.0, -1.0, 0.0, 4.0, 0.0, -1.0]);
+        let out = warp(&src, &src.crs, src.bbox, 4, 4, Resampling::Nearest).unwrap();
+        assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 30.0);
+        assert_eq!(out.pixels.to_f64()[[0, 0, 3]], 0.0);
+    }
+
+    #[test]
+    fn nearest_warp_preserves_wide_numeric_precision() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::U32(Array3::from_elem((1, 4, 4), 16_777_217));
+        let out = warp(&src, &src.crs, src.bbox, 4, 4, Resampling::Nearest).unwrap();
+        assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 16_777_217.0);
+    }
+
+    #[test]
+    fn bilinear_warp_excludes_invalid_neighbors() {
+        for numeric_nodata in [false, true] {
+            let mut src = dummy_src(Crs::epsg(3857));
+            src.pixels = PixelData::F32(Array3::from_shape_fn((1, 4, 4), |(_, _, c)| {
+                if c == 0 {
+                    -9999.0
+                } else {
+                    100.0
+                }
+            }));
+            if numeric_nodata {
+                src.nodata = Some(-9999.0);
+            } else {
+                src.mask = Some(Array2::from_shape_fn((4, 4), |(_, c)| c != 0));
+            }
+            // Source center-index coordinate 0.75: nearest is valid, but
+            // interpolation still overlaps the invalid first column.
+            let out = warp(
+                &src,
+                &src.crs,
+                Bbox::new(0.75, 2.0, 1.75, 3.0),
+                1,
+                1,
+                Resampling::Bilinear,
+            )
+            .unwrap();
+            assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 100.0);
+            assert!(out.mask.unwrap()[[0, 0]]);
+        }
+    }
+
+    #[test]
+    fn interior_and_boundary_paths_use_same_kernel() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::U8(Array3::from_shape_fn((1, 4, 4), |(_, _, c)| {
+            if c == 1 {
+                100
+            } else {
+                0
+            }
+        }));
+        for kernel in [
+            Resampling::Bilinear,
+            Resampling::Cubic,
+            Resampling::CubicSpline,
+            Resampling::Lanczos,
+            Resampling::Average,
+        ] {
+            let interior = warp(&src, &src.crs, src.bbox, 8, 8, kernel).unwrap();
+            let boundary =
+                warp(&src, &src.crs, Bbox::new(0.0, 0.0, 5.0, 4.0), 10, 8, kernel).unwrap();
+            assert!(
+                (interior.pixels.to_f64()[[0, 3, 3]] - boundary.pixels.to_f64()[[0, 3, 3]]).abs()
+                    < 1e-9,
+                "{kernel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_warp_preserves_native_display_dtype() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::U8(Array3::from_elem((3, 4, 4), 100));
+        let out = warp(&src, &src.crs, src.bbox, 8, 8, Resampling::Bilinear).unwrap();
+        assert!(
+            matches!(out.pixels, PixelData::U8(_)),
+            "U8 styles must not acquire float auto-stretch semantics"
+        );
+    }
+
+    #[test]
+    fn sheared_source_uses_spatial_sampling() {
+        let mut src = dummy_src(Crs::epsg(3857));
+        src.pixels = PixelData::U8(Array3::from_shape_fn((1, 4, 8), |(_, r, c)| {
+            (r * 10 + c) as u8
+        }));
+        src.transform = GeoTransform::from_gdal(&[0.0, 1.0, 1.0, 4.0, 0.0, -1.0]);
+        let out = warp(
+            &src,
+            &src.crs,
+            Bbox::new(4.0, 0.0, 8.0, 4.0),
+            4,
+            4,
+            Resampling::Nearest,
+        )
+        .unwrap();
+        assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 4.0);
+        assert_eq!(out.pixels.to_f64()[[0, 3, 0]], 31.0);
+    }
 
     fn identity_resize_options() -> fast_image_resize::ResizeOptions {
         fast_image_resize::ResizeOptions::new().resize_alg(fast_image_resize::ResizeAlg::Nearest)
@@ -749,23 +1018,8 @@ mod tests {
         assert_eq!(out.crs, src.crs);
     }
 
-    /// Integration test that provably exercises the scalar `is_average` fallback branch.
-    ///
-    /// Control-flow reasoning:
-    ///   1. src CRS (EPSG:4326) ≠ dst CRS (EPSG:3857) → same-CRS fast path skipped.
-    ///   2. The dst bbox in EPSG:3857 is chosen to map partly *outside* the source
-    ///      image bounds when projected back to EPSG:4326 pixel space.  Concretely,
-    ///      the source covers lon 0–8°, lat 0–8°, but the dst bbox extends to
-    ///      ~lon −1° and ~lon 15° (in EPSG:3857 meters), so the grid corners in
-    ///      src-pixel space have min_x < 0 and max_x > src_w.  `try_subtile_affine`
-    ///      detects this at the out-of-bounds guard (lines 348-354) and returns
-    ///      `Ok(None)`, falling through to the scalar loop.
-    ///
-    /// Path oracle:
-    ///   The scalar fallback always returns `PixelData::F64(out)`.
-    ///   `try_subtile_affine` converts F64 sources to F32 and returns
-    ///   `PixelData::F32`.  Asserting `PixelData::F64` therefore FAILS if the
-    ///   implementation ever silently routes through the fast path instead.
+    /// Average over a cross-CRS tile that extends outside the source.
+    /// The kernel must preserve valid source values and F64 precision.
     #[test]
     fn average_cross_crs_scalar_path_box_mean() {
         // 8×8 ramp: pixel (y,x) = y*8+x, range [0, 63].
@@ -788,10 +1042,7 @@ mod tests {
         let dst_bbox = Bbox::new(-111_195.0, 0.0, 1_669_792.0, 1_003_750.0);
         let out = warp(&src, &Crs::epsg(3857), dst_bbox, 4, 4, Resampling::Average).unwrap();
 
-        // ── Path oracle ──────────────────────────────────────────────────────
-        // The scalar fallback returns F64; the SIMD fast path converts F64→F32.
-        // This assertion is the coverage guard: it fails if the test silently
-        // takes the fast path.
+        // F64 source precision must be retained.
         assert!(
             matches!(out.pixels, PixelData::F64(_)),
             "expected scalar fallback (F64 output) but got a different variant"
@@ -839,11 +1090,11 @@ mod tests {
         // Downsample 4x4 → 2x2, same CRS. Each output pixel covers a pure
         // 2x2 block (all class 1 or all class 9) → mean (5.0) must NEVER appear.
         let out = warp(&src, &Crs::epsg(3857), src.bbox, 2, 2, Resampling::Mode).unwrap();
-        // Path oracle: scalar fallback returns F64; fr fast-paths cast F64→F32.
-        // This assertion fails if Mode silently takes an fr fast-path (F32).
+        // Preserve F64 categorical values.
+        // Value assertions below establish the majority semantics.
         assert!(
             matches!(out.pixels, PixelData::F64(_)),
-            "expected scalar majority path (F64) but Mode took an fr fast-path (F32)"
+            "expected F64 categorical output"
         );
         let f = out.pixels.to_f64();
         for v in f.iter() {
@@ -854,29 +1105,7 @@ mod tests {
         }
     }
 
-    /// Regression guard: cross-CRS `Resampling::Mode` must route through the
-    /// scalar majority path, NOT through `try_subtile_affine` + fr.
-    ///
-    /// Control-flow reasoning:
-    ///   - src EPSG:4326, dst EPSG:3857 → same-CRS fast path skipped.
-    ///   - The dst bbox is the same in-bounds geometry used by
-    ///     `average_cross_crs_downsample_within_source_range`: the grid fits
-    ///     entirely within the 8×8 source image, so `try_subtile_affine`
-    ///     *would* return `Some(...)` for other resamplers (e.g. Average).
-    ///   - The bypass at `if !matches!(resampling, Resampling::Mode)` (line 135)
-    ///     prevents `try_subtile_affine` from running, routing Mode to the
-    ///     scalar majority loop instead.
-    ///
-    /// Path oracle: scalar returns `PixelData::F64`; `try_subtile_affine`
-    /// converts F64→F32 and returns `PixelData::F32`. If the bypass were
-    /// removed, Mode would take the fr/Nearest path and return F32 — the
-    /// `matches!(PixelData::F64(_))` assertion would fail immediately.
-    ///
-    /// Value oracle: for a source with only class values 1 and 9, the scalar
-    /// majority sampler must never produce inter-class values. If Mode
-    /// incorrectly went through fr's continuous Nearest filter, bilinear
-    /// blending at the class boundary could produce values strictly between 1
-    /// and 9 — the per-pixel assertion would catch that.
+    /// Cross-CRS categorical output contains only original source classes.
     #[test]
     fn mode_cross_crs_preserves_class() {
         // 16×8 single-band categorical source in EPSG:4326:
@@ -914,11 +1143,11 @@ mod tests {
         assert_eq!(out.pixels.width(), 4);
 
         // ── Path oracle ──────────────────────────────────────────────────────
-        // Scalar majority path returns F64; try_subtile_affine returns F32.
+        // Preserve the source precision.
         // This trips the moment the bypass is removed (Mode silently takes fr).
         assert!(
             matches!(out.pixels, PixelData::F64(_)),
-            "expected scalar majority path (F64) but Mode took the fr fast-path (F32); \
+            "expected F64 categorical output; \
              the `if !matches!(resampling, Resampling::Mode)` bypass may be missing"
         );
 

@@ -25,6 +25,7 @@ pub(crate) type PendingBlock = watch::Receiver<Option<BlockResult>>;
 /// Outcome of [`BlockCache::claim`]: either this caller owns the fetch (and must
 /// `resolve` the returned guard), or another caller is already fetching it.
 pub(crate) enum Claim {
+    Ready(Arc<DecodedBlock>),
     Owned(InflightGuard),
     Pending(PendingBlock),
 }
@@ -199,19 +200,29 @@ impl BlockCache {
     /// already claimed it. The first caller for a cold block receives
     /// [`Claim::Owned`]; concurrent callers receive [`Claim::Pending`] and avoid
     /// issuing a duplicate network fetch.
-    pub(crate) fn claim(&self, key: &BlockKey) -> Claim {
-        let mut map = self.inflight.lock().unwrap();
-        if let Some(rx) = map.get(key) {
-            return Claim::Pending(rx.clone());
+    pub(crate) async fn claim(&self, key: &BlockKey) -> Claim {
+        let guard = {
+            let mut map = self.inflight.lock().unwrap();
+            if let Some(rx) = map.get(key) {
+                return Claim::Pending(rx.clone());
+            }
+            let (tx, rx) = watch::channel(None);
+            map.insert(key.clone(), rx);
+            InflightGuard {
+                key: key.clone(),
+                tx,
+                inflight: Arc::clone(&self.inflight),
+                resolved: false,
+            }
+        };
+        // A prior owner may have completed since the caller's initial probe.
+        // Recheck only after reserving the slot, so no other owner can race us.
+        if let Some(block) = self.inner.get(key).await {
+            guard.resolve(Ok(Arc::clone(&block)));
+            Claim::Ready(block)
+        } else {
+            Claim::Owned(guard)
         }
-        let (tx, rx) = watch::channel(None);
-        map.insert(key.clone(), rx);
-        Claim::Owned(InflightGuard {
-            key: key.clone(),
-            tx,
-            inflight: Arc::clone(&self.inflight),
-            resolved: false,
-        })
     }
 
     /// Await an in-flight block another caller is fetching.
@@ -337,18 +348,16 @@ mod tests {
     use crate::error::AgError;
     use crate::io::cache::CacheConfig;
 
-    /// Open the AOT.tif fixture (UInt16, Deflate) and decode tile (0, 0).
+    /// Open the checked-in UInt16 fixture and decode tile (0, 0).
     ///
     /// This is the only public path to an `async_tiff::Array` since
     /// `Array::try_new` is `pub(crate)` in async-tiff 0.3.x.
     ///
-    /// Returns `None` when the fixture file is absent so tests can skip
-    /// gracefully rather than hard-panicking in CI environments without data.
-    async fn sample_array() -> Option<Array> {
-        let tif = std::env::current_dir().unwrap().join("data/AOT.tif");
-        if !tif.exists() {
-            return None;
-        }
+    /// A missing required fixture must fail the test.
+    async fn sample_array() -> Array {
+        let tif = std::env::current_dir()
+            .unwrap()
+            .join("tests/fixtures/uint16.tif");
         let fs = Arc::new(LocalFileSystem::new());
         let reader = ObjectReader::new(fs, Path::from_filesystem_path(&tif).unwrap());
         let md_cache = ReadaheadMetadataCache::new(reader.clone());
@@ -357,7 +366,7 @@ mod tests {
         let tiff = TIFF::new(ifds, md.endianness());
         let ifd = &tiff.ifds()[0];
         let tile = ifd.fetch_tile(0, 0, &reader).await.unwrap();
-        Some(tile.decode(&Default::default()).unwrap())
+        tile.decode(&Default::default()).unwrap()
     }
 
     fn make_key(source: &str) -> BlockKey {
@@ -386,10 +395,7 @@ mod tests {
     /// `× dtype.size()` factor would make (a) half of (b) and the test fails.
     #[tokio::test]
     async fn decoded_block_weight_is_byte_size() {
-        let Some(array) = sample_array().await else {
-            eprintln!("fixture missing, skipping");
-            return;
-        };
+        let array = sample_array().await;
 
         // Verify we got a non-trivial UInt16 tile.
         assert_eq!(
@@ -424,14 +430,8 @@ mod tests {
         let key = make_key("aot");
         let calls = Arc::new(AtomicUsize::new(0));
 
-        let Some(array_a) = sample_array().await else {
-            eprintln!("fixture missing, skipping");
-            return;
-        };
-        let Some(array_b) = sample_array().await else {
-            eprintln!("fixture missing, skipping");
-            return;
-        };
+        let array_a = sample_array().await;
+        let array_b = sample_array().await;
 
         let calls_a = Arc::clone(&calls);
         let a = cache
@@ -467,14 +467,8 @@ mod tests {
     async fn distinct_sources_do_not_collide() {
         let cache = default_cache();
 
-        let Some(array1) = sample_array().await else {
-            eprintln!("fixture missing, skipping");
-            return;
-        };
-        let Some(array2) = sample_array().await else {
-            eprintln!("fixture missing, skipping");
-            return;
-        };
+        let array1 = sample_array().await;
+        let array2 = sample_array().await;
         let expected_weight = DecodedBlock::new(array1.clone()).weight();
 
         let key1 = make_key("source-a");
@@ -508,21 +502,18 @@ mod tests {
 
     #[tokio::test]
     async fn claim_dedups_and_await_pending_receives_result() {
-        let Some(array) = sample_array().await else {
-            eprintln!("fixture missing, skipping");
-            return;
-        };
+        let array = sample_array().await;
         let cache = default_cache();
         let key = make_key("inflight");
 
         // First claim owns the fetch; a concurrent claim is pending.
-        let guard = match cache.claim(&key) {
+        let guard = match cache.claim(&key).await {
             Claim::Owned(g) => g,
-            Claim::Pending(_) => panic!("first claim must own the fetch"),
+            Claim::Pending(_) | Claim::Ready(_) => panic!("first claim must own the fetch"),
         };
-        let pending = match cache.claim(&key) {
+        let pending = match cache.claim(&key).await {
             Claim::Pending(rx) => rx,
-            Claim::Owned(_) => panic!("second concurrent claim must be pending"),
+            Claim::Owned(_) | Claim::Ready(_) => panic!("second concurrent claim must be pending"),
         };
 
         let block = Arc::new(DecodedBlock::new(array));
@@ -537,7 +528,7 @@ mod tests {
 
         // Slot is freed after resolve → a later claim owns again.
         assert!(
-            matches!(cache.claim(&key), Claim::Owned(_)),
+            matches!(cache.claim(&key).await, Claim::Owned(_)),
             "resolved slot must be freed for re-claim"
         );
     }
@@ -546,13 +537,13 @@ mod tests {
     async fn dropped_guard_cancels_waiters_and_frees_slot() {
         let cache = default_cache();
         let key = make_key("inflight-drop");
-        let guard = match cache.claim(&key) {
+        let guard = match cache.claim(&key).await {
             Claim::Owned(g) => g,
-            Claim::Pending(_) => unreachable!(),
+            Claim::Pending(_) | Claim::Ready(_) => unreachable!(),
         };
-        let pending = match cache.claim(&key) {
+        let pending = match cache.claim(&key).await {
             Claim::Pending(rx) => rx,
-            Claim::Owned(_) => unreachable!(),
+            Claim::Owned(_) | Claim::Ready(_) => unreachable!(),
         };
         // Owner gives up without resolving (e.g. fetch error / task abort).
         drop(guard);
@@ -561,17 +552,31 @@ mod tests {
             "waiter must observe Ok(None) when owner drops (signal to retry)"
         );
         assert!(
-            matches!(cache.claim(&key), Claim::Owned(_)),
+            matches!(cache.claim(&key).await, Claim::Owned(_)),
             "cancelled slot must be freed for re-claim"
         );
     }
 
     #[tokio::test]
+    async fn audit_claim_rechecks_cache_after_stale_miss() {
+        let cache = default_cache();
+        let key = make_key("race");
+        assert!(cache.get(&key).await.is_none());
+        // Another request completes between our initial probe and claim.
+        let array = sample_array().await;
+        cache
+            .try_get_with(key.clone(), async move { Ok(DecodedBlock::new(array)) })
+            .await
+            .unwrap();
+        assert!(
+            !matches!(cache.claim(&key).await, Claim::Owned(_)),
+            "stale miss must not own a duplicate fetch"
+        );
+    }
+
+    #[tokio::test]
     async fn stats_track_hits_misses_decode_and_fetch() {
-        let Some(array) = sample_array().await else {
-            eprintln!("fixture missing, skipping");
-            return;
-        };
+        let array = sample_array().await;
         let cache = BlockCache::new(CacheConfig::default());
         let key = make_key("s1");
 

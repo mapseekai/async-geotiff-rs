@@ -128,7 +128,8 @@
       </div>
       <div class="field">
         <label for="bidx">Bands</label>
-        <input id="bidx" name="bidx" type="text" value="1,2,3" />
+        <input id="bidx" name="bidx" type="text" value="" placeholder="Auto" />
+        <small id="band-note" role="status" hidden></small>
       </div>
       <div class="field wide">
         <label for="expression">Expression</label>
@@ -186,6 +187,7 @@
       // extension drives the output format. tileUrl() appends the selected ext.
       const TILE_BASE = "/tiles/WebMercatorQuad/{z}/{x}/{y}";
       let styleVersion = 0;
+      let rasterReady = false;
       const c = {
         dataset: document.getElementById("dataset"),
         basemap: document.getElementById("basemap"),
@@ -205,6 +207,7 @@
       const pageParams = new URLSearchParams(window.location.search);
       const requestedDataset = pageParams.get("dataset");
       const requestedFormat = pageParams.get("format") ?? "png";
+      let rgbPresetPending = pageParams.getAll("bidx").join(",").replace(/\s/g, "") === "1,2,3";
 
       function isExpressionMode() {
         return Boolean(c.expression.value.trim());
@@ -213,7 +216,6 @@
       function syncExpressionUi() {
         const active = isExpressionMode();
         c.bidx.disabled = active;
-        if (!active && !c.bidx.value.trim()) c.bidx.value = "1,2,3";
       }
 
       function syncStretchUi() {
@@ -226,6 +228,7 @@
           c.dataset.add(new Option(requestedDataset, requestedDataset, true, true));
         }
         c.colormap.value = pageParams.get("colormap_name") ?? "";
+        c.bidx.value = pageParams.getAll("bidx").join(",");
         const rescale = pageParams.getAll("rescale");
         if (rescale.length) {
           c.rescale.value = rescale.join(";");
@@ -277,7 +280,7 @@
         if (c.dataset.value) p.set("dataset", c.dataset.value);
         const expression = c.expression.value.trim();
         if (expression) p.set("expression", expression);
-        else appendRepeated(p, "bidx", c.bidx.value, ",");
+        else if (!(rgbPresetPending && c.bidx.value.replace(/\s/g, "") === "1,2,3")) appendRepeated(p, "bidx", c.bidx.value, ",");
         // Auto means the advertised global mean ± 2σ stretch, not the U8 raw-value fast path.
         // Explicitly send it so every tile resolves the same dataset statistics.
         const mode = c.stretch.value;
@@ -309,9 +312,8 @@
         return `${ORIGIN}${TILE_BASE}.${ext}?${p.toString()}`;
       }
 
-      const cogSource = new ol.source.XYZ({ url: tileUrl(), maxZoom: 22 });
       const cogLayer = new ol.layer.Tile({
-        source: cogSource,
+        source: null,
         opacity: Number(c.opacity.value),
       });
       const baseLayer = new ol.layer.Tile({ source: null });
@@ -328,6 +330,7 @@
       applyBasemap();
 
       function applyStyle() {
+        if (!rasterReady) return;
         styleVersion += 1;
         cogLayer.setOpacity(Number(c.opacity.value));
         // Replacing the source drops OL's whole tile cache, so every zoom
@@ -336,14 +339,26 @@
       }
 
       async function flyToDataset() {
-        if (!c.dataset.value) return;
+        const ds = c.dataset.value;
         try {
           const r = await fetch(
-            `${ORIGIN}/bounds?dataset=${encodeURIComponent(c.dataset.value)}`,
+            `${ORIGIN}/bounds${ds ? `?dataset=${encodeURIComponent(ds)}` : ""}`,
           );
           if (!r.ok) return;
+          if (c.dataset.value !== ds) return;
+          const bands = Number(r.headers.get("x-raster-bands"));
+          if (Number.isInteger(bands) && bands > 0) {
+            if (bands < 3 && c.bidx.value.replace(/\s/g, "") === "1,2,3") {
+              c.bidx.value = "";
+              const note = document.getElementById("band-note");
+              note.textContent = `${bands} band${bands === 1 ? "" : "s"}: RGB preset changed to Auto.`;
+              note.hidden = false;
+            }
+            rgbPresetPending = false;
+          }
           const b = await r.json();
           if (Array.isArray(b) && b.length === 4 && b.every(Number.isFinite)) {
+            rasterReady = true;
             const ext = ol.proj.transformExtent(b, "EPSG:4326", "EPSG:3857");
             map.getView().fit(ext, {
               padding: [40, 40, 40, 40],
@@ -362,9 +377,11 @@
       });
       c.basemap.addEventListener("change", applyBasemap);
 
-      c.dataset.addEventListener("change", () => {
+      c.dataset.addEventListener("change", async () => {
+        rasterReady = false;
+        rgbPresetPending = c.bidx.value.replace(/\s/g, "") === "1,2,3";
+        await flyToDataset();
         applyStyle();
-        flyToDataset();
       });
       c.stretch.addEventListener("change", () => {
         syncStretchUi();
@@ -412,7 +429,7 @@
           const r = await fetch(`${ORIGIN}/datasets`);
           if (!r.ok) return;
           const names = await r.json();
-          if (!Array.isArray(names) || !names.length) return;
+          if (!Array.isArray(names)) return;
           c.dataset.innerHTML = "";
           for (const n of names) {
             const o = document.createElement("option");
@@ -422,9 +439,9 @@
           }
           c.dataset.value = names.includes(requestedDataset)
             ? requestedDataset
-            : names[0];
+            : (names[0] ?? "");
+          await flyToDataset();
           applyStyle();
-          flyToDataset();
         } catch (err) {
           console.warn("dataset list unavailable", err);
         }

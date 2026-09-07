@@ -342,44 +342,6 @@ pub fn compile_validated(style: &ValidatedTileStyle) -> AgResult<CompiledTileSty
 
 pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
     validate_style(style)?;
-    style.format.ensure_available()?;
-    validate_tilesize(style.tilesize)?;
-    if style.colormap.is_some() && style.colormap_name.is_some() {
-        return Err(AgError::query(
-            "colormap",
-            "colormap and colormap_name are mutually exclusive",
-        ));
-    }
-    if let Some(&bad) = style.bidx.iter().find(|&&b| b == 0) {
-        return Err(AgError::query("bidx", format!("{bad} is not 1-indexed")));
-    }
-
-    // expression mutual-exclusion guards
-    if style.expression.is_some() {
-        if !style.bidx.is_empty() {
-            return Err(AgError::query(
-                "expression",
-                "expression and bidx are mutually exclusive",
-            ));
-        }
-        if style
-            .color_formula
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-        {
-            return Err(AgError::query(
-                "expression",
-                "expression and color_formula are mutually exclusive",
-            ));
-        }
-        if style.rescale.len() > 1 {
-            return Err(AgError::query(
-                "expression",
-                "expression accepts at most one rescale range",
-            ));
-        }
-    }
-
     let auto_rgb = style.bidx.is_empty()
         && style.rescale.is_empty()
         && style.colormap_name.is_none()

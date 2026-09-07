@@ -41,24 +41,43 @@ pub struct RenderLuts {
     grad_u16: std::sync::OnceLock<Arc<Vec<[u8; 4]>>>,
 }
 
-/// Precompiled render plan for the hot path.
+/// Immutable precompiled render plan for the hot path.
+/// Construct a new plan with [`crate::style::params::compile`] when changing
+/// a style; private fields keep cached lookup tables consistent with ranges.
+///
+/// ```compile_fail
+/// let mut compiled = async_geotiff::style::params::compile(&Default::default()).unwrap();
+/// compiled.rescale.push((0.0, 1.0));
+/// ```
 #[derive(Debug, Clone)]
 pub struct CompiledTileStyle {
-    pub composite: Composite,
-    pub rescale: Vec<(f64, f64)>,
-    pub formula: Vec<Op>,
+    pub(crate) composite: Composite,
+    pub(crate) rescale: Vec<(f64, f64)>,
+    pub(crate) formula: Vec<Op>,
     /// RPN tokens from a band-math `expression=` param. Empty when not used.
-    pub expression: Vec<crate::render::expression::Token>,
-    pub bidx: Vec<usize>, // 0-indexed after compile
-    pub nodata: Option<f64>,
-    pub tile_size: u32,
-    pub resampling: Resampling,
-    pub auto_rgb: bool,
+    pub(crate) expression: Vec<crate::render::expression::Token>,
+    pub(crate) bidx: Vec<usize>, // 0-indexed after compile
+    pub(crate) nodata: Option<f64>,
+    pub(crate) tile_size: u32,
+    pub(crate) resampling: Resampling,
+    pub(crate) auto_rgb: bool,
     /// Output encoding selected by the request.
-    pub format: TileFormat,
+    pub(crate) format: TileFormat,
     /// See [`RenderLuts`]. Reset to a fresh `Arc` whenever `rescale`/vmin/vmax
     /// are rewritten on a clone.
-    pub luts: Arc<RenderLuts>,
+    pub(crate) luts: Arc<RenderLuts>,
+}
+
+impl CompiledTileStyle {
+    /// Resampling selected by the source request; rendering itself does not resize.
+    pub fn resampling(&self) -> Resampling {
+        self.resampling
+    }
+
+    /// Effective read-only rescale ranges. Recompile a TileStyle to change them.
+    pub fn rescale(&self) -> &[(f64, f64)] {
+        &self.rescale
+    }
 }
 
 pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
