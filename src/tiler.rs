@@ -315,7 +315,7 @@ impl Tiler {
     ) -> AgResult<Option<Arc<ImageData>>> {
         self.requests
             .run(self.request_timeout, options, |context| async move {
-                self.warp_tile_in_request(coord, style, &context).await
+                self.warp_tile_in_request(coord, style, &context, &[]).await
             })
             .await
     }
@@ -325,6 +325,7 @@ impl Tiler {
         coord: TileCoord,
         style: &TileStyle,
         context: &RequestContext,
+        selected_bands: &[usize],
     ) -> AgResult<Option<Arc<ImageData>>> {
         context.check()?;
         #[cfg(feature = "perf-tracing")]
@@ -333,7 +334,8 @@ impl Tiler {
         let Some(plan) = self.plan_tile_async(coord, style, context).await? else {
             return Ok(None);
         };
-        let bands = u64::from(self.reader.data_ifd(plan.level)?.samples_per_pixel());
+        let bands = u64::from(self.reader.data_ifd(plan.level)?.samples_per_pixel())
+            .max(selected_bands.len() as u64);
         let bytes = tile_work_bytes(plan.w, plan.h, bands, u64::from(style.tilesize))?;
         let context = &context.with_work(self.work_budget.try_reserve(bytes)?);
         #[cfg(feature = "perf-tracing")]
@@ -346,9 +348,49 @@ impl Tiler {
         if let Some(nodata) = style.nodata {
             Arc::make_mut(&mut src).nodata = Some(nodata);
         }
+        // Mosaic reduction needs the selected bands' validity, not nodata from
+        // unrelated bands. Select before warp/unscale can combine their masks.
+        // Public warp_tile passes an empty selection and retains all bands.
+        if !selected_bands.is_empty() {
+            let selected = selected_bands.to_vec();
+            src = self
+                .run_tile_cpu(context, "select bands", move || {
+                    let image = Arc::make_mut(&mut src);
+                    image.pixels = select_pixel_bands(&image.pixels, &selected)?;
+                    Ok(src)
+                })
+                .await?;
+        }
+        let scales = if selected_bands.is_empty() {
+            self.reader.band_scale_offset().to_vec()
+        } else {
+            selected_bands
+                .iter()
+                .map(|&band| {
+                    self.reader
+                        .band_scale_offset()
+                        .get(band)
+                        .copied()
+                        .unwrap_or(ScaleOffset::IDENTITY)
+                })
+                .collect()
+        };
         #[cfg(feature = "perf-tracing")]
         let read_done = started.elapsed();
         if plan.passthrough {
+            // Passthrough tolerates tiny source alignment differences. Its
+            // pixels still represent the destination grid, just like warp's
+            // output; reducers must not see the original source coordinates.
+            let image = Arc::make_mut(&mut src);
+            image.bbox = plan.dst_bbox;
+            image.transform = crate::bounds::GeoTransform::from_gdal(&[
+                plan.dst_bbox.xmin,
+                plan.dst_bbox.width() / f64::from(style.tilesize),
+                0.0,
+                plan.dst_bbox.ymax,
+                0.0,
+                -plan.dst_bbox.height() / f64::from(style.tilesize),
+            ]);
             crate::perf_trace! {
                 tracing::debug!(
                     level = plan.level,
@@ -364,7 +406,6 @@ impl Tiler {
                 );
             }
             if style.unscale {
-                let scales = self.reader.band_scale_offset().to_vec();
                 return self
                     .run_tile_cpu(context, "unscale", move || {
                         Ok(Some(Arc::new(unscale_image(&src, &scales))))
@@ -382,7 +423,6 @@ impl Tiler {
         };
         let dst_crs = plan.dst_crs.clone();
         let dst_bbox = plan.dst_bbox;
-        let scales = self.reader.band_scale_offset().to_vec();
         let unscale = style.unscale;
         let cancellation = context.clone();
         let warped: ImageData = match self
@@ -726,6 +766,22 @@ impl Tiler {
         let h = (row_end - row).max(0) as u64;
         Ok((col, row, w, h))
     }
+}
+
+fn select_pixel_bands(pixels: &PixelData, bands: &[usize]) -> AgResult<PixelData> {
+    if bands.iter().any(|&band| band >= pixels.bands()) {
+        return Err(AgError::query("bidx", "band out of range"));
+    }
+    macro_rules! select {
+        ($($variant:ident),+) => {
+            match pixels {
+                $(PixelData::$variant(array) => {
+                    PixelData::$variant(array.select(ndarray::Axis(0), bands))
+                }),+
+            }
+        };
+    }
+    Ok(select!(U8, U16, I16, U32, I32, F32, F64))
 }
 
 /// Conservative live working-set estimate: source/promotion and overlapping

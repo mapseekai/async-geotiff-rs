@@ -98,7 +98,7 @@ fn is_nodata(value: f64, nodata: f64) -> bool {
     if nodata.is_nan() {
         value.is_nan()
     } else {
-        (value - nodata).abs() < 1e-9
+        value == nodata || (value - nodata).abs() < 1e-9
     }
 }
 

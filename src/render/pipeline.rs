@@ -304,7 +304,7 @@ fn try_u8_rgb_fastpath(
     }
     let nodata = style.nodata.or(image.nodata);
     let nd_u8: Option<u8> = nodata.and_then(|nd| {
-        if nd.is_finite() && (0.0..=255.0).contains(&nd) {
+        if nd.is_finite() && nd.fract() == 0.0 && (0.0..=255.0).contains(&nd) {
             Some(nd as u8)
         } else {
             None
@@ -323,7 +323,8 @@ fn try_u8_rgb_fastpath(
     let r_band = &src_slice[bidx[0] * stride..][..stride];
     let g_band = &src_slice[bidx[1] * stride..][..stride];
     let b_band = &src_slice[bidx[2] * stride..][..stride];
-    let mask_slice: Option<&[bool]> = image.mask.as_ref().and_then(|m| m.as_slice());
+    let mask_standard = image.mask.as_ref().map(|m| m.as_standard_layout());
+    let mask_slice = mask_standard.as_ref().and_then(|m| m.as_slice());
     let dst = rgba
         .as_slice_mut()
         .expect("freshly-allocated Array3 standard layout");
@@ -420,7 +421,8 @@ fn try_u16_rgb_lut_fastpath(
     let r_band = &src_slice[bidx[0] * stride..][..stride];
     let g_band = &src_slice[bidx[1] * stride..][..stride];
     let b_band = &src_slice[bidx[2] * stride..][..stride];
-    let mask_slice: Option<&[bool]> = image.mask.as_ref().and_then(|m| m.as_slice());
+    let mask_standard = image.mask.as_ref().map(|m| m.as_standard_layout());
+    let mask_slice = mask_standard.as_ref().and_then(|m| m.as_slice());
     let dst = rgba
         .as_slice_mut()
         .expect("freshly-allocated Array3 standard layout");
@@ -528,7 +530,7 @@ fn compute_valid_mask<T: RenderSample>(
                 });
             } else {
                 Zip::from(&mut valid).and(band).for_each(|v, &x| {
-                    if (x.to_f64() - nd).abs() < 1e-9 {
+                    if x.to_f64() == nd || (x.to_f64() - nd).abs() < 1e-9 {
                         *v = false;
                     }
                 });

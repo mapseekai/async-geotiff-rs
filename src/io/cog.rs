@@ -43,9 +43,10 @@ pub(crate) async fn build_http_transport<T: Send + 'static>(
         .acquire_owned()
         .await
         .map_err(|_| AgError::Tiff("HTTP construction limiter closed".into()))?;
+    let request = crate::request::RequestContext::current();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        build()
+        crate::request::RequestContext::run_blocking(request, build)
     })
     .await
     .map_err(|_| AgError::Tiff("HTTP construction task failed".into()))?
@@ -850,26 +851,30 @@ impl CogReader {
             });
         let stitch_all = {
             let work = work.clone();
+            let request = crate::request::RequestContext::current();
             let coords2 = coords.clone();
             let info = data_info;
             let (w, h) = (width, height);
             let (co, ro) = (col_off, row_off);
             move || -> AgResult<(PixelData, Option<Array2<bool>>)> {
                 let _work = work;
-                let refs: Vec<&async_tiff::Array> = data_blocks.iter().map(|b| b.array()).collect();
-                let stitched =
-                    crate::io::window::stitch_with_info(&refs, &coords2, &info, co, ro, w, h)?;
-                let mask = match &mask_blocks {
-                    Some((mask_blocks, mask_info)) => {
-                        let refs: Vec<&async_tiff::Array> =
-                            mask_blocks.iter().map(|b| b.array()).collect();
-                        Some(crate::io::window::stitch_mask_with_info(
-                            &refs, &coords2, mask_info, co, ro, w, h,
-                        )?)
-                    }
-                    None => None,
-                };
-                Ok((stitched, mask))
+                crate::request::RequestContext::run_blocking(request, || {
+                    let refs: Vec<&async_tiff::Array> =
+                        data_blocks.iter().map(|b| b.array()).collect();
+                    let stitched =
+                        crate::io::window::stitch_with_info(&refs, &coords2, &info, co, ro, w, h)?;
+                    let mask = match &mask_blocks {
+                        Some((mask_blocks, mask_info)) => {
+                            let refs: Vec<&async_tiff::Array> =
+                                mask_blocks.iter().map(|b| b.array()).collect();
+                            Some(crate::io::window::stitch_mask_with_info(
+                                &refs, &coords2, mask_info, co, ro, w, h,
+                            )?)
+                        }
+                        None => None,
+                    };
+                    Ok((stitched, mask))
+                })
             }
         };
         let (stitched, mask) = if est_out_bytes <= INLINE_STITCH_MAX_BYTES {
@@ -1273,7 +1278,11 @@ impl CogReader {
                     let work = work.clone();
                     let metadata_guard = self.metadata_reservations.clone();
                     let cache = Arc::clone(&self.block_cache);
+                    // Capture before JoinSet::spawn; its child task does not
+                    // inherit the request's task-local scope.
+                    let request = crate::request::RequestContext::current();
                     set.spawn(async move {
+                        let owner_request = request.clone();
                         let block_res: AgResult<Arc<DecodedBlock>> = cache
                             .try_get_with(key, async move {
                                 #[cfg(feature = "perf-tracing")]
@@ -1289,7 +1298,9 @@ impl CogReader {
                                     let _permit = permit;
                                     let _work = work;
                                     let _metadata_guard = metadata_guard;
-                                    crate::io::decode::decode_one(tile, decode_dimensions)
+                                    crate::request::RequestContext::run_blocking(request, || {
+                                        crate::io::decode::decode_one(tile, decode_dimensions)
+                                    })
                                 })
                                 .await
                                 .map_err(|e| AgError::Tiff(format!("join: {e}")))??;
@@ -1310,6 +1321,12 @@ impl CogReader {
                                 Ok(DecodedBlock::new(arr))
                             })
                             .await;
+                        // An expired owner must relinquish its claim, not
+                        // publish its cancellation as a shared decode failure.
+                        // Dropping the guard lets healthy waiters claim/retry.
+                        if let Some(owner) = &owner_request {
+                            owner.check()?;
+                        }
                         // Publish to concurrent waiters (Arc-wrap the error since
                         // AgError isn't Clone), then return to this caller.
                         let forward: BlockResult = match &block_res {

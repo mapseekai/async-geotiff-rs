@@ -153,7 +153,7 @@ impl CogReader {
                 let hit = if nd.is_nan() {
                     values.iter().any(|v| v.is_nan())
                 } else {
-                    values.iter().any(|v| (v - nd).abs() < 1e-9)
+                    values.iter().any(|v| *v == nd || (v - nd).abs() < 1e-9)
                 };
                 if hit {
                     valid = false;

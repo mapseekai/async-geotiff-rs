@@ -80,6 +80,19 @@ HTTP admission and timeout include dataset lookup/opening. Library callers that
 open a `CogReader` directly outside a tile request should apply their own outer
 timeout when an application deadline must include that initial open.
 
+## Mosaic ordering and selected bands
+
+MosaicJSON assets retain their listed paint order during deduplication. Prefix
+lookups traverse matching quadkeys in lexical order and retain the first
+occurrence of each asset, preserving each key's list order.
+
+For multi-asset mosaics, explicit `bidx` selection happens before warp, unscale
+and reduction. Unselected bands' nodata cannot invalidate the requested samples;
+scale/offset metadata follows the selected source indices. Highest/Lowest compare
+the first selected band and keep that asset's other selected bands. Final style
+evaluation indexes the resulting compact image. Public `Tiler::warp_tile` keeps
+its existing full-band output contract.
+
 ## Pinned object snapshots
 
 Managed `open_http` and `open_object_store` use

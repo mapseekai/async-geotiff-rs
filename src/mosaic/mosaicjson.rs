@@ -1,7 +1,7 @@
 //! `MosaicJsonSource` — read-only consumer of a pre-built cogeo-mosaic
 //! MosaicJSON document (quadkey index). Building the index is out of scope.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -242,8 +242,10 @@ impl MosaicSource for MosaicJsonSource {
                 }
             }
         }
-        urls.sort();
-        urls.dedup();
+        // Asset lists carry paint priority. Prefix queries traverse sorted keys,
+        // but preserve the first occurrence of each asset within those lists.
+        let mut seen = HashSet::new();
+        urls.retain(|url| seen.insert(url.clone()));
         Ok(urls
             .into_iter()
             .map(|url| {
@@ -336,7 +338,7 @@ mod tests {
 
         assert_eq!(
             urls,
-            vec!["https://x/a.tif", "https://x/b.tif", "https://x/c.tif"]
+            vec!["https://x/c.tif", "https://x/a.tif", "https://x/b.tif"]
         );
     }
 
@@ -348,7 +350,7 @@ mod tests {
 
         assert_eq!(
             urls,
-            vec!["https://x/a.tif", "https://x/b.tif", "https://x/c.tif"]
+            vec!["https://x/c.tif", "https://x/a.tif", "https://x/b.tif"]
         );
     }
 

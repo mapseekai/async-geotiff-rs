@@ -314,13 +314,16 @@ pub async fn load_dataset_stats(reader: &CogReader) -> AgResult<Option<DatasetSt
     let work = reader.work_budget().try_reserve(estimate)?;
     let img = reader.read_window(top, 0, 0, w as u64, h as u64).await?;
     let permit = reader.cpu_limiter().acquire().await?;
+    let request = crate::request::RequestContext::current();
     let stats = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _work = work;
-        band_stats_from_image(&img, HIST_BINS)
+        crate::request::RequestContext::run_blocking(request, || {
+            Ok(band_stats_from_image(&img, HIST_BINS))
+        })
     })
     .await
-    .map_err(|e| crate::error::AgError::Warp(format!("statistics task: {e}")))?;
+    .map_err(|e| crate::error::AgError::Warp(format!("statistics task: {e}")))??;
     Ok(Some(DatasetStats {
         bands: stats,
         provenance: Provenance::Estimated,

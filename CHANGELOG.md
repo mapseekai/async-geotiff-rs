@@ -11,6 +11,21 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve MosaicJSON asset priority when deduplicating URLs, including prefix
+  lookups, so `First` follows the index's paint order.
+- Apply Mosaic band selection before warp, unscale and reduction; selected-band
+  nodata and scale/offset metadata now follow the requested order. Reindex the
+  reduced image for final rendering without selecting source bands twice.
+- Give passthrough warp results the canonical destination grid so tiny source
+  alignment differences do not reject otherwise compatible mosaic assets.
+- Retain request admission through cancelled blocking decode, stitch, statistics,
+  DNS and HTTP initialization jobs. Skip queued work after cancellation and let
+  healthy block-cache waiters retry an expired owner's claim.
+- Respect fractional nodata and strided validity masks in RGB fast paths, and
+  match infinite nodata in rendering, direct colour mapping and point queries.
+
 ### Changed
 
 - Replaced the style compiler's debug-string cache key with a typed key that

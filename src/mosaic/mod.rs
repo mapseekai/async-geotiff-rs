@@ -343,6 +343,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
         let mut reducer: Option<Reducer<NonEmptyReducer>> = None;
         let mut fed = 0usize;
         let mut retained_bytes = 0usize;
+        let selected_bands = compiled.bidx.as_slice();
 
         for chunk in assets.chunks(self.cfg.chunk_size) {
             context.check()?;
@@ -352,7 +353,8 @@ impl<S: MosaicSource> MosaicTiler<S> {
                     context.check()?;
                     let reader = self.pool.get_or_open(&a.url, &a.source_id).await?;
                     context.check()?;
-                    let bands = u64::from(reader.data_ifd(0)?.samples_per_pixel());
+                    let bands = u64::from(reader.data_ifd(0)?.samples_per_pixel())
+                        .max(selected_bands.len() as u64);
                     // Warped image plus its temporary F64 reducer input.
                     // Streaming reducers release this after the chunk is fed;
                     // Median retains its samples until finish.
@@ -372,7 +374,9 @@ impl<S: MosaicSource> MosaicTiler<S> {
                     let tiler = Tiler::new(reader)
                         .with_request_limiter(self.requests.clone())
                         .with_work_budget(self.work_budget.clone());
-                    let img = tiler.warp_tile_in_request(coord, style, &child).await?;
+                    let img = tiler
+                        .warp_tile_in_request(coord, style, &child, selected_bands)
+                        .await?;
                     Ok::<_, AgError>((img, reservation))
                 }
             });
@@ -460,8 +464,16 @@ impl<S: MosaicSource> MosaicTiler<S> {
         // Bound the composite render with the same shared CPU limiter the
         // per-asset reads/warps used, so it doesn't add an unbounded blocking
         // job on top of the mosaic's CPU budget.
+        let mut style = style.clone();
+        let compiled = if selected_bands.is_empty() {
+            compiled
+        } else {
+            // Reduction already selected/reordered the original source bands.
+            // Statistics and rendering now index the resulting compact array.
+            style.bidx = (1..=selected_bands.len() as u32).collect();
+            compile_cached(&style).await?
+        };
         let permit = self.pool.cpu_limiter().acquire().await?;
-        let style = style.clone();
         let cancellation = context.clone();
         let bytes = tokio::task::spawn_blocking(move || {
             let _permit = permit;

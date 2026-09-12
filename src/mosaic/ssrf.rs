@@ -347,11 +347,12 @@ async fn resolve_bounded(
             .acquire_owned()
             .await
             .map_err(|_| AgError::Mosaic("DNS resolver closed".into()))?;
+        let request = crate::request::RequestContext::current();
         tokio::task::spawn_blocking(move || {
             // A timed-out OS resolver cannot be stopped. Keep its capacity
             // owned by the blocking job until it really returns.
             let _permit = permit;
-            resolve()
+            crate::request::RequestContext::run_blocking(request, resolve)
         })
         .await
         .map_err(|_| AgError::Mosaic("DNS resolver task failed".into()))?
