@@ -43,13 +43,13 @@ use selection::{NonEmptyReducer, Reducer};
 
 /// Tuning knobs for [`MosaicTiler`].
 ///
-/// `chunk_size` is the effective concurrency bound for per-asset reads/warps;
-/// all assets share the reader pool CPU limiter. Median additionally rejects
-/// requests whose retained input buffers would exceed 256 MiB.
+/// `chunk_size` bounds per-asset reads/warps except for `First`, which reads
+/// sequentially until coverage is complete. All assets share the reader pool
+/// CPU limiter. Median rejects requests whose retained inputs exceed 256 MiB.
 #[derive(Clone, Copy, Debug)]
 pub struct MosaicConfig {
-    /// Assets fetched+warped in parallel per chunk; `is_done` is checked
-    /// after each chunk so `First` can stop once coverage is complete.
+    /// Assets fetched+warped in parallel per chunk. `First` always uses one
+    /// asset at a time and stops once coverage is complete.
     pub chunk_size: usize,
     /// Max distinct opened COGs kept in the reader pool.
     pub reader_capacity: u64,
@@ -275,7 +275,8 @@ impl<S: MosaicSource> MosaicTiler<S> {
     /// request nodata and per-source unscale) per-asset; render params once on
     /// the composite. Multiple assets use composite-tile statistics for stretch;
     /// one asset preserves the single-source dataset-statistics behavior.
-    /// Asset failures and fan-out overflow return errors, never partial tiles.
+    /// Required asset failures and fan-out overflow return errors, never partial tiles.
+    /// `First` does not open lower-priority assets once coverage is complete.
     pub async fn tile(
         &self,
         coord: TileCoord,
@@ -345,7 +346,14 @@ impl<S: MosaicSource> MosaicTiler<S> {
         let mut retained_bytes = 0usize;
         let selected_bands = compiled.bidx.as_slice();
 
-        for chunk in assets.chunks(self.cfg.chunk_size) {
+        // First usually needs only one STAC scene. Check coverage before opening
+        // the next asset instead of speculatively downloading a whole chunk.
+        let chunk_size = if selection == PixelSelection::First {
+            1
+        } else {
+            self.cfg.chunk_size
+        };
+        for chunk in assets.chunks(chunk_size) {
             context.check()?;
             let futs = chunk.iter().map(|a| {
                 let context = &context;
