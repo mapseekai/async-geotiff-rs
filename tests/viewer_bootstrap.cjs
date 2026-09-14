@@ -55,7 +55,7 @@ async function check(viewer) {
     document:{getElementById:id => elements.get(id), createElement:() => new Element()},
     Option: function(label, value) { this.value = value; this.textContent = label; },
     fetch:url => new Promise(resolve => pending.push({url,resolve})),
-    maplibregl:{Map:FakeMap,NavigationControl:class {},ScaleControl:class {}},
+    maplibregl:{Map:FakeMap,NavigationControl:class {},ScaleControl:class {},setMaxParallelImageRequests() {}},
     L:{map:() => new FakeMap(),tileLayer:url => { record(url); return {addTo(){return this;},bringToBack(){},setOpacity(){}}; }},
     ol:{source:{XYZ:class {constructor({url}) {record(url);}},OSM:class {}},layer:{Tile:Layer},Map:FakeMap,View:class {},proj:{transformExtent:b=>b}},
   };

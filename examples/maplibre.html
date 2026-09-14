@@ -242,6 +242,9 @@
     <div class="status" id="status"></div>
 
     <script>
+      // Online COG tiles share a bounded server working-memory budget.
+      // Queue images in the browser before they allocate server-side buffers.
+      maplibregl.setMaxParallelImageRequests(2);
       const DEFAULT_TILE_ORIGIN = "http://127.0.0.1:8080";
       const SINGLE_PATH = "/tiles/WebMercatorQuad/{z}/{x}/{y}";
       const MOSAIC_PATH = "/mosaic/tiles/WebMercatorQuad/{z}/{x}/{y}";

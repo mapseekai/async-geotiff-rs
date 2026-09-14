@@ -11,8 +11,14 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-14
+
 ### Fixed
 
+- Read `First` mosaic assets sequentially and stop as soon as coverage is
+  complete, avoiding unnecessary remote reads and working-memory reservations.
+- Limit MapLibre image requests to two concurrent loads so online STAC
+  viewports do not overwhelm the server's bounded working-memory budget.
 - Preserve MosaicJSON asset priority when deduplicating URLs, including prefix
   lookups, so `First` follows the index's paint order.
 - Apply Mosaic band selection before warp, unscale and reduction; selected-band
@@ -410,7 +416,9 @@ can land in any release** and are called out explicitly under a
 - PNG output; example axum server with MapLibre / OpenLayers / Leaflet
   viewers and a local `data/*.tif` dataset picker.
 
-[Unreleased]: https://github.com/zwishing/async-geotiff-rs/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/mapseekai/async-geotiff-rs/compare/v0.10.1...HEAD
+
+[0.10.1]: https://github.com/mapseekai/async-geotiff-rs/releases/tag/v0.10.1
 
 [0.10.0]: https://github.com/zwishing/async-geotiff-rs/releases/tag/v0.10.0
 

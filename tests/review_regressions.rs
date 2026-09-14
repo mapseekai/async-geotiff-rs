@@ -225,6 +225,80 @@ mod mosaic {
     }
 
     #[tokio::test]
+    async fn first_stops_before_unneeded_assets() {
+        let store = Arc::new(InMemory::new());
+        for (name, samples) in [("empty", [0, 0, 0]), ("full", [10, 200, 30])] {
+            store
+                .put(
+                    &ObjectPath::from(name),
+                    world_fixture(0.0, Some(samples)).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let style =
+            TileStyle::from_query("tilesize=64&bidx=1&bidx=2&bidx=3&rescale=0,255").unwrap();
+        for keys in [vec!["full", "missing"], vec!["empty", "full", "missing"]] {
+            let assets = keys
+                .into_iter()
+                .map(|key| AssetRef {
+                    url: key.into(),
+                    source_id: key.into(),
+                    bbox: Bbox::new(-180.0, -90.0, 0.0, 90.0),
+                })
+                .collect();
+            let mosaic = MosaicTiler::builder(Fixed(assets))
+                .backend(Backend::Store(store.clone()))
+                .build();
+            let bytes = mosaic
+                .tile(coord(), PixelSelection::First, &style)
+                .await
+                .expect("covered First tile must not open missing lower-priority assets")
+                .unwrap();
+            let rgba = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            for pixel in rgba.pixels() {
+                assert_eq!(pixel.0, [10, 200, 30, 255]);
+            }
+            // Other reducers still require every asset and must propagate its failure.
+            assert!(mosaic
+                .tile(coord(), PixelSelection::Mean, &style)
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn first_propagates_failure_when_coverage_is_incomplete() {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("partial"),
+                world_fixture(90.0, Some([10, 200, 30])).into(),
+            )
+            .await
+            .unwrap();
+        let assets = ["partial", "missing"]
+            .into_iter()
+            .map(|key| AssetRef {
+                url: key.into(),
+                source_id: key.into(),
+                bbox: Bbox::new(-180.0, -90.0, 180.0, 90.0),
+            })
+            .collect();
+        let mosaic = MosaicTiler::builder(Fixed(assets))
+            .backend(Backend::Store(store))
+            .build();
+        assert!(mosaic
+            .tile(
+                coord(),
+                PixelSelection::First,
+                &TileStyle::from_query("tilesize=64&rescale=0,255").unwrap()
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn mosaicjson_preserves_asset_priority() {
         let source = MosaicJsonSource::from_str(r#"{"mosaicjson":"0.0.3","minzoom":1,"maxzoom":1,"quadkey_zoom":1,"tiles":{"0":["z_new.tif","a_old.tif","z_new.tif"]}}"#).unwrap();
         for z in [1, 0] {
