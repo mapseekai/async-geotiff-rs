@@ -227,17 +227,17 @@ impl MosaicSource for MosaicJsonSource {
             ));
         }
 
-        let mut urls: Vec<String> = Vec::new();
+        let mut urls: Vec<&str> = Vec::new();
         match lookup(coord.z, coord.x, coord.y, self.quadkey_zoom) {
             QkLookup::Exact(key) => {
                 if let Some(v) = self.doc.tiles.get(&key) {
-                    urls.extend(v.iter().cloned());
+                    urls.extend(v.iter().map(String::as_str));
                 }
             }
             QkLookup::Prefix(prefix) => {
                 for key in &self.tile_keys[prefix_key_range(&self.tile_keys, &prefix)] {
                     if let Some(v) = self.doc.tiles.get(key) {
-                        urls.extend(v.iter().cloned());
+                        urls.extend(v.iter().map(String::as_str));
                     }
                 }
             }
@@ -245,13 +245,13 @@ impl MosaicSource for MosaicJsonSource {
         // Asset lists carry paint priority. Prefix queries traverse sorted keys,
         // but preserve the first occurrence of each asset within those lists.
         let mut seen = HashSet::new();
-        urls.retain(|url| seen.insert(url.clone()));
+        urls.retain(|url| seen.insert(*url));
         Ok(urls
             .into_iter()
             .map(|url| {
                 let url = match &self.doc.asset_prefix {
                     Some(prefix) => format!("{prefix}{url}"),
-                    None => url,
+                    None => url.to_owned(),
                 };
                 AssetRef {
                     source_id: url.clone(),

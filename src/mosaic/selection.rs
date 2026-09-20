@@ -1,6 +1,7 @@
 //! Pixel-selection reducer. Mirrors rio-tiler `MosaicMethodBase`.
 
 use ndarray::{Array2, Array3};
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 use crate::error::{AgError, AgResult};
@@ -153,8 +154,9 @@ impl<State> Reducer<State> {
                 "assets must have matching nonempty shapes, masks, CRS and pixel grids".into(),
             ));
         }
-        let arr = img.pixels.to_f64(); // (bands, h, w)
-                                       // Normalize declared numeric nodata once for every selection method.
+        // (bands, h, w), borrowed for F64.
+        let arr = img.pixels.as_f64();
+        // Normalize declared numeric nodata once for every selection method.
         let normalized_mask = img.nodata.map(|nd| {
             Array2::from_shape_fn((shape.1, shape.2), |(r, c)| {
                 valid(img.mask.as_ref(), r, c)
@@ -178,7 +180,7 @@ impl<State> Reducer<State> {
             PixelSelection::First => self.feed_first(arr, m),
             PixelSelection::Highest => self.feed_extreme(arr, m, true),
             PixelSelection::Lowest => self.feed_extreme(arr, m, false),
-            PixelSelection::Mean => self.feed_mean(arr, m),
+            PixelSelection::Mean => self.feed_mean(&arr, m),
             PixelSelection::Median => {
                 if let Some((first, _)) = self.stack.first() {
                     debug_assert_eq!(
@@ -189,13 +191,13 @@ impl<State> Reducer<State> {
                 }
                 let (_, h, w) = arr.dim();
                 let m = owned_mask(m, h, w);
-                self.stack.push((arr, m));
+                self.stack.push((arr.into_owned(), m));
                 Ok(())
             }
         }
     }
 
-    fn feed_first(&mut self, arr: Array3<f64>, m: Option<&Array2<bool>>) -> AgResult<()> {
+    fn feed_first(&mut self, arr: Cow<'_, Array3<f64>>, m: Option<&Array2<bool>>) -> AgResult<()> {
         match (&mut self.acc, &mut self.acc_mask) {
             (None, _) => {
                 // Seed `remaining_invalid` from the first asset so `is_done`
@@ -204,7 +206,7 @@ impl<State> Reducer<State> {
                 let (_, h, w) = arr.dim();
                 self.remaining_invalid = m.map_or(0, |m| m.iter().filter(|&&v| !v).count());
                 self.acc_mask = Some(owned_mask(m, h, w));
-                self.acc = Some(arr);
+                self.acc = Some(arr.into_owned());
             }
             (Some(acc), Some(am)) => {
                 let (bands, h, w) = acc.dim();
@@ -254,7 +256,7 @@ impl<State> Reducer<State> {
     /// the number of assets. A pixel is valid (`acc_mask`) if ANY asset marks it
     /// valid; per band, only finite samples contribute — matching the previous
     /// stack aggregation exactly.
-    fn feed_mean(&mut self, arr: Array3<f64>, m: Option<&Array2<bool>>) -> AgResult<()> {
+    fn feed_mean(&mut self, arr: &Array3<f64>, m: Option<&Array2<bool>>) -> AgResult<()> {
         let (bands, h, w) = arr.dim();
         let (sum, count, am) = match (&mut self.acc, &mut self.count, &mut self.acc_mask) {
             (Some(sum), Some(count), Some(am)) => {
@@ -324,7 +326,7 @@ impl<State> Reducer<State> {
 
     fn feed_extreme(
         &mut self,
-        arr: Array3<f64>,
+        arr: Cow<'_, Array3<f64>>,
         m: Option<&Array2<bool>>,
         want_high: bool,
     ) -> AgResult<()> {
@@ -332,7 +334,7 @@ impl<State> Reducer<State> {
             (None, _) => {
                 let (_, h, w) = arr.dim();
                 self.acc_mask = Some(owned_mask(m, h, w));
-                self.acc = Some(arr);
+                self.acc = Some(arr.into_owned());
             }
             (Some(acc), Some(am)) => {
                 let (bands, h, w) = acc.dim();

@@ -408,7 +408,10 @@ impl Tiler {
             if style.unscale {
                 return self
                     .run_tile_cpu(context, "unscale", move || {
-                        Ok(Some(Arc::new(unscale_image(&src, &scales))))
+                        Ok(Some(Arc::new(unscale_image(
+                            Arc::unwrap_or_clone(src),
+                            &scales,
+                        ))))
                     })
                     .await;
             }
@@ -430,7 +433,7 @@ impl Tiler {
                 let image = warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)?;
                 cancellation.check()?;
                 Ok(if unscale {
-                    unscale_image(&image, &scales)
+                    unscale_image(image, &scales)
                 } else {
                     image
                 })
@@ -571,7 +574,7 @@ impl Tiler {
                 };
                 cancellation.check()?;
                 let img = if style_owned.unscale {
-                    Arc::new(unscale_image(&img, &scale_offset))
+                    Arc::new(unscale_image(Arc::unwrap_or_clone(img), &scale_offset))
                 } else {
                     img
                 };
@@ -1049,11 +1052,11 @@ fn expression_rescale(
     }
 }
 
-/// Apply per-band `physical = raw * scale + offset`, returning a new F64
-/// `ImageData`. Bands beyond `scale_offset.len()` use identity.
-fn unscale_image(img: &ImageData, scale_offset: &[ScaleOffset]) -> ImageData {
+/// Apply per-band `physical = raw * scale + offset`, reusing owned F64 pixels.
+/// Bands beyond `scale_offset.len()` use identity.
+fn unscale_image(img: ImageData, scale_offset: &[ScaleOffset]) -> ImageData {
     use ndarray::Axis;
-    let mut data = img.pixels.to_f64();
+    let mut data = img.pixels.into_f64();
     for (b, mut band) in data.axis_iter_mut(Axis(0)).enumerate() {
         let so = scale_offset
             .get(b)
@@ -1073,8 +1076,8 @@ fn unscale_image(img: &ImageData, scale_offset: &[ScaleOffset]) -> ImageData {
     }
     ImageData {
         pixels: PixelData::F64(data),
-        mask: img.mask.clone(),
-        crs: img.crs.clone(),
+        mask: img.mask,
+        crs: img.crs,
         transform: img.transform,
         nodata: Some(f64::NAN),
         bbox: img.bbox,
@@ -1312,12 +1315,39 @@ mod tests {
             nodata: Some(-9999.0),
             bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
         };
-        let out = unscale_image(&img, &[so(0.1, 1.0), so(2.0, 0.0)]);
+        let out = unscale_image(img, &[so(0.1, 1.0), so(2.0, 0.0)]);
         let f = out.pixels.to_f64();
         assert_eq!(f[[0, 0, 0]], 10.0 * 0.1 + 1.0);
         assert_eq!(f[[0, 0, 1]], 20.0 * 0.1 + 1.0);
         assert_eq!(f[[1, 0, 0]], 1.0 * 2.0);
         assert!(out.nodata.unwrap().is_nan());
+    }
+
+    #[test]
+    fn unscale_reuses_unique_buffers_and_preserves_shared_images() {
+        use crate::pixel::{ImageData, PixelData};
+        use std::sync::Arc;
+        let pixels = ndarray::array![[[1.0, 2.0], [3.0, 4.0]]].permuted_axes([0, 2, 1]);
+        let mask = ndarray::array![[true, false], [true, true]];
+        let pixel_pointer = pixels.as_ptr();
+        let mask_pointer = mask.as_ptr();
+        let image = Arc::new(ImageData {
+            pixels: PixelData::F64(pixels),
+            mask: Some(mask),
+            crs: crate::crs::Crs::epsg(4326),
+            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 2.0, 0.0, -1.0]),
+            nodata: None,
+            bbox: Bbox::new(0.0, 0.0, 2.0, 2.0),
+        });
+        let shared = unscale_image(Arc::unwrap_or_clone(Arc::clone(&image)), &[so(2.0, 1.0)]);
+        assert_eq!(image.pixels.as_f64()[[0, 0, 0]], 1.0);
+        assert_eq!(shared.pixels.as_f64()[[0, 0, 0]], 3.0);
+        assert_ne!(shared.pixels.as_f64().as_ptr(), pixel_pointer);
+
+        let unique = unscale_image(Arc::unwrap_or_clone(image), &[so(2.0, 1.0)]);
+        assert_eq!(unique.pixels.as_f64().as_ptr(), pixel_pointer);
+        assert_eq!(unique.mask.as_ref().unwrap().as_ptr(), mask_pointer);
+        assert_eq!(unique.pixels.as_f64()[[0, 0, 1]], 7.0);
     }
 
     #[test]
@@ -1333,7 +1363,7 @@ mod tests {
             nodata: Some(-9999.0),
             bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
         };
-        let out = unscale_image(&img, &[so(0.1, 1.0)]);
+        let out = unscale_image(img, &[so(0.1, 1.0)]);
         let f = out.pixels.to_f64();
         // Invalid raw samples stay invalid across different band affines.
         assert!(f[[0, 0, 1]].is_nan());
@@ -1529,7 +1559,7 @@ mod tests {
             nodata: Some(-9999.0),
             bbox: Bbox::new(0.0, 0.0, 2.0, 1.0),
         };
-        let out = unscale_image(&img, &[so(0.1, 1.0), so(2.0, 5.0)]);
+        let out = unscale_image(img, &[so(0.1, 1.0), so(2.0, 5.0)]);
         let pixels = out.pixels.to_f64();
         assert!(pixels[[0, 0, 1]].is_nan());
         assert!(pixels[[1, 0, 0]].is_nan());

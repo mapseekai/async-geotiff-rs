@@ -8,9 +8,9 @@ license = "MIT OR Apache-2.0"
 description = "Async COG → XYZ tile renderer (pure Rust, no GDAL)"
 
 [dependencies]
-async-tiff        = "0.3"
+async-tiff        = "0.4.0"
 async-trait       = "0.1"
-object_store      = { version = "0.13", features = ["http", "aws"] }
+object_store      = { version = "0.14", features = ["http", "aws"] }
 tile-grid         = "0.6"
 proj              = { version = "0.31", optional = true }
 raffine           = "0.2"
@@ -34,7 +34,7 @@ serde_urlencoded  = "0.7"
 tracing           = "0.1"
 console-subscriber = { version = "0.5", optional = true }
 url               = "2"
-reqwest           = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+reqwest           = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 quick-xml         = "0.39"
 flate2           = "1.1"
 zstd             = "0.13"

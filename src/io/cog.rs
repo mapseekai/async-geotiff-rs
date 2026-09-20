@@ -172,7 +172,7 @@ pub struct CogReader {
     max_window_bytes: u64,
     max_window_blocks: usize,
     reads: Arc<tokio::sync::Semaphore>,
-    pub(crate) tiff: TIFF,
+    pub(crate) tiff: Arc<TIFF>,
     pub(crate) reader: ObjectReader,
     pub(crate) src_crs: Crs,
     pub(crate) transform: GeoTransform,
@@ -545,7 +545,7 @@ impl CogReader {
                     config.max_concurrent_reads.max(1),
                 ))
             }),
-            tiff,
+            tiff: Arc::new(tiff),
             reader,
             src_crs,
             transform,
@@ -1447,14 +1447,15 @@ impl CogReader {
         let slot = Slot(Arc::clone(&self.prefetch_inflight));
 
         let ring = i64::from(self.prefetch_ring);
-        let mut targets: Vec<(BlockKind, ImageFileDirectory)> = Vec::with_capacity(2);
-        match self.data_ifd(level) {
-            Ok(ifd) => targets.push((BlockKind::Data, ifd.clone())),
+        let mut targets = Vec::with_capacity(2);
+        match self.data_ifd_index(level) {
+            Ok(idx) => targets.push((BlockKind::Data, idx)),
             Err(_) => return, // slot decrements via drop
         }
-        if let Ok(Some(mask_ifd)) = self.mask_ifd(level) {
-            targets.push((BlockKind::Mask, mask_ifd.clone()));
+        if let Some(Some(idx)) = self.mask_ifds.get(level) {
+            targets.push((BlockKind::Mask, *idx));
         }
+        let tiff = Arc::clone(&self.tiff);
         let reader = self.reader.clone();
         let cache = Arc::clone(&self.block_cache);
         let cpu = self.cpu.clone();
@@ -1468,8 +1469,11 @@ impl CogReader {
         tasks.spawn(async move {
             let _read_permit = read_permit;
             let _slot = slot;
-            for (kind, ifd) in targets {
-                let Ok(info) = IfdInfo::from(&ifd).validate() else {
+            for (kind, idx) in targets {
+                let Some(ifd) = tiff.ifds().get(idx) else {
+                    continue;
+                };
+                let Ok(info) = IfdInfo::from(ifd).validate() else {
                     continue;
                 };
                 let coords = ring_coords(&info, tx_range, ty_range, ring);
@@ -1477,7 +1481,7 @@ impl CogReader {
                     continue;
                 }
                 prefetch_blocks(
-                    &ifd,
+                    ifd,
                     kind,
                     level,
                     &coords,
@@ -1648,7 +1652,10 @@ fn split_http_url(url: &str) -> AgResult<(String, String)> {
 
 fn derive_geo(tiff: &TIFF) -> AgResult<(GeoTransform, Crs)> {
     let ifd = tiff.ifds().first().ok_or(AgError::MissingGeo("no IFD"))?;
+    derive_ifd_geo(ifd)
+}
 
+fn derive_ifd_geo(ifd: &ImageFileDirectory) -> AgResult<(GeoTransform, Crs)> {
     let mut gt = if let Some(t) = ifd.model_transformation() {
         // 4x4 row-major; for a north-up image use indices [3, 0, 1, 7, 4, 5].
         if t.len() < 16 {
@@ -1711,7 +1718,7 @@ fn classify_ifds(tiff: &TIFF) -> AgResult<(Vec<usize>, Vec<Option<usize>>)> {
             // reduced IFDs inherit the base transform, as ordinary COGs do.
             if ifd.model_transformation().is_some() || ifd.model_tiepoint().is_some() {
                 let base = derive_geo(tiff)?.0;
-                let candidate = derive_geo(&TIFF::new(vec![ifd.clone()], tiff.endianness()))?.0;
+                let candidate = derive_ifd_geo(ifd)?.0;
                 let sx = f64::from(first.image_width()) / f64::from(dims.0);
                 let sy = f64::from(first.image_height()) / f64::from(dims.1);
                 let aligned = [(0., 0.), (1., 0.), (0., 1.)].iter().all(|&(x, y)| {

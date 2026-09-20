@@ -89,6 +89,14 @@ impl PixelData {
         }
     }
 
+    /// Consume the pixels, reusing the allocation when already F64.
+    pub fn into_f64(self) -> Array3<f64> {
+        match self {
+            Self::F64(a) => a,
+            other => other.to_f64(),
+        }
+    }
+
     /// Split off band `b` as an `Array2<bool>` (truthy = non-zero) and
     /// return the remaining planar `(bands-1, H, W)` buffer. Used by the
     /// CogReader to promote an `ExtraSamples=Alpha` band to a validity
@@ -145,6 +153,24 @@ pub struct ImageData {
 mod tests {
     use super::*;
     use ndarray::Array3;
+
+    #[test]
+    fn f64_views_borrow_and_consuming_conversion_reuses_strided_storage() {
+        let array = Array3::from_shape_vec((1, 2, 3), (0..6).map(f64::from).collect())
+            .unwrap()
+            .permuted_axes([0, 2, 1]);
+        let pointer = array.as_ptr();
+        let pixels = PixelData::F64(array);
+        assert!(matches!(pixels.as_f64(), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(pixels.as_f64().as_ptr(), pointer);
+        let converted = pixels.into_f64();
+        assert_eq!(converted.as_ptr(), pointer);
+        assert_eq!(converted[[0, 2, 1]], 5.0);
+
+        let integer = PixelData::U16(Array3::from_elem((1, 2, 3), 1234));
+        assert!(matches!(integer.as_f64(), std::borrow::Cow::Owned(_)));
+        assert!(integer.into_f64().iter().all(|&v| v == 1234.0));
+    }
 
     #[test]
     fn pixel_data_shape_helpers() {

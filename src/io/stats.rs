@@ -255,9 +255,9 @@ pub(crate) fn band_stats_from_image(
     image: &crate::pixel::ImageData,
     hist_bins: usize,
 ) -> Vec<BandStat> {
-    let mut arr = image.pixels.to_f64();
+    let mut arr = image.pixels.as_f64();
     if let Some(mask) = &image.mask {
-        for mut band in arr.axis_iter_mut(Axis(0)) {
+        for mut band in arr.to_mut().axis_iter_mut(Axis(0)) {
             ndarray::Zip::from(&mut band)
                 .and(mask)
                 .for_each(|value, &valid| {
@@ -418,6 +418,23 @@ mod tests {
             (10.0, 20.0, 15.0)
         );
         assert_eq!(stats[0].hist.counts.iter().sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn masked_stats_do_not_mutate_borrowed_strided_f64_pixels() {
+        let pixels = ndarray::array![[[1.0, 9999.0], [3.0, 5.0]]].permuted_axes([0, 2, 1]);
+        let image = crate::pixel::ImageData {
+            pixels: crate::pixel::PixelData::F64(pixels),
+            mask: Some(ndarray::array![[true, true], [false, true]]),
+            bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 2.0),
+            crs: crate::crs::Crs::epsg(4326),
+            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 2.0, 0.0, -1.0]),
+            nodata: None,
+        };
+        let stats = band_stats_from_image(&image, 4);
+        assert_eq!((stats[0].min, stats[0].max, stats[0].mean), (1.0, 5.0, 3.0));
+        assert_eq!(stats[0].hist.counts.iter().sum::<u64>(), 3);
+        assert_eq!(image.pixels.as_f64()[[0, 1, 0]], 9999.0);
     }
 
     #[test]

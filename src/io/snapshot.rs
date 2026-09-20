@@ -99,7 +99,7 @@ impl SnapshotStore {
                 },
             )
             .await?;
-        let meta = first.meta.clone();
+        let meta = &first.meta;
         let strong = meta
             .e_tag
             .as_deref()
@@ -113,7 +113,7 @@ impl SnapshotStore {
         if first.range != (0..1) || meta.size == 0 {
             return Err(invalid("snapshot probe returned an invalid range"));
         }
-        collect_bounded(first, 1, reservation).await?;
+        let meta = collect_bounded(first, 1, reservation).await?.meta;
         Ok(Arc::new(Self {
             inner,
             budget,
@@ -181,25 +181,28 @@ impl SnapshotStore {
         if result.range != requested {
             return Err(invalid("source returned a mismatched byte range"));
         }
-        let meta = result.meta.clone();
-        let attributes = result.attributes.clone();
-        let bytes = collect_bounded(result, len, reservation).await?;
-        Ok(GetResult {
-            meta,
-            attributes,
-            range: requested,
-            payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
-        })
+        collect_bounded(result, len, reservation).await
     }
 }
 async fn collect_bounded(
-    result: GetResult,
+    mut result: GetResult,
     limit: u64,
     reservation: crate::resource::WorkReservation,
-) -> Result<Bytes> {
+) -> Result<GetResult> {
     let capacity =
         usize::try_from(limit).map_err(|_| invalid("range too large for this platform"))?;
     let mut out = BytesMut::with_capacity(capacity);
+    // into_stream consumes the response, but only uses its payload and range.
+    // Move heap-backed metadata out first; keep file range handling upstream.
+    let meta = ObjectMeta {
+        location: std::mem::take(&mut result.meta.location),
+        e_tag: result.meta.e_tag.take(),
+        version: result.meta.version.take(),
+        ..result.meta
+    };
+    let attributes = std::mem::take(&mut result.attributes);
+    let extensions = std::mem::take(&mut result.extensions);
+    let range = result.range.clone();
     let mut chunks = result.into_stream();
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk?;
@@ -222,10 +225,17 @@ async fn collect_bounded(
     }
     // Every Bytes clone/slice keeps the backing reservation, including cached
     // metadata and compressed data retained by a cancelled blocking decoder.
-    Ok(Bytes::from_owner(AccountedBytes {
+    let bytes = Bytes::from_owner(AccountedBytes {
         bytes: out.freeze(),
         _reservation: reservation,
-    }))
+    });
+    Ok(GetResult {
+        meta,
+        attributes,
+        extensions,
+        range,
+        payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
+    })
 }
 #[async_trait]
 impl ObjectStore for SnapshotStore {
@@ -281,6 +291,58 @@ impl ObjectStore for SnapshotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_response_moves_extensions_and_preserves_file_range() {
+        #[derive(Debug)]
+        struct NeverClone;
+        impl Clone for NeverClone {
+            fn clone(&self) -> Self {
+                panic!("response extensions must be moved, not cloned");
+            }
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"0123456789").unwrap();
+        let path = Path::from_filesystem_path(file.path()).unwrap();
+        let store = object_store::local::LocalFileSystem::new();
+        let mut response = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(3..7)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(response.payload, GetResultPayload::File(..)));
+        response.extensions.insert(NeverClone);
+        response
+            .attributes
+            .insert(object_store::Attribute::ContentType, "image/tiff".into());
+        let budget = crate::resource::WorkBudget::new(4);
+        let response = collect_bounded(response, 4, budget.try_reserve(4).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.meta.location, path);
+        assert_eq!(response.meta.size, 10);
+        assert_eq!(response.range, 3..7);
+        assert!(response.extensions.get::<NeverClone>().is_some());
+        assert_eq!(
+            response
+                .attributes
+                .get(&object_store::Attribute::ContentType)
+                .unwrap()
+                .as_ref(),
+            "image/tiff"
+        );
+        let bytes = response.bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"3456");
+        assert_eq!(budget.used_bytes(), 4);
+        drop(bytes);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
     #[tokio::test]
     async fn snapshot_buffers_hold_budget_until_last_bytes_clone_drops() {
         let memory = Arc::new(object_store::memory::InMemory::new());

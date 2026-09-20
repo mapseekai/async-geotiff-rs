@@ -119,7 +119,7 @@ pub fn fallback_rescale(
         return bidx.iter().map(|_| r).collect();
     }
     // Float: per-tile min/max.
-    let arr = pixels.to_f64();
+    let arr = pixels.as_f64();
     bidx.iter()
         .map(|&b| {
             let band = arr.index_axis(Axis(0), b.min(arr.shape()[0].saturating_sub(1)));
