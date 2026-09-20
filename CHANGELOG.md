@@ -11,6 +11,36 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-20
+
+### ⚠️ BREAKING
+
+- Upgrade `async-tiff` to 0.4.0 and `object_store` to 0.14. Callers passing
+  object stores or async-tiff readers must use these compatible dependency
+  versions. The direct HTTP client dependency is now `reqwest` 0.13.
+
+### Added
+
+- `PixelData::into_f64` consumes pixel data and reuses existing F64 storage.
+
+### Changed
+
+- Borrow F64 arrays with `Cow` in mosaic reduction, statistics and fallback
+  stretching; copy only when mutation or retained ownership requires it.
+- Reuse uniquely owned F64 buffers during unscale and move masks and CRS
+  metadata instead of cloning them.
+- Share TIFF metadata with prefetch tasks and inspect overview IFDs directly,
+  avoiding copies of complete tile-offset and byte-count tables.
+- Move Snapshot response metadata, attributes and extensions while preserving
+  bounded file-range reads and working-memory accounting.
+- Deduplicate MosaicJSON URLs as borrowed strings before allocating asset
+  references, preserving first-occurrence paint priority.
+
+### Fixed
+
+- Keep the lockfile compatible with Rust 1.88 by selecting `crc-fast` 1.9.0;
+  version 1.10.0 requires Rust 1.89.
+
 ## [0.10.1] - 2026-09-14
 
 ### Fixed
@@ -416,7 +446,9 @@ can land in any release** and are called out explicitly under a
 - PNG output; example axum server with MapLibre / OpenLayers / Leaflet
   viewers and a local `data/*.tif` dataset picker.
 
-[Unreleased]: https://github.com/mapseekai/async-geotiff-rs/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/mapseekai/async-geotiff-rs/compare/v0.11.0...HEAD
+
+[0.11.0]: https://github.com/mapseekai/async-geotiff-rs/releases/tag/v0.11.0
 
 [0.10.1]: https://github.com/mapseekai/async-geotiff-rs/releases/tag/v0.10.1
 
