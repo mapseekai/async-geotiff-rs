@@ -215,6 +215,8 @@ CPU 密集型解码、拼接、重投影和渲染通过受信号量限制的 `sp
 
 ### 性能说明
 
+大型 COG 的首次／二次请求、浏览器视口和并发实测见 [与 TiTiler 的性能对比](docs/performance-comparison-titiler.md)。
+
 - **缓存容量是最重要的调节项。** 512 MB 通常足够大型 RGB COG 的浏览视口；多数据集服务或大范围平移缩放可以使用 1024 MB。
 - **创建 COG 时优先使用 ZSTD。** 基准测试显示 ZSTD 块解码 P50 约 1.5 ms，DEFLATE 约 4.5 ms（约快 3 倍）；可使用 `gdal_translate -co COMPRESS=ZSTD -co ZSTD_LEVEL=1` 降低读取延迟。
 - **`MAX_TILE_TASKS` 保持默认值**（`available_parallelism()`）。只有 profiling 证明默认值造成 CPU 争用时才覆盖它。

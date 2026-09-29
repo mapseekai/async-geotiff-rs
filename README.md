@@ -224,6 +224,8 @@ this automatically via its `ReaderPool`.
 
 ### Performance notes
 
+See the [large-COG performance comparison with TiTiler](docs/performance-comparison-titiler.md) (Chinese) for cold/warm requests, browser viewport loading, and concurrent batches.
+
 - **Cache capacity is the strongest lever.** 512 MB holds a typical browsing
   viewport for large RGB COGs; use 1024 MB for multi-dataset servers or wide
   pan/zoom sessions.
