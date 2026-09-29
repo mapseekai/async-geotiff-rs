@@ -6,7 +6,7 @@ weight: 10
 
 ## 库与示例 {#library}
 
-- Rust 1.88 或更高版本，与 `Cargo.toml` 保持一致。
+- Rust 1.92 或更高版本，与 `Cargo.toml` 保持一致。
 - 默认 feature 集需要系统 `libproj` 9.x。
 - 从仓库开发时需要 Git。
 

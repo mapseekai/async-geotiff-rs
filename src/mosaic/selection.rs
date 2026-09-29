@@ -1,4 +1,4 @@
-//! Pixel-selection reducer. Mirrors rio-tiler `MosaicMethodBase`.
+//! Raster Style whole-tuple pixel-selection reducer.
 
 use ndarray::{Array2, Array3};
 use std::borrow::Cow;
@@ -12,16 +12,16 @@ use crate::pixel::{ImageData, PixelData};
 pub enum PixelSelection {
     /// First valid pixel by paint order wins; short-circuits once tile is fully covered.
     First,
-    /// Per-pixel maximum on band 0 across ALL assets (global extremum). Reads
+    /// Per-pixel maximum on the configured ranking channel across ALL assets (global extremum). Reads
     /// every asset — does NOT short-circuit on full coverage, since a
     /// not-yet-read overlapping asset can still hold a higher value. Matches
     /// rio-tiler, where only `FirstMethod` sets `exit_when_filled`.
     Highest,
-    /// Per-pixel minimum on band 0 across ALL assets (global extremum). Reads
+    /// Per-pixel minimum on the configured ranking channel across ALL assets (global extremum). Reads
     /// every asset — does NOT short-circuit (see [`Self::Highest`]).
     Lowest,
     /// Per-pixel mean over all valid asset samples; all assets are read (no
-    /// short-circuit). Memory is O(1) in the number of assets (streaming sum).
+    /// short-circuit). Memory is O(1) in the number of assets (streaming mean).
     Mean,
     /// Per-pixel median over all valid asset samples; all assets are read (no
     /// short-circuit). **Memory is O(assets)**: every fed image is retained as
@@ -50,12 +50,13 @@ pub enum NonEmptyReducer {}
 
 pub struct Reducer<State = EmptyReducer> {
     method: PixelSelection,
+    rank: usize,
     /// `(bands, h, w)` accumulator — `None` until first feed.
-    /// First/Highest/Lowest: the running result. Mean: the running **sum**.
+    /// First/Highest/Lowest: the running result. Mean: the running **mean**.
     acc: Option<Array3<f64>>,
     /// `(h, w)` validity of `acc`, `true = valid`.
     acc_mask: Option<Array2<bool>>,
-    /// Mean only: per-band finite-sample count, parallel to `acc` (the sum).
+    /// Mean only: per-band finite-sample count, parallel to `acc` (the mean).
     count: Option<Array3<u32>>,
     /// Median only: every fed image's `(bands,h,w)` + mask.
     stack: Vec<(Array3<f64>, Array2<bool>)>,
@@ -92,6 +93,7 @@ impl Reducer<EmptyReducer> {
     pub fn new(method: PixelSelection) -> Self {
         Self {
             method,
+            rank: 0,
             acc: None,
             acc_mask: None,
             count: None,
@@ -104,10 +106,19 @@ impl Reducer<EmptyReducer> {
         }
     }
 
+    /// Raster Style uses finite, complete tuples and an explicit ranking channel.
+    pub(crate) fn new_raster(method: PixelSelection, rank: usize) -> Self {
+        Self {
+            rank,
+            ..Self::new(method)
+        }
+    }
+
     pub fn feed(mut self, img: &ImageData) -> AgResult<Reducer<NonEmptyReducer>> {
         self.feed_impl(img)?;
         Ok(Reducer {
             method: self.method,
+            rank: self.rank,
             acc: self.acc,
             acc_mask: self.acc_mask,
             count: self.count,
@@ -154,23 +165,23 @@ impl<State> Reducer<State> {
                 "assets must have matching nonempty shapes, masks, CRS and pixel grids".into(),
             ));
         }
+        if self.rank >= shape.0 {
+            return Err(AgError::query(
+                "/mosaic/rank_channel",
+                "outside the input tuple",
+            ));
+        }
         // (bands, h, w), borrowed for F64.
         let arr = img.pixels.as_f64();
         // Normalize declared numeric nodata once for every selection method.
-        let normalized_mask = img.nodata.map(|nd| {
-            Array2::from_shape_fn((shape.1, shape.2), |(r, c)| {
-                valid(img.mask.as_ref(), r, c)
-                    && (0..shape.0).all(|b| {
-                        let v = arr[[b, r, c]];
-                        if nd.is_nan() {
-                            !v.is_nan()
-                        } else {
-                            v != nd
-                        }
-                    })
-            })
+        let normalized_mask = Array2::from_shape_fn((shape.1, shape.2), |(r, c)| {
+            valid(img.mask.as_ref(), r, c)
+                && (0..shape.0).all(|b| {
+                    let v = arr[[b, r, c]];
+                    v.is_finite() && img.nodata.is_none_or(|nd| nd.is_nan() || v != nd)
+                })
         });
-        let m = normalized_mask.as_ref().or(img.mask.as_ref());
+        let m = Some(&normalized_mask);
         if self.bbox.is_none() {
             self.bbox = Some(img.bbox);
             self.crs = Some(img.crs.clone());
@@ -299,8 +310,8 @@ impl<State> Reducer<State> {
                     let offset = linear_offset(b, plane, i);
                     let value = arr[offset];
                     if value.is_finite() {
-                        sum[offset] += value;
                         count[offset] += 1;
+                        sum[offset] = running_mean(sum[offset], value, count[offset]);
                     }
                 }
             }
@@ -314,8 +325,8 @@ impl<State> Reducer<State> {
                     for b in 0..bands {
                         let v = arr[[b, y, x]];
                         if v.is_finite() {
-                            sum[[b, y, x]] += v;
                             count[[b, y, x]] += 1;
+                            sum[[b, y, x]] = running_mean(sum[[b, y, x]], v, count[[b, y, x]]);
                         }
                     }
                 }
@@ -353,13 +364,13 @@ impl<State> Reducer<State> {
                         if !mask.is_none_or(|mask| mask[i]) {
                             continue;
                         }
-                        // compare on band 0; replace whole pixel stack
+                        // Compare on the configured channel; replace the whole tuple.
                         let replace = if !am[i] {
                             true
                         } else if want_high {
-                            arr[i] > acc[i]
+                            arr[self.rank * plane + i] > acc[self.rank * plane + i]
                         } else {
-                            arr[i] < acc[i]
+                            arr[self.rank * plane + i] < acc[self.rank * plane + i]
                         };
                         if replace {
                             for b in 0..bands {
@@ -375,13 +386,13 @@ impl<State> Reducer<State> {
                             if !valid(m, y, x) {
                                 continue;
                             }
-                            // compare on band 0; replace whole pixel stack
+                            // Compare on the configured channel; replace the whole tuple.
                             let replace = if !am[[y, x]] {
                                 true
                             } else if want_high {
-                                arr[[0, y, x]] > acc[[0, y, x]]
+                                arr[[self.rank, y, x]] > acc[[self.rank, y, x]]
                             } else {
-                                arr[[0, y, x]] < acc[[0, y, x]]
+                                arr[[self.rank, y, x]] < acc[[self.rank, y, x]]
                             };
                             if replace {
                                 for b in 0..bands {
@@ -430,20 +441,10 @@ impl Reducer<NonEmptyReducer> {
                 )
             }
             PixelSelection::Mean => {
-                // Streamed: divide running sum by finite-sample count per band.
-                let sum = self
+                let out = self
                     .acc
                     .ok_or_else(|| AgError::Mosaic("no assets fed".into()))?;
-                let count = self
-                    .count
-                    .expect("invariant: count is set whenever the Mean sum is set");
-                let mask = self
-                    .acc_mask
-                    .expect("invariant: acc_mask is set whenever the Mean sum is set");
-                let mut out = sum;
-                ndarray::Zip::from(&mut out).and(&count).for_each(|v, &c| {
-                    *v = if c > 0 { *v / c as f64 } else { 0.0 };
-                });
+                let mask = self.acc_mask.expect("Mean accumulator has a validity mask");
                 (out, mask)
             }
             PixelSelection::Median => {
@@ -461,6 +462,27 @@ impl Reducer<NonEmptyReducer> {
             transform: self.transform.unwrap(),
             nodata: None,
         })
+    }
+}
+
+// Convex combinations avoid overflowing an intermediate sum of finite values.
+fn running_mean(mean: f64, value: f64, count: u32) -> f64 {
+    if count == 1 {
+        return value;
+    }
+    let n = f64::from(count);
+    if mean.signum() == value.signum() {
+        mean + (value - mean) / n
+    } else {
+        mean * ((n - 1.0) / n) + value / n
+    }
+}
+
+fn midpoint(lo: f64, hi: f64) -> f64 {
+    if lo.signum() == hi.signum() {
+        lo + (hi - lo) / 2.0
+    } else {
+        lo / 2.0 + hi / 2.0
     }
 }
 
@@ -498,15 +520,14 @@ fn aggregate_median(stack: &[(Array3<f64>, Array2<bool>)]) -> (Array3<f64>, Arra
                 }
                 let len = buf.len();
                 let mid = len / 2;
-                // total_cmp orders NaN last, matching the previous full-sort
-                // behaviour; quickselect only positions the needed rank(s).
+                // Quickselect only positions the needed rank(s).
                 let (_, hi, _) = buf.select_nth_unstable_by(mid, f64::total_cmp);
                 let hi_val = *hi;
                 out[offset] = if len % 2 == 1 {
                     hi_val
                 } else {
                     let (_, lo, _) = buf.select_nth_unstable_by(mid - 1, f64::total_cmp);
-                    (*lo + hi_val) / 2.0
+                    midpoint(*lo, hi_val)
                 };
             }
         }
@@ -527,15 +548,14 @@ fn aggregate_median(stack: &[(Array3<f64>, Array2<bool>)]) -> (Array3<f64>, Arra
                     }
                     let len = buf.len();
                     let mid = len / 2;
-                    // total_cmp orders NaN last, matching the previous full-sort
-                    // behaviour; quickselect only positions the needed rank(s).
+                    // Quickselect only positions the needed rank(s).
                     let (_, hi, _) = buf.select_nth_unstable_by(mid, f64::total_cmp);
                     let hi_val = *hi;
                     out[[b, y, x]] = if len % 2 == 1 {
                         hi_val
                     } else {
                         let (_, lo, _) = buf.select_nth_unstable_by(mid - 1, f64::total_cmp);
-                        (*lo + hi_val) / 2.0
+                        midpoint(*lo, hi_val)
                     };
                 }
             }
@@ -645,31 +665,26 @@ mod tests {
             ),
         ];
 
-        assert_reduction(
-            PixelSelection::First,
-            &images,
-            &[1.0, 7.0, 4.0, 10.0, 70.0, f64::NAN],
-        );
-        assert_reduction(
-            PixelSelection::Highest,
-            &images,
-            &[2.0, 7.0, f64::INFINITY, 20.0, 70.0, f64::INFINITY],
-        );
-        assert_reduction(
-            PixelSelection::Lowest,
-            &images,
-            &[1.0, 6.0, 4.0, 10.0, 60.0, f64::NAN],
-        );
-        assert_reduction(
-            PixelSelection::Mean,
-            &images,
-            &[4.0 / 3.0, 6.5, 4.0, 43.0, 65.0, 0.0],
-        );
-        assert_reduction(
-            PixelSelection::Median,
-            &images,
-            &[1.0, 6.5, f64::INFINITY, 20.0, 65.0, f64::NAN],
-        );
+        for (method, expected) in [
+            (PixelSelection::First, [1.0, 7.0, 10.0, 70.0]),
+            (PixelSelection::Highest, [2.0, 7.0, 20.0, 70.0]),
+            (PixelSelection::Lowest, [1.0, 6.0, 10.0, 60.0]),
+            (PixelSelection::Mean, [4.0 / 3.0, 6.5, 43.0, 65.0]),
+            (PixelSelection::Median, [1.0, 6.5, 20.0, 65.0]),
+        ] {
+            let out = reduce(method, &images);
+            assert_eq!(
+                out.mask.unwrap().into_raw_vec_and_offset().0,
+                [true, true, false]
+            );
+            let pixels = out.pixels.to_f64();
+            for (index, expected) in expected.into_iter().enumerate() {
+                assert!(
+                    (pixels[[index / 2, 0, index % 2]] - expected).abs() < 1e-12,
+                    "{method:?}: valid tuple component {index}"
+                );
+            }
+        }
 
         let tied = reduce(PixelSelection::Highest, &images[..2]);
         assert_eq!(tied.pixels.to_f64()[[1, 0, 0]], 10.0);
@@ -797,17 +812,16 @@ mod tests {
 
     #[test]
     fn median_and_mean_are_nan_safe() {
-        // NaN samples with mask=true must not panic; median uses total order,
-        // mean ignores non-finite samples.
+        // Non-finite samples are invalid even when the supplied mask is true.
         let mut md = Reducer::new(PixelSelection::Median)
             .feed(&img(&[1.0], &[true]))
             .unwrap();
         md.feed(&img(&[f64::NAN], &[true])).unwrap();
         md.feed(&img(&[3.0], &[true])).unwrap();
         let v = md.finish().unwrap().pixels.to_f64()[[0, 0, 0]];
-        // total_cmp orders NaN last → sorted [1.0, 3.0, NaN], len=3, mid=1 → 3.0
+        // NaN is excluded: median of [1.0, 3.0] = 2.0
         assert!(v.is_finite()); // no panic
-        assert_eq!(v, 3.0);
+        assert_eq!(v, 2.0);
 
         let mut me = Reducer::new(PixelSelection::Mean)
             .feed(&img(&[2.0], &[true]))

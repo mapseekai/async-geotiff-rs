@@ -22,7 +22,7 @@
         position: absolute;
         z-index: 10;
         top: 12px;
-        left: 12px;
+        left: 56px;
         right: 12px;
         display: flex;
         flex-wrap: wrap;
@@ -36,6 +36,7 @@
           13px system-ui,
           sans-serif;
       }
+      .field[hidden] { display: none; }
       .field {
         display: flex;
         flex-direction: column;
@@ -105,17 +106,15 @@
       </div>
       <div class="field">
         <label for="stretch">Stretch</label>
-        <select id="stretch" name="stretch">
-          <option value="auto">auto (stddev 2σ)</option>
-          <option value="custom">custom (rescale)</option>
-          <option value="minmax">min/max</option>
-          <option value="percent">percentile</option>
-          <option value="stddev">mean ± kσ</option>
+        <select id="stretch" name="method">
+          <option value="none">none (0–255)</option>
+          <option value="linear">linear (rescale)</option>
+          <option value="minmax">minmax</option>
+          <option value="percentile">percentile</option>
+          <option value="stddev">standard deviation</option>
+          <option value="histogram_equalization">histogram equalization</option>
+          <option value="curve">curve</option>
         </select>
-      </div>
-      <div class="field">
-        <label for="stretchArg">pc / σ</label>
-        <input id="stretchArg" type="text" placeholder="2,98 or 2.5" />
       </div>
       <div class="field wide">
         <label for="rescale">Rescale</label>
@@ -125,6 +124,18 @@
           type="text"
           value="0,255;0,255;0,255"
         />
+      </div>
+      <div class="field" id="percentiles-field" hidden>
+        <label for="percentiles">Percentiles (low, high)</label>
+        <input id="percentiles" name="percentiles" type="text" value="2,98" />
+      </div>
+      <div class="field" id="stddev-field" hidden>
+        <label for="stddev">Standard deviations</label>
+        <input id="stddev" name="stddev" type="number" min="0.000001" step="any" value="2" />
+      </div>
+      <div class="field wide" id="curves-field" hidden>
+        <label for="curves">Curves ([[x,u],…] per channel)</label>
+        <input id="curves" name="curves" type="text" value="[[[0,0],[128,0.5],[255,1]]]" />
       </div>
       <div class="field">
         <label for="bidx">Bands</label>
@@ -183,8 +194,7 @@
     <script src="https://cdn.jsdelivr.net/npm/ol@9.2.4/dist/ol.js"></script>
     <script>
       const ORIGIN = window.location.origin;
-      // Base without extension; the server is titiler-style so the path
-      // extension drives the output format. tileUrl() appends the selected ext.
+      // Path extension and Raster Style image.format must agree.
       const TILE_BASE = "/tiles/WebMercatorQuad/{z}/{x}/{y}";
       let styleVersion = 0;
       let rasterReady = false;
@@ -193,8 +203,10 @@
         basemap: document.getElementById("basemap"),
         colormap: document.getElementById("colormap"),
         stretch: document.getElementById("stretch"),
-        stretchArg: document.getElementById("stretchArg"),
         rescale: document.getElementById("rescale"),
+        percentiles: document.getElementById("percentiles"),
+        stddev: document.getElementById("stddev"),
+        curves: document.getElementById("curves"),
         bidx: document.getElementById("bidx"),
         expression: document.getElementById("expression"),
         resampling: document.getElementById("resampling"),
@@ -219,8 +231,11 @@
       }
 
       function syncStretchUi() {
-        c.stretchArg.disabled = !["percent", "stddev"].includes(c.stretch.value);
-        c.rescale.disabled = c.stretch.value !== "custom";
+        c.rescale.disabled = c.stretch.value !== "linear";
+        for (const [field, method] of [["percentiles", "percentile"], ["stddev", "stddev"], ["curves", "curve"]]) {
+          c[field].disabled = c.stretch.value !== method;
+          document.getElementById(`${field}-field`).hidden = c[field].disabled;
+        }
       }
 
       function restorePageParams() {
@@ -230,20 +245,13 @@
         c.colormap.value = pageParams.get("colormap_name") ?? "";
         c.bidx.value = pageParams.getAll("bidx").join(",");
         const rescale = pageParams.getAll("rescale");
-        if (rescale.length) {
-          c.rescale.value = rescale.join(";");
-          c.stretch.value = "custom";
-        } else {
-          const stretch = pageParams.get("stretch");
-          if (["minmax", "percent", "stddev"].includes(stretch)) {
-            c.stretch.value = stretch;
-          }
-        }
-        if (c.stretch.value === "percent") {
-          c.stretchArg.value = pageParams.get("pc") ?? "";
-        } else if (c.stretch.value === "stddev") {
-          c.stretchArg.value = pageParams.get("sigma") ?? "";
-        }
+        if (rescale.length) c.rescale.value = rescale.join(";");
+        c.stretch.value = pageParams.get("method") ?? "none";
+      for (const field of ["percentiles", "stddev", "curves"]) {
+        const value = pageParams.get(field);
+        if (value !== null) c[field].value = value;
+      }
+        c.opacity.value = pageParams.get("opacity") ?? "1";
         for (const control of [c.resampling, c.tilesize]) {
           const value = pageParams.get(control.name);
           if (value !== null && [...control.options].some((option) => option.value === value)) {
@@ -260,7 +268,7 @@
       function applyNdvi() {
         c.expression.value = "(b5-b4)/(b5+b4)";
         c.bidx.value = "";
-        c.stretch.value = "custom";
+        c.stretch.value = "linear";
         c.rescale.value = "-1,1";
         c.colormap.value = "viridis";
         syncStretchUi();
@@ -275,46 +283,53 @@
           .filter(Boolean)
           .forEach((v) => p.append(name, v));
       }
+      let datasetBands = 1;
+      function protocolParams(params) {
+        params.set("version", "2.0");
+        const expression = params.get("expression");
+        if (!expression && !params.has("bidx")) {
+          const bands = c.colormap.value || datasetBands < 3 ? [1] : [1,2,3];
+          for (const band of bands) params.append("bidx", String(band));
+        }
+        const count = expression ? expression.split(";").length : params.getAll("bidx").length;
+        params.set("type", count === 3 ? "rgb" : (c.colormap.value ? "pseudocolor" : "gray"));
+        if (count === 3) params.delete("colormap_name");
+        params.set("method", c.stretch.value);
+        params.set("opacity", c.opacity.value);
+        if (count === 1 && params.getAll("rescale").length > 1) {
+          const first = params.get("rescale"); params.delete("rescale"); params.append("rescale", first);
+        }
+        params.set("format", c.format.value || "png");
+        if (c.format.value === "webp") params.set("lossless", "true");
+        params.sort();
+        return params;
+      }
+
       function tileUrl() {
         const p = new URLSearchParams();
         if (c.dataset.value) p.set("dataset", c.dataset.value);
         const expression = c.expression.value.trim();
         if (expression) p.set("expression", expression);
         else if (!(rgbPresetPending && c.bidx.value.replace(/\s/g, "") === "1,2,3")) appendRepeated(p, "bidx", c.bidx.value, ",");
-        // Auto means the advertised global mean ± 2σ stretch, not the U8 raw-value fast path.
-        // Explicitly send it so every tile resolves the same dataset statistics.
-        const mode = c.stretch.value;
-        const arg = c.stretchArg.value.trim();
-        if (mode === "custom") {
-          const ranges = c.rescale.value.split(";").map((s) => s.trim()).filter(Boolean);
-          for (const range of expression ? ranges.slice(0, 1) : ranges) {
-            p.append("rescale", range);
-          }
-        } else if (mode === "minmax") {
-          p.set("stretch", "minmax");
-        } else if (mode === "percent") {
-          p.set("stretch", "percent");
-          if (arg) p.set("pc", arg);
-        } else if (mode === "stddev") {
-          p.set("stretch", "stddev");
-          if (arg) p.set("sigma", arg);
-        } else {
-          p.set("stretch", "stddev");
+        if (c.stretch.value === "linear") {
+          appendRepeated(p, "rescale", c.rescale.value, ";");
         }
+        if (c.stretch.value === "percentile") p.set("percentiles", c.percentiles.value);
+        if (c.stretch.value === "stddev") p.set("stddev", c.stddev.value);
+        if (c.stretch.value === "curve") p.set("curves", c.curves.value);
         if (c.colormap.value) p.set("colormap_name", c.colormap.value);
         p.set("resampling", c.resampling.value);
         p.set("reproject", c.resampling.value);
         p.set("tilesize", c.tilesize.value || "256");
         p.set("_v", String(styleVersion));
-        // Format is carried by the path extension (.png/.webp/.jpg), not a
-        // query param, to satisfy the server's extension-drives-format rule.
+        // Match the path extension to the Raster Style format parameter.
         const ext = (c.format.value || "png");
-        return `${ORIGIN}${TILE_BASE}.${ext}?${p.toString()}`;
+        return `${ORIGIN}${TILE_BASE}.${ext}?${protocolParams(p).toString().replace(/\+/g, "%20")}`;
       }
 
       const cogLayer = new ol.layer.Tile({
         source: null,
-        opacity: Number(c.opacity.value),
+        opacity: 1,
       });
       const baseLayer = new ol.layer.Tile({ source: null });
 
@@ -332,7 +347,6 @@
       function applyStyle() {
         if (!rasterReady) return;
         styleVersion += 1;
-        cogLayer.setOpacity(Number(c.opacity.value));
         // Replacing the source drops OL's whole tile cache, so every zoom
         // level re-fetches with the new style (no stale-on-zoom).
         cogLayer.setSource(new ol.source.XYZ({ url: tileUrl(), maxZoom: 22 }));
@@ -348,6 +362,7 @@
           if (c.dataset.value !== ds) return;
           const bands = Number(r.headers.get("x-raster-bands"));
           if (Number.isInteger(bands) && bands > 0) {
+            datasetBands = bands;
             if (bands < 3 && c.bidx.value.replace(/\s/g, "") === "1,2,3") {
               c.bidx.value = "";
               const note = document.getElementById("band-note");
@@ -393,11 +408,9 @@
       c.ndvi.addEventListener("click", applyNdvi);
       syncStretchUi();
       syncExpressionUi();
-      c.opacity.addEventListener("input", () =>
-        cogLayer.setOpacity(Number(c.opacity.value)),
-      );
+      c.opacity.addEventListener("change", applyStyle);
 
-      // List only formats this build can encode (PNG always; WebP/JPG when the
+      // List only formats this build can encode (PNG always; lossless WebP when the
       // server was started with --features webp,jpeg), so we never offer a
       // format that would 400.
       (async function loadFormats() {

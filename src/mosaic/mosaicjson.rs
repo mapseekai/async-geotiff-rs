@@ -219,6 +219,16 @@ fn validate_document(doc: &mut MosaicJson) -> AgResult<()> {
 
 #[async_trait::async_trait]
 impl MosaicSource for MosaicJsonSource {
+    async fn statistics_assets(&self) -> AgResult<Vec<AssetRef>> {
+        self.assets_for_tile(TileCoord {
+            tms: TileMatrixSet::WebMercatorQuad,
+            z: 0,
+            x: 0,
+            y: 0,
+        })
+        .await
+    }
+
     async fn assets_for_tile(&self, coord: TileCoord) -> AgResult<Vec<AssetRef>> {
         if coord.tms != TileMatrixSet::WebMercatorQuad {
             return Err(AgError::query(

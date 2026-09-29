@@ -17,7 +17,7 @@ style, and encodes the result.
 - U8, U16, I16, U32, I32, F32, and F64 source pixels.
 - Nearest, bilinear, cubic, cubic-spline, Lanczos, and average resampling.
 - Rescaling, colormaps, RGB composition, color formulas, and arithmetic band math.
-- PNG output, plus feature-gated WebP and JPEG output.
+- PNG output and feature-gated lossless WebP output.
 - Multi-asset mosaics backed by MosaicJSON, STAC, or a custom source.
 
 ## What the library deliberately does not own {#boundaries}

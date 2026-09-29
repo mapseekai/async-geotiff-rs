@@ -1,6 +1,8 @@
 # Audit verification ledger
 
-Date: 2026-09-07. This ledger covers the current uncommitted audit fixes.
+Date: 2026-09-07. This is a historical ledger for the audit fixes at that date.
+Style and mosaic entries describe the pre-Raster Style API. For the current
+contract, see [the migration guide](../website/content/docs/guides/styling.md).
 “Regression passed” means a targeted correctness check passed; it does not imply
 exhaustive correctness, a completed feature matrix, or measured performance.
 Source-fix evidence below is supplied by the implementing agent unless a command

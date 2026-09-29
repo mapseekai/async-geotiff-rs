@@ -7,7 +7,7 @@
 
 use async_geotiff::bounds::Bbox;
 use async_geotiff::error::AgResult;
-use async_geotiff::mosaic::{AssetRef, MosaicSource, MosaicTiler, PixelSelection};
+use async_geotiff::mosaic::{AssetRef, MosaicSource, MosaicTiler};
 use async_geotiff::style::TileStyle;
 use async_geotiff::tms::{TileCoord, TileMatrixSet};
 
@@ -29,7 +29,13 @@ async fn main() -> AgResult<()> {
         bbox: Bbox::new(-10.0, -10.0, 10.0, 10.0),
     }]);
     let mosaic = MosaicTiler::new(source);
-    let style = TileStyle::from_query("")?;
+    let style = TileStyle::from_json(
+        r#"{
+        "version": "2.0",
+        "renderer": {"type": "rgb", "bidx": [1, 2, 3]},
+        "mosaic": {"pixel_selection": "first", "stage": "before_channels"}
+    }"#,
+    )?;
     match mosaic
         .tile(
             TileCoord {
@@ -38,7 +44,6 @@ async fn main() -> AgResult<()> {
                 x: 8,
                 y: 8,
             },
-            PixelSelection::First,
             &style,
         )
         .await

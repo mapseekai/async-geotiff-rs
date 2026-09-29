@@ -3,12 +3,12 @@
 [中文文档](README.zh-CN.md) | English | [Documentation site source](website/)
 
 Pure-Rust async crate that reads cloud-hosted Cloud-Optimized GeoTIFFs (COGs)
-and serves them as XYZ map tiles with titiler-style URL parameter styling.
+and serves them as XYZ map tiles with Raster Style 2.0 inputs.
 
 **No GDAL.** All raster IO goes through [`async-tiff`] + [`object_store`].
 Reprojection through [`proj`] (libproj system dep, feature-gated). Affine math
 through [`raffine`] (the author's own Rust port of Python's `affine`).
-Colormaps via [`colorous`] + [`enterpolation`]. Resampling via
+Colormaps via [`colorous`]. Resampling via
 [`fast_image_resize`]. PNG encoding via [`image`].
 
 ## Quick start
@@ -24,7 +24,7 @@ cargo run --release --example serve
 # http://127.0.0.1:8080/openlayers
 # http://127.0.0.1:8080/leaflet
 
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?colormap_name=viridis&rescale=0,3000'
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=pseudocolor&bidx=1&method=linear&rescale=0,3000&colormap_name=viridis'
 ```
 
 The example server binds to `127.0.0.1:8080` by default. To expose it on a
@@ -34,35 +34,24 @@ network interface, set `ASYNC_GEOTIFF_BIND`, for example:
 ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 ```
 
+## Raster Style 2.0 inputs
+
+Uses `raster-style = "=0.3.0"`. Rust entrypoints are `TileStyle::from_json`,
+`from_raster_query`, and `from_raster_style`; all three viewers default to Q2.
+New inputs declare `version=2.0&type=...`; omitted stretch uses fixed `[0,255]`.
+HTTP accepts complete Q2 documents only. Unsupported protocol capabilities fail explicitly.
+See the [migration guide and supported subset](website/content/docs/guides/styling.md).
+
 ## Band math expressions
 
-Use the `expression` query parameter to calculate one derived band per pixel.
-Band references are 1-indexed (`b1` is the first source band). The grammar is
-arithmetic-only:
-
-- band references such as `b1`, `b4`, and `b5` (uppercase `B` is also accepted);
-- finite decimal numbers such as `2.5` and `0.5`;
-- parentheses, binary `+`, `-`, `*`, `/`, and unary `-`.
-
-Multiplication and division bind more tightly than addition and subtraction;
-operators at the same level are evaluated left to right. Scientific notation
-such as `1e3` is not supported. For example, NDVI can be rendered from bands 5
-and 4 with:
+`renderer.expression` uses one-based `bN` band references, parentheses,
+arithmetic operators, and unary minus. Gray/pseudocolor accept one expression;
+RGB accepts three semicolon-separated expressions. Expressions and `bidx` are
+mutually exclusive. Referenced NoData and non-finite results become transparent.
 
 ```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?expression=(b5-b4)%2F(b5%2Bb4)&rescale=-1,1'
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=gray&expression=(b5-b4)%2F(b5%2Bb4)&method=linear&rescale=-1,1'
 ```
-
-The `+` and `/` characters are percent-encoded here because this is a URL
-query string. Equivalent expressions include `b1/2`, `-b1+3`, and
-`(b2-b1)/(b2+b1)`.
-
-`expression` produces a single derived band, so it is mutually exclusive with
-`bidx` and `color_formula`, and accepts at most one `rescale` range. A source
-nodata value referenced by the expression produces a transparent pixel.
-Division by zero and other non-finite results are also rendered as transparent
-pixels rather than being replaced with zero. Expressions are limited to 4096
-bytes, 256 tokens, and 128 levels of nesting.
 
 ## Library usage
 
@@ -91,51 +80,33 @@ assets still use the default HTTP access policy, which rejects loopback and
 link-local destinations so the demo cannot become a client-controlled public
 proxy.
 
-## URL contract (titiler-compatible subset)
+## Styles and migration
 
-Path: `/tiles/{tms}/{z}/{x}/{y}.{ext}` where `ext ∈ {png, webp, jpg, jpeg}`.
-`webp` and `jpg`/`jpeg` require building with the matching cargo feature.
+All styles use Raster Style 2.0 JSON/Q2:
 
-| Parameter | Repeat | Example | Notes |
-|---|---|---|---|
-| `bidx`          | yes | `?bidx=1&bidx=2&bidx=3` | 1-indexed band selection |
-| `rescale`       | yes | `?rescale=0,3000&rescale=0,3000` | per-band `min,max` stretch (Custom; highest priority) |
-| `stretch`       | no  | `?stretch=percent&pc=2,98` | auto stretch mode: `minmax`, `percent`, `stddev` |
-| `pc`            | no  | `?pc=2,98` | percentile cut for `stretch=percent` (default `2,98`) |
-| `sigma`         | no  | `?sigma=2.5` | σ multiplier for `stretch=stddev` (default `2.0`) |
-| `nodata`        | no  | `?nodata=nan` | overrides dataset nodata (accepts `nan`, `inf`, `-inf`, float) |
-| `colormap_name` | no  | `?colormap_name=viridis` | from `colorous`: viridis/magma/inferno/plasma/cividis/turbo/greys |
-| `color_formula` | no  | `?color_formula=gamma%20RGB%201.5` | rio-color subset (`gamma`, `sigmoidal`, `saturation`) |
-| `resampling`    | no  | `?resampling=average` | `nearest` (default), `bilinear`, `cubic`, `cubic_spline`, `lanczos`, `average` — `average` is a box mean over the covered source pixels (titiler/GDAL `average`): antialiasing on downsample, nearest on upsample |
-| `reproject`     | no  | `?reproject=bilinear` | warp-time kernel (same kernel names as `resampling`) |
-| `tilesize`      | no  | `?tilesize=512` | default 256; allowed values: 64, 128, 256, 512, 1024 |
+```rust
+let style = async_geotiff::style::TileStyle::from_json(r#"{
+  "version": "2.0",
+  "renderer": {"type": "rgb", "bidx": [1, 2, 3]},
+  "stretch": {"method": "linear", "rescale": [[0, 3000]]}
+}"#)?;
+let bytes = tiler.tile(coord, &style).await?;
+```
 
-Default tile size is **256** (not titiler's 512) for wider XYZ-client
-compatibility; pass `?tilesize=512` to override. Tile sizes are restricted to
-the power-of-two values above to prevent unbounded allocations and keep viewer
-tile grids predictable.
+For mosaics, add `mosaic` to the same document and call `mosaic.tile(coord, &style)`.
+Five selection methods, both merge stages, and rank channels are supported.
+MosaicJSON/STAC supplies assets separately.
 
-### Data stretching (non-uint8 rasters)
+This is a breaking migration: `from_query`, `from_pairs`, mutable style fields,
+the old `Stretch`, `ColourDefinition`, `Colour`, and `lut_from_stops` APIs,
+and the separate mosaic selection argument are removed. The default style is gray band 1 with fixed 0–255 mapping;
+provide a linear range for high-bit-depth data. Styles support PNG and lossless
+WebP (with the `webp` feature). Unknown fields, old parameters, and unimplemented
+capabilities return errors.
 
-UInt16/Int16/Float COGs need a value range or they render saturated white.
-Stretch priority: explicit **`rescale`** (Custom) → **`stretch`** mode →
-**default `stretch=stddev` with `sigma=2.0`** when nothing is passed. `u8`
-RGB keeps its 0–255 fast path and is never auto-stretched.
-
-| Mode | Example | Range per band |
-|---|---|---|
-| Custom    | `?rescale=470,660&rescale=470,700&rescale=350,730` | exactly as given |
-| MinMax    | `?stretch=minmax` | dataset `min … max` |
-| Percent   | `?stretch=percent&pc=2,98` | 2nd … 98th percentile (QGIS cumulative cut) |
-| StdDev    | `?stretch=stddev&sigma=2.5` | `mean ± 2.5·σ` (clamped to min/max) |
-| *(none)*  | `?` (no stretch params) | ≡ `stretch=stddev&sigma=2.0` |
-
-Statistics come from the COG's embedded `STATISTICS_*` GDAL tags when
-present (**exact**), otherwise from a one-shot read of the highest
-overview (**estimated**, computed once per dataset and memoized). For
-accurate ranges on tag-less COGs, write stats offline (e.g.
-`gdal_edit.py -stats file.tif`). Invalid params (`?stretch=bogus`,
-`?pc=2`, `?sigma=0`, or `pc`/`sigma` without `stretch=`) return HTTP 400.
+See the [styling guide](website/content/docs/guides/styling.md) for fields,
+migration, and capabilities, and [tile API](website/content/docs/reference/tile-api.md)
+for request paths and encoding.
 
 ## Supported TileMatrixSets
 
@@ -149,7 +120,7 @@ unified to F64 at the read/warp seam.
 
 ## Build requirements
 
-- Rust ≥ 1.88, matching `Cargo.toml`'s `rust-version`.
+- Rust ≥ 1.92, matching `Cargo.toml`'s `rust-version`.
 - For the default `proj` feature: `libproj` 9.x on the system
   (`brew install proj` on macOS; `apt install libproj-dev libsqlite3-dev
   libtiff-dev clang` on Debian/Ubuntu).
@@ -165,15 +136,15 @@ Example HTTP request (axum, `examples/serve.rs`)
   │       misses fetched coalesced + decoded in semaphore-limited spawn_blocking
   ├─ warp::warp (if src_crs ≠ dst_crs)  proj coarse-grid + bilinear
   │    └─ runs in semaphore-limited spawn_blocking (Proj is !Send + !Sync)
-  ├─ render pipeline:                   ndarray + palette
+  ├─ render pipeline:                   ndarray + raster-style
   │    ├─ rescale per band
-  │    ├─ color_formula (sRGB Lab/Lch)
-  │    └─ composite (LUT for gradient / HashMap for discrete / per-band rgb)
-  └─ encode PNG / WebP / JPEG           image (+ image-webp)
+  │    ├─ Gamma / opacity
+  │    └─ Raster Style gray / RGB / native colormaps
+  └─ encode PNG / lossless WebP           image (+ image-webp)
 ```
 
 Out-of-range tiles return `Ok(None)` (the example server replies HTTP 204);
-WebP/JPEG output is gated behind the `webp` / `jpeg` cargo features.
+Lossless WebP output requires the `webp` cargo feature.
 
 Module layout:
 
@@ -191,8 +162,8 @@ src/
     decode.rs         semaphore-limited single-block decode spawn_blocking helper
     window.rs         source tile-range and stitch helpers
   warp/               Projector + Resampling + coarse-grid warp
-  render/             colour, colormap, color_formula, composite, encode, pipeline
-  style/              titiler-style params parser (`TileStyle`) + compiler
+  render/             colormap, expression, encode, pipeline
+  style/              Raster Style JSON/Q2 validation and render plans
   tiler.rs            orchestrator
 examples/
   serve.rs            demo entrypoint and viewer wiring

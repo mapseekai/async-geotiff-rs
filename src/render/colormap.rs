@@ -1,7 +1,6 @@
-//! Colormap LUTs (colorous builtins + user-supplied stops).
+//! Built-in colormap LUTs used by the Raster Style adapter.
 
 use crate::error::{AgError, AgResult};
-use crate::render::colour::Colour;
 
 /// 256-entry RGBA lookup table.
 pub type Lut = [[u8; 4]; 256];
@@ -29,11 +28,14 @@ const TERRAIN_STOPS: &[(f64, [f64; 4])] = &[
 
 pub fn builtin_lut(name: &str) -> AgResult<Lut> {
     if name.eq_ignore_ascii_case("terrain") {
-        let stops: Vec<(f64, Colour)> = TERRAIN_STOPS
-            .iter()
-            .map(|(p, c)| (*p, Colour::Seq(*c)))
-            .collect();
-        return lut_from_stops(&stops);
+        return Ok(std::array::from_fn(|i| {
+            let t = i as f64 / 255.0;
+            let upper = TERRAIN_STOPS.iter().position(|(p, _)| *p >= t).unwrap();
+            let (lo, a) = TERRAIN_STOPS[upper.saturating_sub(1)];
+            let (hi, b) = TERRAIN_STOPS[upper];
+            let mix = ((t - lo) / (hi - lo).max(1e-12)).clamp(0.0, 1.0);
+            std::array::from_fn(|c| ((a[c] * (1.0 - mix) + b[c] * mix) * 255.0) as u8)
+        }));
     }
     let g = BUILTINS
         .iter()
@@ -44,36 +46,6 @@ pub fn builtin_lut(name: &str) -> AgResult<Lut> {
     for (i, slot) in lut.iter_mut().enumerate() {
         let c = g.eval_rational(i, 255);
         *slot = [c.r, c.g, c.b, 255];
-    }
-    Ok(lut)
-}
-
-/// Build a LUT by linearly interpolating between (position-in-[0,1], Colour) stops.
-pub fn lut_from_stops(stops: &[(f64, Colour)]) -> AgResult<Lut> {
-    if stops.len() < 2 {
-        return Err(AgError::UnknownColormap("need >=2 stops".into()));
-    }
-    let mut s = stops.to_vec();
-    // `total_cmp` is NaN-safe — a stray NaN stop position must not panic
-    // the render pipeline (it would take down the tile handler).
-    s.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut lut = [[0u8; 4]; 256];
-    for (i, slot) in lut.iter_mut().enumerate() {
-        let t = i as f64 / 255.0;
-        let upper_idx = s.iter().position(|(p, _)| *p >= t).unwrap_or(s.len() - 1);
-        let lower_idx = if upper_idx == 0 { 0 } else { upper_idx - 1 };
-        let a = &s[lower_idx];
-        let b = &s[upper_idx];
-        let span = (b.0 - a.0).max(1e-12);
-        let mix = ((t - a.0) / span).clamp(0.0, 1.0);
-        let ca = a.1.rgba();
-        let cb = b.1.rgba();
-        *slot = [
-            ((ca[0] * (1.0 - mix) + cb[0] * mix) * 255.0) as u8,
-            ((ca[1] * (1.0 - mix) + cb[1] * mix) * 255.0) as u8,
-            ((ca[2] * (1.0 - mix) + cb[2] * mix) * 255.0) as u8,
-            ((ca[3] * (1.0 - mix) + cb[3] * mix) * 255.0) as u8,
-        ];
     }
     Ok(lut)
 }
@@ -94,18 +66,6 @@ mod tests {
     #[test]
     fn unknown_colormap_errors() {
         assert!(builtin_lut("not-a-thing").is_err());
-    }
-
-    #[test]
-    fn stops_lut_linear_red_to_blue() {
-        let lut = lut_from_stops(&[
-            (0.0, Colour::Hex("#FF0000".into())),
-            (1.0, Colour::Hex("#0000FF".into())),
-        ])
-        .unwrap();
-        let mid = lut[127];
-        assert!(mid[0] > 100 && mid[0] < 160);
-        assert!(mid[2] > 100 && mid[2] < 160);
     }
 
     #[test]

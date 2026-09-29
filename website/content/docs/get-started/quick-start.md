@@ -51,10 +51,10 @@ The viewers then display a dataset switcher.
 
 ## Optional formats {#formats}
 
-PNG is always available. Enable WebP and JPEG explicitly:
+PNG is always available. Enable lossless WebP explicitly:
 
 ```bash
-cargo run --release --features webp,jpeg --example serve -- \
+cargo run --release --features webp --example serve -- \
   https://example.com/cog.tif
 ```
 

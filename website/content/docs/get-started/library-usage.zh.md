@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?,
     );
     let tiler = Tiler::new(reader);
-    let style = TileStyle::from_query("colormap_name=viridis&rescale=0,3000")?;
+    let style = TileStyle::from_raster_query("version=2.0&type=pseudocolor&bidx=1&colormap_name=viridis&method=linear&rescale=0,3000")?;
     let coord = TileCoord {
         tms: TileMatrixSet::WebMercatorQuad,
         z: 0,
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`TileStyle::from_query` 接受与示例 HTTP 服务相同的查询字符串，但不包含开头的 `?`。
+`TileStyle::from_raster_query` 接受与示例 HTTP 服务相同的查询字符串，但不包含开头的 `?`。
 将示例保存为 `src/main.rs`，然后执行 `cargo run`。固定 URL 是一个支持 Range 的
 小型测试 COG；确认集成成功后再替换为自己的数据。
 

@@ -51,7 +51,7 @@ async function check(viewer) {
   class Layer { setSource() {} setOpacity() {} }
   const context = {
     console, URLSearchParams, Number, Boolean,
-    window:{location:{search:"?dataset=single.tif&bidx=1&bidx=2&bidx=3", protocol:"http:", origin:"http://test"}, history:{replaceState() {}}},
+    window:{location:{search:"?dataset=single.tif&version=2.0&type=rgb&bidx=1&bidx=2&bidx=3", protocol:"http:", origin:"http://test"}, history:{replaceState() {}}},
     document:{getElementById:id => elements.get(id), createElement:() => new Element()},
     Option: function(label, value) { this.value = value; this.textContent = label; },
     fetch:url => new Promise(resolve => pending.push({url,resolve})),
@@ -77,7 +77,60 @@ async function check(viewer) {
   for (const url of requests) {
     const params = new URL(url).searchParams;
     assert.equal(params.get("dataset"),"single.tif");
-    assert.equal(params.has("bidx"),false,`${viewer}: legacy RGB preset survived single-band metadata`);
+    assert.deepEqual(params.getAll("bidx"),["1"],`${viewer}: expected explicit single-band selection`);
+    assert.equal(params.get("version"),"2.0");
+    assert.equal(params.get("type"),"gray");
+    assert.equal(params.get("method"),"none");
+    assert.equal(params.has("stretch"),false);
+  }
+  const fields = viewer === "maplibre" ? "controls" : "c";
+  vm.runInContext(`${fields}.expression.value = "b1+b1;b1;b1"; ${fields}.stretch.value = "linear"; ${fields}.rescale.value = "0,100;0,200;0,300"`, context);
+  let generated = vm.runInContext("tileUrl()", context);
+  let params = new URL(generated).searchParams;
+  assert.equal(params.get("type"), "rgb");
+  assert.deepEqual(params.getAll("rescale"), ["0,100", "0,200", "0,300"]);
+  assert.equal(params.get("expression"), "b1+b1;b1;b1");
+  assert.ok(generated.includes("%2B"), `${viewer}: literal plus must be encoded`);
+  assert.equal(params.has("bidx"), false);
+  assert.equal(elements.has("style-protocol"), false);
+  assert.equal(params.has("stretch"), false);
+  assert.equal(params.has("pc"), false);
+  for (const [method, key, value] of [["none",null,null],["linear","rescale","0,100"],["minmax",null,null],["percentile","percentiles","2,98"],["stddev","stddev","2"],["histogram_equalization",null,null],["curve","curves","[[[0,0],[128,0.5],[255,1]]]"]]) {
+    vm.runInContext(`${fields}.stretch.value = ${JSON.stringify(method)}; syncStretchUi()`, context);
+    const query = new URL(vm.runInContext("tileUrl()", context)).searchParams;
+    assert.equal(query.get("method"),method);
+    if (key) assert.equal(query.get(key),value);
+    for (const other of ["rescale","percentiles","stddev","curves"]) {
+      if (other !== key) assert.equal(query.has(other),false,`${viewer}: stale ${other} with ${method}`);
+    }
+  }
+  vm.runInContext(`${fields}.stretch.value = "linear"`, context);
+  vm.runInContext(`${fields}.opacity.value = "0.4"`, context);
+  assert.equal(new URL(vm.runInContext("tileUrl()", context)).searchParams.get("opacity"), "0.4");
+  if (viewer === "maplibre") {
+    vm.runInContext('controls.mode.value = "mosaic"; controls.stage.value = "after_channels"; controls.pixelSelection.value = "highest"; controls.rankChannel.value = "2"; syncSourceUi()', context);
+    generated = vm.runInContext("tileUrl()", context);
+    params = new URL(generated).searchParams;
+    assert.ok(new URL(generated).pathname.startsWith("/mosaic/tiles/"));
+    assert.equal(params.get("stage"), "after_channels");
+    assert.equal(params.get("rank_channel"), "2");
+    assert.equal(params.get("pixel_selection"), "highest");
+    assert.equal(params.get("version"), "2.0");
+    assert.equal(params.has("dataset"), false);
+    vm.runInContext('controls.pixelSelection.value = "first"; syncSourceUi()', context);
+    assert.equal(new URL(vm.runInContext("tileUrl()", context)).searchParams.has("rank_channel"), false);
+    assert.equal(elements.get("rank_channel").disabled, true);
+    // A source refresh makes isStyleLoaded() false without another map load.
+    // Applying again must immediately use the latest controls.
+    maps[0].loaded = false;
+    const before = requests.length;
+    vm.runInContext('controls.expression.value = "b1+10"; controls.rescale.value = "0,10000"; controls.pixelSelection.value = "highest"; controls.rankChannel.value = "1"; document.getElementById("style-form").requestSubmit()', context);
+    assert.ok(requests.length > before, "MapLibre dropped Apply while tiles were loading");
+    const latest = new URL(requests.at(-1)).searchParams;
+    assert.equal(latest.get("expression"), "b1+10");
+    assert.equal(latest.get("rescale"), "0,10000");
+    assert.equal(latest.get("pixel_selection"), "highest");
+    assert.equal(latest.get("stage"), "after_channels");
   }
   console.log(`${viewer}: delayed dataset/metadata bootstrap passed`);
 }

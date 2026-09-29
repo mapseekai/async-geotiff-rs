@@ -24,8 +24,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust 1.88.0
-        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install Rust 1.92.0
+        run: rustup toolchain install 1.92.0 --profile minimal
 
       - name: Validate release tag
         id: package
@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           version="$(
-            cargo +1.88.0 metadata --no-deps --format-version=1 |
+            cargo +1.92.0 metadata --no-deps --format-version=1 |
               python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; assert len(packages) == 1; print(packages[0]["version"])'
           )"
           expected_tag="v${version}"
@@ -46,12 +46,12 @@ jobs:
           printf 'artifact=%s\n' "${artifact}" >> "${GITHUB_OUTPUT}"
 
       - name: Test all features
-        run: cargo +1.88.0 test --all-features --locked
+        run: cargo +1.92.0 test --all-features --locked
 
       - name: Package source crate
         run: |
           set -euo pipefail
-          cargo +1.88.0 package --locked
+          cargo +1.92.0 package --locked
           test -f "${{ steps.package.outputs.artifact }}"
 
       - name: Create or update GitHub Release

@@ -18,7 +18,7 @@ mod workload {
         bounds::Bbox,
         error::AgResult,
         io::{BlockCache, CacheConfig, CogReader},
-        mosaic::{AssetRef, HttpAccessPolicy, MosaicSource, MosaicTiler, PixelSelection},
+        mosaic::{AssetRef, HttpAccessPolicy, MosaicSource, MosaicTiler},
         request::{RequestCancellation, RequestLimiter, RequestOptions},
         resource::WorkBudget,
         style::TileStyle,
@@ -193,11 +193,7 @@ mod workload {
         ) -> AgResult<usize> {
             let output = match self {
                 Self::Single(renderer) => renderer.tile_with_options(coord, style, options).await?,
-                Self::Mosaic(renderer) => {
-                    renderer
-                        .tile_with_options(coord, PixelSelection::Mean, style, options)
-                        .await?
-                }
+                Self::Mosaic(renderer) => renderer.tile_with_options(coord, style, options).await?,
             };
             Ok(output.expect("fixture center must produce a tile").len())
         }
@@ -245,9 +241,7 @@ mod workload {
                 Renderer::create(base, mosaic, cache.clone()).await.unwrap(),
             ))
         };
-        let style = TileStyle::from_query(
-            "tilesize=64&rescale=0,255&resampling=bilinear&reproject=bilinear",
-        )
+        let style = TileStyle::from_raster_query("version=2.0&type=gray&tilesize=64&rescale=0,255&resampling=bilinear&reproject=bilinear&bidx=1&method=linear&pixel_selection=mean&stage=after_channels")
         .unwrap();
         if let Some(renderer) = &warm {
             renderer.tile(coord(), &style).await.unwrap();
@@ -315,7 +309,7 @@ mod workload {
         let mut jobs = JoinSet::new();
         for _ in 0..concurrency {
             let renderer = renderer.clone();
-            jobs.spawn(async move { renderer.tile(coord(), &TileStyle::default()).await });
+            jobs.spawn(async move { renderer.tile(coord(), &TileStyle::from_raster_query("version=2.0&type=gray&bidx=1&pixel_selection=mean&stage=after_channels").unwrap()).await });
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         jobs.abort_all();
@@ -375,7 +369,7 @@ mod workload {
             jobs.spawn(async move {
                 let started = Instant::now();
                 let result = renderer
-                    .tile_with_options(coord(), &TileStyle::default(), &options)
+                    .tile_with_options(coord(), &TileStyle::from_raster_query("version=2.0&type=gray&bidx=1&pixel_selection=mean&stage=after_channels").unwrap(), &options)
                     .await;
                 let outcome = match result {
                     Err(async_geotiff::error::AgError::Overloaded) => "overloaded",
@@ -427,7 +421,7 @@ mod workload {
         for _ in 0..8 {
             let renderer = renderer.clone();
             jobs.spawn(async move {
-                let style = TileStyle::from_query("tilesize=1024&rescale=0,255").unwrap();
+                let style = TileStyle::from_raster_query("version=2.0&type=gray&tilesize=1024&rescale=0,255&bidx=1&method=linear&pixel_selection=mean&stage=after_channels").unwrap();
                 assert!(matches!(
                     renderer.tile(coord(), &style).await,
                     Err(async_geotiff::error::AgError::ResourceLimit(_))

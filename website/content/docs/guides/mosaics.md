@@ -34,23 +34,52 @@ ASYNC_GEOTIFF_MOSAIC=/path/to/mosaic.json \
 
 Tiles are then available under `/mosaic/tiles/...`.
 
+## Raster Style 2.0
+
+```rust
+let style = TileStyle::from_json(r#"{
+  "version": "2.0",
+  "renderer": {"type": "rgb", "bidx": [3, 2, 1]},
+  "stretch": {"method": "linear", "rescale": [[0, 3000]]},
+  "mosaic": {"pixel_selection": "highest", "stage": "before_channels", "rank_channel": 1}
+}"#)?;
+let tile = mosaic.tile(coord, &style).await?;
+```
+
+`before_channels` merges dependencies before evaluating expressions;
+`after_channels` evaluates each source first, then merges outputs. The example's
+dependency table is `[1,2,3]`, so rank_channel=1 compares source band 1;
+after_channels would compare the first output, source band 3. Ties preserve the
+first source's complete tuple. Mean/median use the same complete valid tuples
+for every channel and avoid intermediate overflow for extreme finite values.
+
+Q2 example:
+
+```text
+/mosaic/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=rgb&bidx=3&bidx=2&bidx=1&method=linear&rescale=0,3000&pixel_selection=mean&stage=after_channels
+```
+
+In MapLibre, select mosaic under Source to configure stage and ranking.
+Asset locations remain server-bound; JSON/Q2 does not contain the asset list.
+Protocol mosaics require explicit configuration. Source Alpha bands remain
+unsupported and return a capability error. See the [styling guide](../styling/).
+
 ## Pixel selection {#selection}
 
 | Strategy | Behavior |
 | --- | --- |
 | `First` | First valid pixel wins; stops early after the tile is fully covered. |
-| `Highest` | Maximum value in the first output band per pixel across every asset. |
-| `Lowest` | Minimum value in the first output band per pixel across every asset. |
+| `Highest` | Select the complete tuple with maximum rank_channel. |
+| `Lowest` | Select the complete tuple with minimum rank_channel. |
 | `Mean` | Streaming mean of valid samples; constant memory in asset count. |
 | `Median` | Median of valid samples; retains every contributing image until completion. |
 
-“First output band” is internal index 0; user-facing `bidx` values remain
-1-indexed.
+Both `bidx` and `rank_channel` are one-based; the latter is a position at the merge stage.
 
 `MosaicConfig` defaults to 8 assets processed concurrently per chunk, an
 opened-reader capacity of 256 in each `MosaicTiler` reader pool, and a hard cap
-of 64 assets per requested tile. When the cap is exceeded, the tiler logs a
-warning and keeps the first assets in source-provided order. Configure all
+of 64 assets per requested tile. Exceeding the cap returns an error,
+never a truncated partial result. Configure all
 three limits through the builder:
 
 ```rust
@@ -65,6 +94,7 @@ let config = MosaicConfig {
     chunk_size: 4,
     reader_capacity: 64,
     max_assets_per_tile: 32,
+    ..Default::default()
 };
 let mosaic = MosaicTiler::builder(source)
     .config(config)
@@ -74,8 +104,8 @@ let mosaic = MosaicTiler::builder(source)
 ```
 
 Keep the asset cap enabled for untrusted or low-zoom indexes to prevent fetch
-amplification. Choose a deterministic source order when truncation would affect
-visual correctness.
+amplification. Choose deterministic source order for first and extremum ties.
+Median additionally limits retained inputs to 256 MiB and observes the shared work budget.
 
 ## STAC demo {#stac}
 

@@ -86,12 +86,18 @@ MosaicJSON assets retain their listed paint order during deduplication. Prefix
 lookups traverse matching quadkeys in lexical order and retain the first
 occurrence of each asset, preserving each key's list order.
 
-For multi-asset mosaics, explicit `bidx` selection happens before warp, unscale
-and reduction. Unselected bands' nodata cannot invalidate the requested samples;
-scale/offset metadata follows the selected source indices. Highest/Lowest compare
-the first selected band and keep that asset's other selected bands. Final style
-evaluation indexes the resulting compact image. Public `Tiler::warp_tile` keeps
-its existing full-band output contract.
+Mosaic selection comes from the Raster Style document, including
+`pixel_selection`, `stage`, and the one-based `rank_channel` for Highest/Lowest.
+Before channels, the input tuple contains deduplicated source dependencies sorted
+by band number; after channels, it contains evaluated output channels. Every
+component must be valid for the asset's tuple to participate. Highest/Lowest
+keep a complete tuple from the winning asset, with source order breaking ties.
+
+Dependencies are warped independently so unrelated bands' nodata cannot affect
+interpolation. Gamma, color mapping and opacity run once after reduction.
+Calibration other than `none` currently returns an error; the old `unscale`
+parameter is removed. Public `Tiler::warp_tile` returns compact dependencies or,
+for `after_channels`, evaluated channels. It no longer returns every source band.
 
 ## Pinned object snapshots
 

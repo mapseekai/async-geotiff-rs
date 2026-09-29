@@ -11,7 +11,7 @@
 //!   cargo run --example mosaic_json --features mosaic -- path/to/mosaic.json
 
 use async_geotiff::error::AgResult;
-use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
+use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler};
 use async_geotiff::style::TileStyle;
 use async_geotiff::tms::{TileCoord, TileMatrixSet};
 
@@ -75,7 +75,13 @@ async fn main() -> AgResult<()> {
     );
 
     let mosaic = MosaicTiler::new(source);
-    let style = TileStyle::from_query("")?;
+    let style = TileStyle::from_json(
+        r#"{
+        "version": "2.0",
+        "renderer": {"type": "rgb", "bidx": [1, 2, 3]},
+        "mosaic": {"pixel_selection": "first", "stage": "before_channels"}
+    }"#,
+    )?;
 
     // Request a tile that the sample's quadkey index covers ("021").
     let (z, x, y) = quadkey_to_tile("021");
@@ -89,7 +95,6 @@ async fn main() -> AgResult<()> {
                 x,
                 y,
             },
-            PixelSelection::First,
             &style,
         )
         .await

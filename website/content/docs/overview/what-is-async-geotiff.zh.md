@@ -16,7 +16,7 @@ XYZ 地图瓦片。它只读取生成目标瓦片所需的字节范围，解码�
 - 支持 U8、U16、I16、U32、I32、F32 和 F64 源像元。
 - 支持 nearest、bilinear、cubic、cubic-spline、Lanczos 和 average 重采样。
 - 支持拉伸、色带、RGB 合成、颜色公式和算术波段计算。
-- 默认输出 PNG，并可通过 feature 启用 WebP 和 JPEG。
+- 默认输出 PNG，并可通过 feature 启用无损 WebP。
 - 使用 MosaicJSON、STAC 或自定义数据源组合多资产镶嵌。
 
 ## 有意保留的边界 {#boundaries}

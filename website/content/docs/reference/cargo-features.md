@@ -9,7 +9,7 @@ weight: 20
 | `proj` | yes | Enables general CRS transformation through system `libproj`. |
 | `mosaic` | yes | Enables `MosaicTiler`, `MosaicSource`, MosaicJSON, and async asset fan-out. |
 | `webp` | no | Enables lossless WebP encoding through `image`. |
-| `jpeg` | no | Enables JPEG encoding; alpha is flattened because JPEG has no alpha channel. |
+| `jpeg` | no | Enables the low-level JPEG encoder; Raster Style requests currently reject JPEG. |
 | `stac` | no | Adds the STAC client and implies `mosaic`. |
 | `perf-tracing` | no | Emits detailed internal timing events. |
 | `tokio-console` | no | Enables Tokio Console integration and implies `perf-tracing`. |
@@ -24,7 +24,7 @@ cargo build --release
 cargo build --release --no-default-features
 
 # Example server with all image formats
-cargo run --release --example serve --features webp,jpeg
+cargo run --release --example serve --features webp
 
 # STAC-backed mosaic demo
 cargo run --release --example serve --features stac

@@ -30,21 +30,48 @@ ASYNC_GEOTIFF_MOSAIC=/path/to/mosaic.json \
 
 镶嵌瓦片随后可通过 `/mosaic/tiles/...` 获取。
 
+## Raster Style 2.0
+
+```rust
+let style = TileStyle::from_json(r#"{
+  "version": "2.0",
+  "renderer": {"type": "rgb", "bidx": [3, 2, 1]},
+  "stretch": {"method": "linear", "rescale": [[0, 3000]]},
+  "mosaic": {"pixel_selection": "highest", "stage": "before_channels", "rank_channel": 1}
+}"#)?;
+let tile = mosaic.tile(coord, &style).await?;
+```
+
+`before_channels` 先合并输入依赖，再执行表达式；`after_channels` 先逐源计算表达式，
+再合并输出。上例的依赖表是 `[1,2,3]`，因此 rank_channel=1 比较源波段 1；
+改为 after_channels 后比较第一个输出，即源波段 3。并列保留源顺序靠前的完整元组。
+mean/median 只对同一组完整有效元组逐通道求值，避免极值相加溢出。
+
+Q2 请求示例：
+
+```text
+/mosaic/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=rgb&bidx=3&bidx=2&bidx=1&method=linear&rescale=0,3000&pixel_selection=mean&stage=after_channels
+```
+
+MapLibre 的 Source 选择 mosaic 后可以配置阶段和排序通道。资产地址仍由服务端固定，
+JSON/Q2 不携带资产列表。新格式要求显式 mosaic 配置；源 Alpha 波段暂不支持，返回能力错误。
+完整支持范围见[样式指南](../styling/)。
+
 ## 像元选择 {#selection}
 
 | 策略 | 行为 |
 | --- | --- |
 | `First` | 第一个有效像元获胜；瓦片被完全覆盖后可提前停止。 |
-| `Highest` | 对全部资产的第一个输出波段逐像元取最大值。 |
-| `Lowest` | 对全部资产的第一个输出波段逐像元取最小值。 |
+| `Highest` | 按 rank_channel 选择最大值所在的完整元组。 |
+| `Lowest` | 按 rank_channel 选择最小值所在的完整元组。 |
 | `Mean` | 对有效样本流式求均值，内存不随资产数量增长。 |
 | `Median` | 对有效样本求中位数，完成前需要保留所有参与图像。 |
 
-“第一个输出波段”在内部索引中是 0；面向用户的 `bidx` 仍然从 1 开始。
+`bidx` 和 `rank_channel` 都从 1 开始；后者是合并阶段的通道位置。
 
 `MosaicConfig` 默认每批并发处理 8 个资产，每个 `MosaicTiler` 的 reader 池最多保留
-256 个已打开 reader，并把每张请求瓦片的资产数硬限制为 64。超过上限时，tiler 会
-记录 warning，并按数据源提供的顺序保留前 N 个资产。三个限制都通过 builder 配置：
+256 个已打开 reader，并把每张请求瓦片的资产数硬限制为 64。超过上限时返回错误，
+不会截断资产后返回部分结果。三个限制都通过 builder 配置：
 
 ```rust
 use std::sync::Arc;
@@ -58,6 +85,7 @@ let config = MosaicConfig {
     chunk_size: 4,
     reader_capacity: 64,
     max_assets_per_tile: 32,
+    ..Default::default()
 };
 let mosaic = MosaicTiler::builder(source)
     .config(config)
@@ -66,8 +94,8 @@ let mosaic = MosaicTiler::builder(source)
     .build();
 ```
 
-对于不可信或低缩放级别的索引，应保留资产上限以避免请求放大。如果截断会影响视觉
-正确性，数据源必须提供确定性的资产顺序。
+对于不可信或低缩放级别的索引，应保留资产上限以避免请求放大。数据源应提供确定性的资产顺序，
+因为 first 和极值并列时依赖该顺序。Median 保留输入上限为 256 MiB，另受共享工作内存预算约束。
 
 ## STAC 示例 {#stac}
 

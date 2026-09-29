@@ -628,6 +628,10 @@ impl CogReader {
         &self.src_crs
     }
 
+    pub(crate) fn statistics_identity(&self) -> &str {
+        &self.source_id
+    }
+
     pub fn transform(&self) -> GeoTransform {
         self.transform
     }

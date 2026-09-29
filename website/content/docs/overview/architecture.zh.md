@@ -19,7 +19,7 @@ flowchart LR
     CPU --> Warp[重投影与重采样]
     Warp --> Render[拉伸 / 色带 / 合成]
     Style --> Render
-    Render --> Encode[PNG / WebP / JPEG]
+    Render --> Encode[PNG / lossless WebP]
     Encode --> Result[Option&lt;Bytes&gt;]
     Mosaic[MosaicTiler] --> ReaderPool[ReaderPool]
     ReaderPool --> Reader
@@ -33,7 +33,7 @@ flowchart LR
 | `CogReader` | 打开 COG，读取元数据和概览层，选择并拼接原生块，以及采样点或窗口。 |
 | `BlockCache` | 在统一字节预算下跨 reader 共享解码块，并合并并发冷读取。 |
 | `Tiler` | 规划瓦片、选择概览层、读取源窗口、按需重投影并输出编码字节。 |
-| `TileStyle` | 在渲染前解析并校验 titiler 风格的查询参数。 |
+| `TileStyle` | 校验 Raster Style JSON/Q2，并绑定已支持的渲染能力。 |
 | `MosaicTiler` | 查找资产、通过池打开 reader、重投影各资产、合并重叠像元并统一渲染。 |
 | `CpuLimiter` | 限制跨 reader 与 tiler 的 CPU 密集型阻塞任务。 |
 
@@ -45,8 +45,9 @@ flowchart LR
 4. `CogReader` 通过范围请求加载缺失的原生块，并复用缓存命中。
 5. 同 CRS 使用仿射快速路径；跨 CRS 使用反向重投影。EPSG:4326 与 EPSG:3857
    之间有闭式快速路径，其他组合需要 `proj` feature。
-6. 渲染管线依次处理 nodata、scale/offset、波段计算、拉伸、色带或 RGB 合成，
-   最后调用目标编码器。
+6. 源 nodata 在插值前排除。Raster Style 管线计算输出通道，再应用固定范围拉伸、
+   Gamma、颜色映射与 opacity，最后编码为 PNG 或无损 WebP。元数据 scale/offset
+   校准暂不支持，请求时返回错误。
 
 ## 并发模型 {#concurrency}
 

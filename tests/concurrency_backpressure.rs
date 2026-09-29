@@ -122,9 +122,11 @@ async fn multi_asset_mosaic_retries_whole_request_not_nested_stages() {
     let style = TileStyle::default();
     let mut expected = None;
     for _ in 0..2 {
-        let results = futures_util::future::join_all(
-            (0..8).map(|_| mosaic.tile(coord(), PixelSelection::Mean, &style)),
-        )
+        let results = futures_util::future::join_all((0..8).map(|_| async {
+            mosaic
+                .tile(coord(), &mosaic_style(PixelSelection::Mean, &style))
+                .await
+        }))
         .await;
         for result in results {
             let bytes = result.unwrap().expect("mosaic must exist");
@@ -138,4 +140,12 @@ async fn multi_asset_mosaic_retries_whole_request_not_nested_stages() {
     assert!(budget.peak_bytes() <= budget.limit_bytes());
     drop(mosaic);
     assert_eq!(budget.used_bytes(), 0);
+}
+
+#[cfg(feature = "mosaic")]
+
+fn mosaic_style(selection: async_geotiff::mosaic::PixelSelection, style: &TileStyle) -> TileStyle {
+    let mut document: serde_json::Value = serde_json::from_str(style.raster_style_json()).unwrap();
+    document["mosaic"] = serde_json::json!({"pixel_selection": format!("{selection:?}").to_lowercase(), "stage": "after_channels"});
+    TileStyle::from_json(&document.to_string()).unwrap()
 }

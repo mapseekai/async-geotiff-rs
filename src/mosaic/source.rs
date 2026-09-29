@@ -33,6 +33,15 @@ pub struct AssetRef {
 pub trait MosaicSource: Send + Sync {
     /// COGs covering `coord`, in paint order (first = top).
     async fn assets_for_tile(&self, coord: TileCoord) -> AgResult<Vec<AssetRef>>;
+
+    /// Complete immutable source collection in paint order for shared statistics.
+    /// Dynamic sources must bind a finite collection before enabling statistical stretch.
+    async fn statistics_assets(&self) -> AgResult<Vec<AssetRef>> {
+        Err(crate::error::AgError::query(
+            "statistics",
+            "this mosaic source does not bind a complete fixed asset collection",
+        ))
+    }
 }
 
 #[cfg(test)]

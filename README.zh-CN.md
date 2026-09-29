@@ -2,9 +2,9 @@
 
 [English](README.md) | 中文 | [文档站源码](website/)
 
-一个纯 Rust 异步库，用于读取云端托管的 Cloud-Optimized GeoTIFF（COG），并以 XYZ 地图瓦片形式提供数据，支持类似 titiler 的 URL 样式参数。
+一个纯 Rust 异步库，用于读取云端托管的 Cloud-Optimized GeoTIFF（COG），并以 XYZ 地图瓦片形式提供数据，支持 Raster Style 2.0 输入。
 
-**不依赖 GDAL。** 栅格 IO 使用 [`async-tiff`] 与 [`object_store`]；重投影使用可通过 feature 控制、依赖系统 `libproj` 的 [`proj`]；仿射计算使用 [`raffine`]；色带使用 [`colorous`] 与 [`enterpolation`]；重采样使用 [`fast_image_resize`]；PNG 编码使用 [`image`]。
+**不依赖 GDAL。** 栅格 IO 使用 [`async-tiff`] 与 [`object_store`]；重投影使用可通过 feature 控制、依赖系统 `libproj` 的 [`proj`]；仿射计算使用 [`raffine`]；色带使用 [`colorous`]；重采样使用 [`fast_image_resize`]；PNG 编码使用 [`image`]。
 
 ## 快速开始
 
@@ -35,59 +35,26 @@ ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 请求瓦片：
 
 ```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?colormap_name=viridis&rescale=0,3000'
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=pseudocolor&bidx=1&method=linear&rescale=0,3000&colormap_name=viridis'
 ```
+
+## Raster Style 2.0 输入
+
+采用 `raster-style = "=0.3.0"`，Rust API 支持 `TileStyle::from_json`、
+`from_raster_query` 和 `from_raster_style`。三个查看器默认生成 Q2。
+新格式必须声明 `version=2.0&type=...`，省略拉伸使用固定 `[0,255]`。
+HTTP 只接受完整 Q2；不支持的规范能力明确报错。
+详见[迁移指南与能力范围](website/content/docs/guides/styling.zh.md)。
 
 ## 波段计算
 
-使用 `expression` 计算派生单波段。`bN` 表示从 1 开始计数的源波段；表达式支持数值、括号、一元负号以及 `+`、`-`、`*`、`/`：
+`renderer.expression` 使用从 1 开始的 `bN` 波段引用，支持括号、加减乘除和一元负号。
+gray/pseudocolor 使用一个表达式，RGB 使用三个以分号分隔的表达式。
+表达式与 `bidx` 互斥；引用波段的 NoData 和非有限计算结果输出透明像元。
 
 ```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?expression=(b5-b4)/(b5%2Bb4)&rescale=-1,1'
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=gray&expression=(b5-b4)%2F(b5%2Bb4)&method=linear&rescale=-1,1'
 ```
-
-`expression` 不能与 `bidx` 或 `color_formula` 同时使用。引用波段中的 nodata、除零和其他非有限计算结果会输出透明像元，不会被替换为 0。
-
-表达式的完整语法如下：
-
-- 波段引用：`b1`、`b4`、`b5` 等，从 1 开始计数；大写的 `B` 也支持。
-- 有限十进制数字：例如 `2.5`、`0.5`。
-- 括号、二元运算 `+`、`-`、`*`、`/`，以及一元负号 `-`。
-
-乘法和除法的优先级高于加法和减法；同一优先级的运算从左到右计算。不支持科学计数法，例如 `1e3` 无法使用。
-
-常见的 NDVI 表达式是 `(b5-b4)/(b5+b4)`。在 URL 查询参数中，`+` 和 `/` 最好进行百分号编码：
-
-```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?expression=(b5-b4)%2F(b5%2Bb4)&rescale=-1,1'
-```
-
-其他有效示例：
-
-```text
-b1/2
--b1+3
-(b2-b1)/(b2+b1)
-```
-
-`expression` 始终生成一个派生波段，因此不能与 `bidx` 或 `color_formula` 同时使用，且最多只能传入一组 `rescale` 范围。表达式引用的源波段如果是 nodata，输出透明像元；除零和其他非有限结果也会输出透明像元，不会替换成 0。表达式长度最多 4096 字节、256 个 token，嵌套深度最多 128 层。
-
-默认支持 `png`；启用 feature 后也支持 `webp`、`jpg` 和 `jpeg`：
-
-```bash
-cargo run --release --features webp,jpeg --example serve -- https://example.com/cog.tif
-```
-
-常用参数：
-
-- `bidx=1&bidx=2&bidx=3`：选择波段。
-- `rescale=0,3000`：按指定最小值和最大值拉伸，可重复传入。
-- `stretch=percent&pc=2,98`：百分位拉伸。
-- `stretch=stddev&sigma=2.5`：按均值和标准差拉伸。
-- `colormap_name=viridis`：为单波段数据应用色带。
-- `resampling=average`：读取或缩放时的重采样方式，默认 `nearest`。
-- `reproject=bilinear`：重投影时的重采样方式。
-- `tilesize=512`：输出瓦片大小，默认 `256`。
 
 ## 作为库使用
 
@@ -108,39 +75,30 @@ cargo run --example serve --features stac
 
 三个变量必须同时提供，且与 `ASYNC_GEOTIFF_MOSAIC` 互斥。它们只在进程启动时读取，HTTP 请求参数不能选择 STAC 地址、集合或资产字段。STAC 资产仍使用默认 HTTP 访问策略，并拒绝环回和 link-local 地址，避免 Demo 成为客户端可驱动的公网代理。
 
-## URL 接口
+## 样式与迁移
 
-瓦片路径格式为 `/tiles/{tms}/{z}/{x}/{y}.{ext}`，其中 `ext` 为 `png`、`webp`、`jpg` 或 `jpeg`；后面三种格式需要启用对应的 Cargo feature。
+样式统一使用 Raster Style 2.0 JSON/Q2：
 
-| 参数 | 可重复 | 示例 | 说明 |
-|---|---:|---|---|
-| `bidx` | 是 | `?bidx=1&bidx=2&bidx=3` | 从 1 开始的波段选择 |
-| `rescale` | 是 | `?rescale=0,3000` | 每个波段的 `min,max` 拉伸，优先级最高 |
-| `stretch` | 否 | `?stretch=percent&pc=2,98` | `minmax`、`percent` 或 `stddev` |
-| `pc` | 否 | `?pc=2,98` | 百分位裁剪，默认 `2,98` |
-| `sigma` | 否 | `?sigma=2.5` | 标准差倍数，默认 `2.0` |
-| `nodata` | 否 | `?nodata=nan` | 覆盖数据集 nodata 值，支持 `nan`、`inf`、`-inf` 和浮点数 |
-| `colormap_name` | 否 | `?colormap_name=viridis` | 来自 `colorous`：`viridis`、`magma`、`inferno`、`plasma`、`cividis`、`turbo`、`greys` |
-| `color_formula` | 否 | `?color_formula=gamma%20RGB%201.5` | rio-color 子集 |
-| `resampling` | 否 | `?resampling=average` | `nearest`（默认）、`bilinear`、`cubic`、`cubic_spline`、`lanczos`、`average`；`average` 对覆盖的源像元求盒式平均，下采样时抗锯齿，上采样时使用 nearest |
-| `reproject` | 否 | `?reproject=bilinear` | 重投影时的重采样方式 |
-| `tilesize` | 否 | `?tilesize=512` | 默认 256，可用 64、128、256、512、1024 |
+```rust
+let style = async_geotiff::style::TileStyle::from_json(r#"{
+  "version": "2.0",
+  "renderer": {"type": "rgb", "bidx": [1, 2, 3]},
+  "stretch": {"method": "linear", "rescale": [[0, 3000]]}
+}"#)?;
+let bytes = tiler.tile(coord, &style).await?;
+```
 
-默认瓦片大小是 **256**，而不是 titiler 的 512，以兼容更多 XYZ 客户端。
+Mosaic 在同一个文档中增加 `mosaic` 配置，调用 `mosaic.tile(coord, &style)`。
+支持五种选择方法、两个合并阶段和排序通道。资产列表由 MosaicJSON/STAC 提供。
 
-### 数据拉伸
+这是破坏性迁移：移除 `from_query`、`from_pairs`、公开可变样式字段、旧 `Stretch`/
+`ColourDefinition` / `Colour` / `lut_from_stops` API，以及 mosaic 的独立 selection 参数。默认样式为灰度波段 1，
+`method=none` 固定映射 0–255；高位深数据应显式配置线性范围。
+PNG 和无损 WebP 可用于样式输出，后者需要 `webp` feature。
+未知字段、旧参数和暂未实现的能力均报错。
 
-UInt16、Int16 和 Float COG 需要值域，否则可能渲染为饱和白色。优先级为：显式 **`rescale`**（Custom）→ **`stretch`** 模式 → 未指定参数时的 **`stretch=stddev&sigma=2.0`**。U8 RGB 保留 0–255 快速路径，不会自动拉伸。
-
-| 模式 | 示例 | 每波段范围 |
-|---|---|---|
-| Custom | `?rescale=470,660&rescale=470,700&rescale=350,730` | 完全按指定范围 |
-| MinMax | `?stretch=minmax` | 数据集 `min … max` |
-| Percent | `?stretch=percent&pc=2,98` | 第 2 至第 98 百分位（QGIS cumulative cut） |
-| StdDev | `?stretch=stddev&sigma=2.5` | `mean ± 2.5·σ`，限制在最小值和最大值内 |
-| *无参数* | `?`（没有拉伸参数） | 等同于 `stretch=stddev&sigma=2.0` |
-
-统计信息优先读取 COG 内嵌的 `STATISTICS_*` GDAL 标签（**精确**），否则从最高级概览读取一次并缓存（**估算**）。对于没有统计标签的 COG，可离线写入统计信息，例如 `gdal_edit.py -stats file.tif`。无效参数（`?stretch=bogus`、`?pc=2`、`?sigma=0`，或不带 `stretch=` 的 `pc`/`sigma`）返回 HTTP 400。
+完整字段、迁移映射和能力边界见[样式指南](website/content/docs/guides/styling.zh.md)；
+请求路径和编码见[瓦片 API](website/content/docs/reference/tile-api.zh.md)。
 
 ## 支持的 TileMatrixSet
 
@@ -153,7 +111,7 @@ UInt16、Int16 和 Float COG 需要值域，否则可能渲染为饱和白色。
 
 ## 构建要求
 
-- Rust ≥ 1.88，与 `Cargo.toml` 中的 `rust-version` 一致。
+- Rust ≥ 1.92，与 `Cargo.toml` 中的 `rust-version` 一致。
 - 默认 `proj` feature 需要系统安装 `libproj` 9.x。
 - macOS：`brew install proj`。
 - Debian/Ubuntu：`apt install libproj-dev libsqlite3-dev libtiff-dev clang`。
@@ -161,7 +119,7 @@ UInt16、Int16 和 Float COG 需要值域，否则可能渲染为饱和白色。
 
 ## 架构与性能
 
-处理流程为：HTTP 请求 → TMS 瓦片范围 → `CogReader` 读取 → 可选重投影 → 拉伸、着色和合成 → PNG/WebP/JPEG 编码。
+处理流程为：HTTP 请求 → TMS 瓦片范围 → `CogReader` 读取 → 可选重投影 → 拉伸、着色和合成 → PNG/无损 WebP 编码。
 
 ```text
 HTTP 请求（axum，`examples/serve.rs`）
@@ -171,14 +129,14 @@ HTTP 请求（axum，`examples/serve.rs`）
   │       并通过受信号量限制的 spawn_blocking 解码
   ├─ warp::warp（src_crs ≠ dst_crs）    proj 粗网格 + 双线性重投影
   │    └─ 在受信号量限制的 spawn_blocking 中执行（Proj 不实现 Send/Sync）
-  ├─ 渲染管线：                         ndarray + palette
+  ├─ 渲染管线：                         ndarray + raster-style
   │    ├─ 每波段拉伸
-  │    ├─ color_formula（sRGB Lab/Lch）
-  │    └─ 合成（渐变 LUT / 离散 HashMap / 多波段 RGB）
-  └─ PNG / WebP / JPEG 编码             image（+ image-webp）
+  │    ├─ Gamma / opacity
+  │    └─ Raster Style 灰度 / RGB / 原生色表
+  └─ PNG / lossless WebP 编码             image（+ image-webp）
 ```
 
-超出数据范围的瓦片返回 `Ok(None)`（示例服务响应 HTTP 204）；WebP/JPEG 输出需要启用对应的 `webp` / `jpeg` Cargo feature。
+超出数据范围的瓦片返回 `Ok(None)`（示例服务响应 HTTP 204）；无损 WebP 输出需要启用 `webp` Cargo feature。
 
 模块布局：
 
@@ -196,8 +154,8 @@ src/
     decode.rs         受信号量限制的单块 spawn_blocking 解码辅助函数
     window.rs         源瓦片范围和拼接辅助函数
   warp/               Projector + Resampling + 粗网格重投影
-  render/             colour、colormap、color_formula、composite、encode、pipeline
-  style/              titiler 风格参数解析器（`TileStyle`）和编译器
+  render/             colormap、expression、encode、pipeline
+  style/              Raster Style JSON/Q2 校验与渲染计划
   tiler.rs            编排器
 examples/
   serve.rs            Demo 入口和 viewer wiring

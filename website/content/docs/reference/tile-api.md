@@ -20,32 +20,32 @@ dependency surface.
 | `GET`, `HEAD /data/{name}` | Serve a discovered local TIFF with range support. |
 
 Supported TMS names are `WebMercatorQuad` and `WorldCRS84Quad`. Supported
-extensions are `png`, feature-gated `webp`, and feature-gated `jpg`/`jpeg`.
+style extensions are `png` and feature-gated lossless `webp`.
 
-## Style parameters {#parameters}
+## Raster Style Q2 {#parameters}
 
-| Parameter | Repeat | Default or example | Meaning |
-| --- | ---: | --- | --- |
-| `bidx` | yes | `bidx=1&bidx=2&bidx=3` | 1-indexed source-band selection. |
-| `expression` | no | `(b5-b4)/(b5+b4)` | Arithmetic expression producing one derived band. |
-| `rescale` | yes | `0,3000` | Explicit per-band `min,max` range; highest stretch priority. |
-| `stretch` | no | `minmax`, `percent`, `stddev` | Automatic stretch mode. |
-| `pc` | no | `2,98` | Percentile cut used by `stretch=percent`. |
-| `sigma` | no | `2.0` | Standard-deviation multiplier. |
-| `nodata` | no | `nan`, `inf`, `-inf`, or float | Override the dataset nodata value. |
-| `colormap_name` | no | `viridis` | Built-in single-band color ramp. |
-| `color_formula` | no | `gamma RGB 1.5` | Supported rio-color operation sequence. |
-| `resampling` | no | `nearest` | Source read or resize kernel. |
-| `reproject` | no | `nearest` | Warp-time resampling kernel. |
-| `tilesize` | no | `256` | One of 64, 128, 256, 512, or 1024. |
-| `format` | no | `png` | Optional format assertion; must agree with the path extension. |
+Both tile routes require complete Q2: `version=2.0&type=...`. Unknown fields,
+old parameters, and unimplemented capabilities fail explicitly. `dataset`,
+`mode`, and `_v` are separate singleton context keys; asset URLs are not styles.
 
-Resampling kernels are `nearest`, `bilinear`, `cubic`, `cubic_spline`,
-`lanczos`, and `average`. Average computes a box mean for downsampling and
-uses nearest behavior when upsampling.
+| Parameter | Repeat | Meaning |
+| --- | --- | --- |
+| `version` / `type` | no | `2.0` and gray/rgb/pseudocolor/categorized/single_color. |
+| `bidx` | yes | One-based source bands; RGB requires exactly three. |
+| `expression` | no | One expression for gray, three separated by semicolons for RGB; excludes bidx. |
+| `method` / `rescale` | ranges only | none, linear, minmax, percentile, stddev, histogram_equalization, curve; see the styling guide for parameters and the shared statistics grid. |
+| `colormap_name` / `colormap` | no | Pseudocolor maps; native tables use exact values or half-open intervals. |
+| `nodata` | no | Finite number or nan. |
+| `color_formula` | yes | Supported Gamma operations, applied in order. |
+| `opacity` | no | 0–1; default 1. |
+| `resampling` / `reproject` | no | nearest, bilinear, cubic, cubic_spline, lanczos, average. |
+| `tilesize` | no | 64, 128, 256 (default), 512, 1024. |
+| `format` / `lossless` | no | png (default) or webp with lossless=true; must match the path extension. |
+| `pixel_selection` / `stage` | no | Required for mosaics: first/highest/lowest/mean/median and before_channels/after_channels. |
+| `rank_channel` | no | One-based tuple position for highest/lowest. |
 
-The mosaic tile route additionally accepts `pixel_selection=first`,
-`highest`, `lowest`, `mean`, or `median`. The default is `first`.
+Encode literal `+` as `%2B` in raw Q2. Do not decode before concatenating query
+fragments. See the [styling guide](../../guides/styling/) for semantics and limits.
 
 ## Responses {#responses}
 

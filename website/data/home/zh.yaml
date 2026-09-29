@@ -21,7 +21,7 @@ cards:
       icon: fa-solid fa-cloud-arrow-down
       url: docs/get-started/library-usage/
     - title: 渲染与样式
-      desc: 通过拉伸、色带、重采样和波段计算生成 PNG、WebP 或 JPEG 瓦片。
+      desc: 使用 Raster Style JSON/Q2，通过拉伸、色带、重采样和波段计算生成 PNG 或无损 WebP 瓦片。
       icon: fa-solid fa-palette
       url: docs/guides/styling/
     - title: 构建镶嵌

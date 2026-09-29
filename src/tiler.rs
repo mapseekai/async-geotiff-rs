@@ -10,43 +10,27 @@ use bytes::Bytes;
 use crate::blocking::{default_blocking_permits, CpuLimiter};
 use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
-use crate::io::stats::{load_dataset_stats, DatasetStats};
-use crate::io::{CogReader, ScaleOffset};
+use crate::io::CogReader;
 #[cfg(feature = "perf-tracing")]
 use crate::perf::duration_ms;
-use crate::pixel::{ImageData, PixelData};
-use crate::render::composite::CompositeKind;
-use crate::render::pipeline::{render, CompiledTileStyle};
+use crate::pixel::ImageData;
 use crate::request::{
     RequestContext, RequestLimiter, RequestOptions, DEFAULT_MAX_IN_FLIGHT_REQUESTS,
     DEFAULT_REQUEST_TIMEOUT,
 };
 use crate::style::params::compile_cached;
-use crate::style::stretch::{fallback_rescale, resolve_rescale, Stretch};
 use crate::style::TileStyle;
 use crate::tms::{TileCoord, Tms};
-use crate::warp;
-use tokio::sync::OnceCell;
 
 const PASSTHROUGH_PIXEL_TOLERANCE: f64 = 1e-3;
-
-/// Bounded memo of stats-derived effective styles, keyed by
-/// `"{style:?}|{dtype}"`. Only deterministic (dataset-stats based) results are
-/// inserted — per-tile fallback/expression stretches never enter it.
-type EffectiveMemo = moka::sync::Cache<String, Arc<CompiledTileStyle>>;
 
 #[derive(Clone)]
 pub struct Tiler {
     reader: Arc<CogReader>,
     cpu: CpuLimiter,
-    stats: Arc<OnceCell<Option<Arc<DatasetStats>>>>,
     requests: RequestLimiter,
     request_timeout: Duration,
     work_budget: crate::resource::WorkBudget,
-    /// See [`EffectiveMemo`]. Shared into the fused CPU job per tile; reused
-    /// across tiles so per-style work (rescale resolution, render LUT builds
-    /// hanging off the compiled style) amortizes instead of repeating per tile.
-    effective_memo: Arc<EffectiveMemo>,
 }
 
 /// Runtime limits for a [`Tiler`].
@@ -91,26 +75,6 @@ struct ReadyPlan {
     dst_bbox: Bbox,
 }
 
-/// Result of the fused warp+style+render CPU job in [`Tiler::tile`].
-enum FusedOut {
-    /// Encoded tile bytes — the common case.
-    Bytes(Bytes),
-    /// Tile fell outside the projection's valid domain during warp.
-    NoTile,
-    /// The effective style needs dataset stats that were not prefetched
-    /// (the warp changed the pixel dtype, e.g. a boundary tile upcast to
-    /// f64). Carries the warped image so the caller re-renders without
-    /// repeating the warp.
-    NeedStats(Arc<ImageData>),
-}
-
-/// Outcome of the synchronous effective-style resolution.
-enum EffectiveOutcome {
-    Ready(Arc<CompiledTileStyle>),
-    /// Dataset stats are required but were not provided by the caller.
-    NeedStats,
-}
-
 impl Tiler {
     /// Build a `Tiler` that shares the reader's [`CpuLimiter`], so decode,
     /// stitch, warp and render all draw from one CPU budget. In a mosaic, where
@@ -123,11 +87,9 @@ impl Tiler {
         Self {
             reader,
             cpu,
-            stats: Arc::new(OnceCell::new()),
             requests: RequestLimiter::default(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             work_budget,
-            effective_memo: Arc::new(EffectiveMemo::new(32)),
         }
     }
 
@@ -139,11 +101,9 @@ impl Tiler {
         Self {
             reader,
             cpu: CpuLimiter::new(config.blocking_task_limit()),
-            stats: Arc::new(OnceCell::new()),
             requests: RequestLimiter::new(config.max_in_flight_requests),
             request_timeout: config.request_timeout,
             work_budget,
-            effective_memo: Arc::new(EffectiveMemo::new(32)),
         }
     }
 
@@ -181,23 +141,6 @@ impl Tiler {
         self.reader.wgs84_bounds()
     }
 
-    /// Lazily computed once per dataset, then memoized for the life of
-    /// this `Tiler` (which `AppState.tilers` keeps alive across all tile
-    /// requests). `?rescale=` requests never call this.
-    async fn dataset_stats(&self) -> AgResult<Option<Arc<DatasetStats>>> {
-        self.stats
-            .get_or_try_init(|| async {
-                Ok::<_, AgError>(load_dataset_stats(&self.reader).await?.map(Arc::new))
-            })
-            .await
-            .cloned()
-    }
-
-    // `effective_compiled` was an async method here; it is now the free
-    // function [`effective_compiled_sync`] so the fused warp+render CPU job
-    // can resolve the style without leaving the blocking context. Dataset
-    // stats are awaited by the caller and passed in.
-
     /// Pure planning: destination grid → overview level + clamped pixel window.
     /// Returns `None` when the tile is fully outside the COG or outside the
     /// projection's valid domain. Shared by [`Self::warp_tile`] (mosaic
@@ -219,7 +162,12 @@ impl Tiler {
 
         let target_gsd =
             bbox_in_src.width().abs().max(bbox_in_src.height().abs()) / f64::from(style.tilesize);
-        let level = self.reader.pick_overview(target_gsd);
+        let level = if style.raster.categorical {
+            // Source overviews do not carry a category-preservation proof.
+            0
+        } else {
+            self.reader.pick_overview(target_gsd)
+        };
 
         let level_tr = self.reader.level_transform(level)?;
         let (rc, rr, rw, rh) = level_tr
@@ -296,7 +244,9 @@ impl Tiler {
     /// Read + warp the source COG onto the destination tile grid. Returns
     /// `None` when the tile is fully outside the COG or outside the
     /// projection's valid domain — [`Tiler::tile`] turns that into "no tile"
-    /// (HTTP 204). This is the per-asset primitive the mosaic layer reuses.
+    /// (HTTP 204). Returns sorted, unique source dependencies; with
+    /// mosaic.stage=after_channels it returns expression outputs instead.
+    /// NoData is consumed into the mask. This is the per-asset mosaic primitive.
     pub async fn warp_tile(
         &self,
         coord: TileCoord,
@@ -317,7 +267,7 @@ impl Tiler {
             .run(self.request_timeout, options, |context| async move {
                 self.work_budget
                     .run_request(&context, |attempt| async move {
-                        self.warp_tile_in_request(coord, style, &attempt, &[]).await
+                        self.warp_tile_in_request(coord, style, &attempt).await
                     })
                     .await
             })
@@ -329,21 +279,17 @@ impl Tiler {
         coord: TileCoord,
         style: &TileStyle,
         context: &RequestContext,
-        selected_bands: &[usize],
     ) -> AgResult<Option<Arc<ImageData>>> {
         context.check()?;
-        #[cfg(feature = "perf-tracing")]
-        let started = Instant::now();
         compile_cached(style).await?;
+        self.check_raster_source()?;
         let Some(plan) = self.plan_tile_async(coord, style, context).await? else {
             return Ok(None);
         };
         let bands = u64::from(self.reader.data_ifd(plan.level)?.samples_per_pixel())
-            .max(selected_bands.len() as u64);
+            .max(style.raster.mosaic_band_count() as u64);
         let bytes = tile_work_bytes(plan.w, plan.h, bands, u64::from(style.tilesize))?;
         let context = &context.with_work(self.work_budget.try_reserve(bytes)?);
-        #[cfg(feature = "perf-tracing")]
-        let planned = started.elapsed();
         let mut src: Arc<ImageData> = self
             .reader
             .read_window(plan.level, plan.col, plan.row, plan.w, plan.h)
@@ -352,119 +298,25 @@ impl Tiler {
         if let Some(nodata) = style.nodata {
             Arc::make_mut(&mut src).nodata = Some(nodata);
         }
-        // Mosaic reduction needs the selected bands' validity, not nodata from
-        // unrelated bands. Select before warp/unscale can combine their masks.
-        // Public warp_tile passes an empty selection and retains all bands.
-        if !selected_bands.is_empty() {
-            let selected = selected_bands.to_vec();
-            src = self
-                .run_tile_cpu(context, "select bands", move || {
-                    let image = Arc::make_mut(&mut src);
-                    image.pixels = select_pixel_bands(&image.pixels, &selected)?;
-                    Ok(src)
-                })
-                .await?;
-        }
-        let scales = if selected_bands.is_empty() {
-            self.reader.band_scale_offset().to_vec()
-        } else {
-            selected_bands
-                .iter()
-                .map(|&band| {
-                    self.reader
-                        .band_scale_offset()
-                        .get(band)
-                        .copied()
-                        .unwrap_or(ScaleOffset::IDENTITY)
-                })
-                .collect()
-        };
-        #[cfg(feature = "perf-tracing")]
-        let read_done = started.elapsed();
-        if plan.passthrough {
-            // Passthrough tolerates tiny source alignment differences. Its
-            // pixels still represent the destination grid, just like warp's
-            // output; reducers must not see the original source coordinates.
-            let image = Arc::make_mut(&mut src);
-            image.bbox = plan.dst_bbox;
-            image.transform = crate::bounds::GeoTransform::from_gdal(&[
-                plan.dst_bbox.xmin,
-                plan.dst_bbox.width() / f64::from(style.tilesize),
-                0.0,
-                plan.dst_bbox.ymax,
-                0.0,
-                -plan.dst_bbox.height() / f64::from(style.tilesize),
-            ]);
-            crate::perf_trace! {
-                tracing::debug!(
-                    level = plan.level,
-                    col = plan.col,
-                    row = plan.row,
-                    width = plan.w,
-                    height = plan.h,
-                    plan_ms = duration_ms(planned),
-                    read_window_ms = duration_ms(read_done - planned),
-                    warp_cpu_ms = 0.0,
-                    total_ms = duration_ms(read_done),
-                    "warp_tile timing"
-                );
-            }
-            if style.unscale {
-                return self
-                    .run_tile_cpu(context, "unscale", move || {
-                        Ok(Some(Arc::new(unscale_image(
-                            Arc::unwrap_or_clone(src),
-                            &scales,
-                        ))))
-                    })
-                    .await;
-            }
-            return Ok(Some(src));
-        }
-
-        let ts = style.tilesize as usize;
-        let resampling = if src.crs == plan.dst_crs {
+        let raster = style.raster.clone();
+        let size = style.tilesize as usize;
+        let kernel = if src.crs == plan.dst_crs {
             style.resampling
         } else {
             style.reproject
         };
-        let dst_crs = plan.dst_crs.clone();
-        let dst_bbox = plan.dst_bbox;
-        let unscale = style.unscale;
         let cancellation = context.clone();
-        let warped: ImageData = match self
-            .run_tile_cpu(context, "warp", move || {
-                let image = warp::warp(&src, &dst_crs, dst_bbox, ts, ts, resampling)?;
-                cancellation.check()?;
-                Ok(if unscale {
-                    unscale_image(image, &scales)
-                } else {
-                    image
-                })
-            })
-            .await
-        {
-            Ok(w) => w,
-            Err(AgError::ProjectionDomain(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        #[cfg(feature = "perf-tracing")]
-        let warp_done = started.elapsed();
-        crate::perf_trace! {
-            tracing::debug!(
-                level = plan.level,
-                col = plan.col,
-                row = plan.row,
-                width = plan.w,
-                height = plan.h,
-                plan_ms = duration_ms(planned),
-                read_window_ms = duration_ms(read_done - planned),
-                warp_cpu_ms = duration_ms(warp_done - read_done),
-                total_ms = duration_ms(warp_done),
-                "warp_tile timing"
-            );
-        }
-        Ok(Some(Arc::new(warped)))
+        self.run_tile_cpu(context, "raster mosaic channels", move || {
+            let warped =
+                match raster.warp_dependencies(&src, &plan.dst_crs, plan.dst_bbox, size, kernel) {
+                    Ok(image) => image,
+                    Err(AgError::ProjectionDomain(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+            cancellation.check()?;
+            Ok(Some(Arc::new(raster.prepare_mosaic(warped))))
+        })
+        .await
     }
 
     /// Render one tile. Returns `Ok(None)` when the tile lies fully outside
@@ -502,6 +354,30 @@ impl Tiler {
             .await
     }
 
+    pub(crate) fn check_raster_source(&self) -> AgResult<()> {
+        {
+            use async_tiff::tags::ExtraSamples;
+            for level in 0..self.reader.level_count() {
+                if self
+                    .reader
+                    .data_ifd(level)?
+                    .extra_samples()
+                    .is_some_and(|extras| {
+                        extras.iter().any(|sample| {
+                            matches!(
+                                sample,
+                                ExtraSamples::AssociatedAlpha | ExtraSamples::UnassociatedAlpha
+                            )
+                        })
+                    })
+                {
+                    return Err(AgError::query("source_alpha", "Raster Style requires preserved fractional Alpha; this reader currently exposes a boolean mask"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn tile_in_request(
         &self,
         coord: TileCoord,
@@ -509,12 +385,11 @@ impl Tiler {
         context: &RequestContext,
     ) -> AgResult<Option<Bytes>> {
         context.check()?;
+        self.check_raster_source()?;
+        style.raster.statistics.check_scope(false)?;
         #[cfg(feature = "perf-tracing")]
         let started = Instant::now();
-        let mut compiled = compile_cached(style).await?;
-        if style.unscale {
-            Arc::make_mut(&mut compiled).nodata = None;
-        }
+        let compiled = compile_cached(style).await?;
         let Some(plan) = self.plan_tile_async(coord, style, context).await? else {
             crate::perf_trace! {
                 tracing::debug!(
@@ -524,6 +399,13 @@ impl Tiler {
             }
             return Ok(None);
         };
+        let raster = crate::style::statistics::resolve(
+            style,
+            std::slice::from_ref(&self.reader),
+            false,
+            context,
+        )
+        .await?;
         let bands = u64::from(self.reader.data_ifd(plan.level)?.samples_per_pixel());
         let bytes = tile_work_bytes(plan.w, plan.h, bands, u64::from(style.tilesize))?;
         let context = &context.with_work(self.work_budget.try_reserve(bytes)?);
@@ -540,99 +422,37 @@ impl Tiler {
         #[cfg(feature = "perf-tracing")]
         let read_done = started.elapsed();
 
-        // Prefetch dataset stats (memoized after the first tile) whenever the
-        // effective style may need them, so the fused CPU job below resolves
-        // the style synchronously. The u8-no-stretch default never loads them
-        // — exactly as before the fusion.
-        let want_stats = style.rescale.is_empty()
-            && style.expression.is_none()
-            && (style.resolved_stretch()?.is_some()
-                || style.unscale
-                || !matches!(src.pixels, PixelData::U8(_)));
-        let stats: Option<Option<Arc<DatasetStats>>> = if want_stats {
-            Some(self.dataset_stats().await?)
-        } else {
-            None
-        };
-
-        // ONE blocking hop (one CPU permit) for warp + unscale + effective
-        // style + render + encode. The intermediate tile buffer stays hot in
-        // cache instead of crossing two spawn_blocking boundaries.
         let ts = style.tilesize as usize;
-        let style_owned = style.clone();
-        let compiled2 = Arc::clone(&compiled);
-        let scale_offset = self.reader.band_scale_offset().to_vec();
-        let memo = Arc::clone(&self.effective_memo);
+        let kernel = if src.crs == plan.dst_crs {
+            style.resampling
+        } else {
+            style.reproject
+        };
         let cancellation = context.clone();
-        let fused = self
+        let bytes = self
             .run_tile_cpu(context, "tile", move || {
-                let img: Arc<ImageData> = if plan.passthrough {
-                    src
+                let result = if plan.passthrough {
+                    raster.render(&src, src.nodata, compiled.format)
                 } else {
-                    let resampling = if src.crs == plan.dst_crs {
-                        style_owned.resampling
-                    } else {
-                        style_owned.reproject
-                    };
-                    match warp::warp(&src, &plan.dst_crs, plan.dst_bbox, ts, ts, resampling) {
-                        Ok(w) => Arc::new(w),
-                        Err(AgError::ProjectionDomain(_)) => return Ok(FusedOut::NoTile),
-                        Err(e) => return Err(e),
-                    }
+                    raster.render_warped(
+                        &src,
+                        &plan.dst_crs,
+                        plan.dst_bbox,
+                        ts,
+                        kernel,
+                        compiled.format,
+                    )
                 };
                 cancellation.check()?;
-                let img = if style_owned.unscale {
-                    Arc::new(unscale_image(Arc::unwrap_or_clone(img), &scale_offset))
-                } else {
-                    img
-                };
-                cancellation.check()?;
-                let effective = match effective_compiled_sync(
-                    &style_owned,
-                    &compiled2,
-                    &img,
-                    stats.as_ref(),
-                    &scale_offset,
-                    &memo,
-                )? {
-                    EffectiveOutcome::Ready(c) => c,
-                    EffectiveOutcome::NeedStats => return Ok(FusedOut::NeedStats(img)),
-                };
-                cancellation.check()?;
-                Ok(FusedOut::Bytes(render(&img, &effective)?))
+                match result {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(AgError::ProjectionDomain(_)) => Ok(None),
+                    Err(error) => Err(error),
+                }
             })
             .await?;
-        let bytes = match fused {
-            FusedOut::Bytes(bytes) => bytes,
-            FusedOut::NoTile => return Ok(None),
-            FusedOut::NeedStats(img) => {
-                // Rare: the warp changed the pixel dtype (boundary tile upcast
-                // to f64) so stats weren't prefetched. Load them and re-render
-                // — the warp is NOT repeated, only the style+render hop.
-                let stats = self.dataset_stats().await?;
-                let style = style.clone();
-                let scales = self.reader.band_scale_offset().to_vec();
-                let memo = self.effective_memo.clone();
-                self.run_tile_cpu(context, "render", move || {
-                    let effective = match effective_compiled_sync(
-                        &style,
-                        &compiled,
-                        &img,
-                        Some(&stats),
-                        &scales,
-                        &memo,
-                    )? {
-                        EffectiveOutcome::Ready(c) => c,
-                        EffectiveOutcome::NeedStats => {
-                            return Err(AgError::Warp(
-                                "effective style demanded stats twice".into(),
-                            ))
-                        }
-                    };
-                    render(&img, &effective)
-                })
-                .await?
-            }
+        let Some(bytes) = bytes else {
+            return Ok(None);
         };
         #[cfg(feature = "perf-tracing")]
         let done = started.elapsed();
@@ -779,24 +599,8 @@ impl Tiler {
     }
 }
 
-fn select_pixel_bands(pixels: &PixelData, bands: &[usize]) -> AgResult<PixelData> {
-    if bands.iter().any(|&band| band >= pixels.bands()) {
-        return Err(AgError::query("bidx", "band out of range"));
-    }
-    macro_rules! select {
-        ($($variant:ident),+) => {
-            match pixels {
-                $(PixelData::$variant(array) => {
-                    PixelData::$variant(array.select(ndarray::Axis(0), bands))
-                }),+
-            }
-        };
-    }
-    Ok(select!(U8, U16, I16, U32, I32, F32, F64))
-}
-
 /// Conservative live working-set estimate: source/promotion and overlapping
-/// warp rows, output, unscale, render, encoding and coordinate/mask buffers.
+/// warp rows, output, render, encoding and coordinate/mask buffers.
 fn tile_work_bytes(width: u64, height: u64, bands: u64, tile_size: u64) -> AgResult<u64> {
     width
         .checked_mul(height)
@@ -816,304 +620,6 @@ fn tile_work_bytes(width: u64, height: u64, bands: u64, tile_size: u64) -> AgRes
         .ok_or_else(|| AgError::ResourceLimit("tile working-set estimate overflow".into()))
 }
 
-/// Resolve the effective rescale and inject it into a cloned
-/// `CompiledTileStyle`. Priority: explicit `rescale` (Custom) →
-/// `?stretch=` mode → default StdDev k=2.0 (u8 keeps its fast path).
-/// Sets BOTH `rescale` (RGB path / fast-path identity) and
-/// `composite.vmin/vmax` (single-band Gradient path).
-///
-/// Pure CPU: dataset stats are passed in (`stats`), not awaited. `None` means
-/// the caller did not prefetch them; if this style+image actually needs them
-/// the function returns [`EffectiveOutcome::NeedStats`] and the caller falls
-/// back to the unfused path. Stats-derived results (deterministic per
-/// style+dtype) are memoized in `memo`; per-tile results (expression stretch,
-/// pixel-fallback stretch) are computed fresh each call by design.
-fn effective_compiled_sync(
-    style: &TileStyle,
-    compiled: &Arc<CompiledTileStyle>,
-    image: &ImageData,
-    stats: Option<&Option<Arc<DatasetStats>>>,
-    scale_offset: &[ScaleOffset],
-    memo: &EffectiveMemo,
-) -> AgResult<EffectiveOutcome> {
-    use EffectiveOutcome::{NeedStats, Ready};
-    if !style.rescale.is_empty() {
-        return Ok(Ready(Arc::clone(compiled)));
-    }
-    // Band-math expression: stretch from the synthetic index's own value
-    // range, NOT dataset_stats (which are per-source-band raw DN and
-    // meaningless for an index like NDVI). Explicit `rescale` already
-    // returned above and wins.
-    if style.expression.is_some() {
-        // Match render's nodata source (`style.nodata.or(image.nodata)`) so
-        // the stretch is computed over the same pixel set that renders.
-        let nodata = compiled.nodata.or(image.nodata);
-        let (lo, hi) =
-            expression_rescale(image, &compiled.expression, nodata).unwrap_or((-1.0, 1.0));
-        let mut next = (**compiled).clone();
-        next.rescale = vec![(lo, hi)];
-        next.composite.vmin = Some(vec![lo]);
-        next.composite.vmax = Some(vec![hi]);
-        next.auto_rgb = false;
-        // Rescale changed → the clone must not share the parent's render LUTs.
-        next.luts = Default::default();
-        return Ok(Ready(Arc::new(next)));
-    }
-    let spec: Stretch = match style.resolved_stretch()? {
-        Some(s) => s,
-        None => {
-            if matches!(image.pixels, PixelData::U8(_))
-                && matches!(compiled.composite.kind, CompositeKind::Gradient)
-            {
-                let bidx = if compiled.bidx.is_empty() {
-                    vec![0]
-                } else {
-                    compiled.bidx.clone()
-                };
-                let ranges = fallback_image_rescale(image, &bidx);
-                let mut next = (**compiled).clone();
-                next.rescale = ranges.clone();
-                next.composite.vmin = Some(ranges.iter().map(|range| range.0).collect());
-                next.composite.vmax = Some(ranges.iter().map(|range| range.1).collect());
-                next.luts = Default::default();
-                return Ok(Ready(Arc::new(next)));
-            }
-            if matches!(image.pixels, PixelData::U8(_)) {
-                return Ok(Ready(Arc::clone(compiled)));
-            }
-            Stretch::DEFAULT
-        }
-    };
-
-    // Stats-derived results are deterministic per (style, pixel dtype): the
-    // memo turns the per-tile clone + range resolution into a pointer fetch
-    // and lets render-side LUTs hanging off the compiled style amortize.
-    let memo_key = format!("{style:?}|{}", dtype_code(&image.pixels));
-    if let Some(hit) = memo.get(&memo_key) {
-        return Ok(Ready(hit));
-    }
-
-    let bands = image.pixels.bands();
-    let bidx: Vec<usize> = if compiled.bidx.is_empty() {
-        if bands >= 3 && compiled.composite.bands >= 3 {
-            vec![0, 1, 2]
-        } else {
-            vec![0]
-        }
-    } else {
-        compiled.bidx.clone()
-    };
-
-    let Some(stats) = stats else {
-        return Ok(NeedStats);
-    };
-    let mut from_stats = false;
-    let ranges = match stats {
-        Some(stats) => {
-            let r = resolve_rescale(&spec, stats, &bidx);
-            // Empty → malformed stats (no bands); degrade gracefully.
-            if r.is_empty() {
-                fallback_image_rescale(image, &bidx)
-            } else {
-                from_stats = true;
-                r
-            }
-        }
-        None => fallback_image_rescale(image, &bidx),
-    };
-
-    let ranges = if style.unscale && from_stats {
-        unscale_ranges(&ranges, &bidx, scale_offset)
-    } else {
-        ranges
-    };
-    let mut next = (**compiled).clone();
-    next.rescale = ranges.clone();
-    next.composite.vmin = Some(ranges.iter().map(|r| r.0).collect());
-    next.composite.vmax = Some(ranges.iter().map(|r| r.1).collect());
-    next.auto_rgb = false;
-    // Rescale changed → the clone must not share the parent's render LUTs.
-    next.luts = Default::default();
-    let next = Arc::new(next);
-    if from_stats {
-        // Only deterministic results enter the memo — the pixel-fallback
-        // branch above depends on this tile's pixels and must stay per-tile.
-        memo.insert(memo_key, Arc::clone(&next));
-    }
-    Ok(Ready(next))
-}
-
-fn fallback_image_rescale(image: &ImageData, bidx: &[usize]) -> Vec<(f64, f64)> {
-    if !matches!(image.pixels, PixelData::F32(_) | PixelData::F64(_)) {
-        return fallback_rescale(&image.pixels, image.nodata, bidx);
-    }
-    let stats = crate::io::stats::band_stats_from_image(image, 1);
-    bidx.iter()
-        .map(|&b| match stats.get(b) {
-            Some(s) if s.max > s.min => (s.min, s.max),
-            _ => (0.0, 1.0),
-        })
-        .collect()
-}
-
-/// Mosaic stretches are derived from the reduced tile; source dataset stats
-/// cannot be mixed when assets have different scale/offset metadata.
-#[cfg(feature = "mosaic")]
-pub(crate) fn render_composite(
-    image: &ImageData,
-    style: &TileStyle,
-    compiled: &Arc<CompiledTileStyle>,
-) -> AgResult<Bytes> {
-    let memo = EffectiveMemo::new(1);
-    let mut physical_style = style.clone();
-    physical_style.unscale = false;
-    let mut compiled = (**compiled).clone();
-    // Request nodata was applied before warping, so reduction's mask/NaNs
-    // carry validity even when per-source values have been unscaled.
-    compiled.nodata = None;
-    let stats = (style.rescale.is_empty() && style.expression.is_none()).then(|| {
-        Arc::new(DatasetStats {
-            bands: crate::io::stats::band_stats_from_image(image, 256),
-            provenance: crate::io::stats::Provenance::Estimated,
-        })
-    });
-    match effective_compiled_sync(
-        &physical_style,
-        &Arc::new(compiled),
-        image,
-        Some(&stats),
-        &[],
-        &memo,
-    )? {
-        EffectiveOutcome::Ready(effective) => render(image, &effective),
-        EffectiveOutcome::NeedStats => unreachable!("stats explicitly supplied"),
-    }
-}
-
-/// Stable per-variant tag for memo keys.
-fn dtype_code(p: &PixelData) -> &'static str {
-    match p {
-        PixelData::U8(_) => "u8",
-        PixelData::U16(_) => "u16",
-        PixelData::I16(_) => "i16",
-        PixelData::U32(_) => "u32",
-        PixelData::I32(_) => "i32",
-        PixelData::F32(_) => "f32",
-        PixelData::F64(_) => "f64",
-    }
-}
-
-/// Finite-value (min, max) of the synthetic band an `expression` produces over
-/// `image`. Returns `None` if no pixel yields a finite value (e.g. all-nodata
-/// tile) — caller falls back to a default range. Nodata in a referenced band
-/// or a non-finite result skips that pixel (same masking as render).
-fn expression_rescale(
-    image: &ImageData,
-    rpn: &[crate::render::expression::Token],
-    nodata: Option<f64>,
-) -> Option<(f64, f64)> {
-    use crate::render::expression::{eval_rpn_with, referenced_nodata_hit, Token};
-    // Borrow as f64: warped cross-CRS tiles are already `F64`, so `as_f64`
-    // avoids the full-image clone `to_f64` would make on the hot expression path.
-    let src = image.pixels.as_f64();
-    let src = src.as_ref();
-    let bands = src.shape()[0];
-    let (h, w) = (src.shape()[1], src.shape()[2]);
-    let refs: Vec<usize> = {
-        let mut v: Vec<usize> = rpn
-            .iter()
-            .filter_map(|t| match t {
-                Token::Band(i) => Some(*i),
-                _ => None,
-            })
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-    let mut px = vec![0.0f64; bands];
-    let mut stack: Vec<f64> = Vec::with_capacity(rpn.len().max(8));
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for r in 0..h {
-        for c in 0..w {
-            if image.mask.as_ref().is_some_and(|mask| !mask[[r, c]]) {
-                continue;
-            }
-            for b in 0..bands {
-                px[b] = src[[b, r, c]];
-            }
-            if referenced_nodata_hit(&px, &refs, nodata) {
-                continue;
-            }
-            let v = eval_rpn_with(rpn, &px, &mut stack);
-            if v.is_finite() {
-                lo = lo.min(v);
-                hi = hi.max(v);
-            }
-        }
-    }
-    if lo.is_finite() && hi.is_finite() {
-        Some((lo, hi))
-    } else {
-        None
-    }
-}
-
-/// Apply per-band `physical = raw * scale + offset`, reusing owned F64 pixels.
-/// Bands beyond `scale_offset.len()` use identity.
-fn unscale_image(img: ImageData, scale_offset: &[ScaleOffset]) -> ImageData {
-    use ndarray::Axis;
-    let mut data = img.pixels.into_f64();
-    for (b, mut band) in data.axis_iter_mut(Axis(0)).enumerate() {
-        let so = scale_offset
-            .get(b)
-            .copied()
-            .unwrap_or(ScaleOffset::IDENTITY);
-        band.mapv_inplace(|v| {
-            if !v.is_finite()
-                || img
-                    .nodata
-                    .is_some_and(|nd| v == nd || (v - nd).abs() < 1e-9)
-            {
-                f64::NAN
-            } else {
-                so.apply(v)
-            }
-        });
-    }
-    ImageData {
-        pixels: PixelData::F64(data),
-        mask: img.mask,
-        crs: img.crs,
-        transform: img.transform,
-        nodata: Some(f64::NAN),
-        bbox: img.bbox,
-    }
-}
-
-/// Apply per-source-band scale/offset to auto-stretch ranges so they match
-/// unscaled pixels. `bidx[i]` is the source band index for `ranges[i]`.
-fn unscale_ranges(
-    ranges: &[(f64, f64)],
-    bidx: &[usize],
-    scale_offset: &[ScaleOffset],
-) -> Vec<(f64, f64)> {
-    ranges
-        .iter()
-        .enumerate()
-        .map(|(i, &(lo, hi))| {
-            let b = bidx.get(i).copied().unwrap_or(i);
-            let so = scale_offset
-                .get(b)
-                .copied()
-                .unwrap_or(ScaleOffset::IDENTITY);
-            let (lo, hi) = (so.apply(lo), so.apply(hi));
-            (lo.min(hi), lo.max(hi))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1131,13 +637,8 @@ mod tests {
             .is_none());
         }
     }
-    use super::{expression_rescale, unscale_image, unscale_ranges, Tiler, TilerConfig};
+    use super::{Tiler, TilerConfig};
     use crate::bounds::{Bbox, GeoTransform};
-    use crate::io::ScaleOffset;
-
-    fn so(scale: f64, offset: f64) -> ScaleOffset {
-        ScaleOffset { scale, offset }
-    }
 
     #[test]
     fn tiler_type_compiles() {
@@ -1177,7 +678,7 @@ mod tests {
             .await
             .unwrap();
         let tiler = Tiler::new(Arc::new(reader));
-        let style = TileStyle::from_query("").unwrap();
+        let style = TileStyle::from_raster_query("version=2.0&type=gray&bidx=1").unwrap();
         let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
 
         // A tile over the dataset centre must render actual bytes.
@@ -1247,9 +748,10 @@ mod tests {
             .await
             .unwrap();
         let tiler = Tiler::new(Arc::new(reader));
-        let style =
-            TileStyle::from_query("bidx=1&resampling=bilinear&reproject=bilinear&tilesize=256")
-                .unwrap();
+        let style = TileStyle::from_raster_query(
+            "version=2.0&type=gray&bidx=1&resampling=bilinear&reproject=bilinear&tilesize=256",
+        )
+        .unwrap();
         let png = tiler
             .tile(
                 TileCoord {
@@ -1308,75 +810,6 @@ mod tests {
         // World span 512 but ts=256 → 2 m/px request, not unit scale.
         let bbox = Bbox::new(0.0, -256.0, 512.0, 256.0);
         assert_eq!(Tiler::passthrough_window(&gt, &bbox, 256), None);
-    }
-
-    #[test]
-    fn unscale_image_applies_per_band_affine() {
-        use crate::pixel::{ImageData, PixelData};
-        use ndarray::array;
-        let pixels = PixelData::F64(array![[[10.0, 20.0]], [[1.0, 2.0]]]); // 2 bands,1x2
-        let img = ImageData {
-            pixels,
-            mask: None,
-            crs: crate::crs::Crs::epsg(3857),
-            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
-            nodata: Some(-9999.0),
-            bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
-        };
-        let out = unscale_image(img, &[so(0.1, 1.0), so(2.0, 0.0)]);
-        let f = out.pixels.to_f64();
-        assert_eq!(f[[0, 0, 0]], 10.0 * 0.1 + 1.0);
-        assert_eq!(f[[0, 0, 1]], 20.0 * 0.1 + 1.0);
-        assert_eq!(f[[1, 0, 0]], 1.0 * 2.0);
-        assert!(out.nodata.unwrap().is_nan());
-    }
-
-    #[test]
-    fn unscale_reuses_unique_buffers_and_preserves_shared_images() {
-        use crate::pixel::{ImageData, PixelData};
-        use std::sync::Arc;
-        let pixels = ndarray::array![[[1.0, 2.0], [3.0, 4.0]]].permuted_axes([0, 2, 1]);
-        let mask = ndarray::array![[true, false], [true, true]];
-        let pixel_pointer = pixels.as_ptr();
-        let mask_pointer = mask.as_ptr();
-        let image = Arc::new(ImageData {
-            pixels: PixelData::F64(pixels),
-            mask: Some(mask),
-            crs: crate::crs::Crs::epsg(4326),
-            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 2.0, 0.0, -1.0]),
-            nodata: None,
-            bbox: Bbox::new(0.0, 0.0, 2.0, 2.0),
-        });
-        let shared = unscale_image(Arc::unwrap_or_clone(Arc::clone(&image)), &[so(2.0, 1.0)]);
-        assert_eq!(image.pixels.as_f64()[[0, 0, 0]], 1.0);
-        assert_eq!(shared.pixels.as_f64()[[0, 0, 0]], 3.0);
-        assert_ne!(shared.pixels.as_f64().as_ptr(), pixel_pointer);
-
-        let unique = unscale_image(Arc::unwrap_or_clone(image), &[so(2.0, 1.0)]);
-        assert_eq!(unique.pixels.as_f64().as_ptr(), pixel_pointer);
-        assert_eq!(unique.mask.as_ref().unwrap().as_ptr(), mask_pointer);
-        assert_eq!(unique.pixels.as_f64()[[0, 0, 1]], 7.0);
-    }
-
-    #[test]
-    fn unscale_moves_nodata_sentinel_with_pixels() {
-        use crate::pixel::{ImageData, PixelData};
-        use ndarray::array;
-        // single band, 1x2: one valid pixel (50) and one nodata pixel (-9999).
-        let img = ImageData {
-            pixels: PixelData::F64(array![[[50.0, -9999.0]]]),
-            mask: None,
-            crs: crate::crs::Crs::epsg(3857),
-            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
-            nodata: Some(-9999.0),
-            bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
-        };
-        let out = unscale_image(img, &[so(0.1, 1.0)]);
-        let f = out.pixels.to_f64();
-        // Invalid raw samples stay invalid across different band affines.
-        assert!(f[[0, 0, 1]].is_nan());
-        // and a valid pixel is unaffected by the sentinel.
-        assert_eq!(f[[0, 0, 0]], 50.0 * 0.1 + 1.0);
     }
 
     #[tokio::test]
@@ -1498,7 +931,10 @@ mod tests {
         let lanczos = tiler
             .plan_tile(
                 coord,
-                &crate::style::TileStyle::from_query("reproject=lanczos").unwrap(),
+                &crate::style::TileStyle::from_raster_query(
+                    "version=2.0&type=gray&reproject=lanczos&bidx=1",
+                )
+                .unwrap(),
             )
             .unwrap()
             .unwrap();
@@ -1525,7 +961,10 @@ mod tests {
             x,
             y,
         };
-        let style = crate::style::TileStyle::from_query("nodata=100&reproject=bilinear").unwrap();
+        let style = crate::style::TileStyle::from_raster_query(
+            "version=2.0&type=gray&nodata=100&reproject=bilinear&bidx=1",
+        )
+        .unwrap();
         let plan = tiler.plan_tile(coord, &style).unwrap().unwrap();
         let mut source = (*tiler
             .reader
@@ -1534,6 +973,10 @@ mod tests {
             .unwrap())
         .clone();
         source.nodata = Some(100.0);
+        // Raster Style warps only referenced bands, in floating point.
+        source.pixels = crate::pixel::PixelData::F64(
+            source.pixels.band_to_f64(0).insert_axis(ndarray::Axis(0)),
+        );
         let expected = crate::warp::warp(
             &source,
             &plan.dst_crs,
@@ -1544,6 +987,7 @@ mod tests {
         )
         .unwrap();
         let actual = tiler.warp_tile(coord, &style).await.unwrap().unwrap();
+        assert_eq!(actual.mask, expected.mask);
         for (a, b) in actual
             .pixels
             .to_f64()
@@ -1552,173 +996,5 @@ mod tests {
         {
             assert!(a == b || (a.is_nan() && b.is_nan()));
         }
-    }
-
-    #[test]
-    fn unscale_preserves_invalidity_with_different_band_affines() {
-        let img = crate::pixel::ImageData {
-            pixels: crate::pixel::PixelData::F64(ndarray::array![
-                [[10.0, -9999.0]],
-                [[-9999.0, 20.0]]
-            ]),
-            mask: None,
-            crs: crate::crs::Crs::epsg(4326),
-            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 1.0, 0.0, -1.0]),
-            nodata: Some(-9999.0),
-            bbox: Bbox::new(0.0, 0.0, 2.0, 1.0),
-        };
-        let out = unscale_image(img, &[so(0.1, 1.0), so(2.0, 5.0)]);
-        let pixels = out.pixels.to_f64();
-        assert!(pixels[[0, 0, 1]].is_nan());
-        assert!(pixels[[1, 0, 0]].is_nan());
-        assert_eq!(pixels[[0, 0, 0]], 2.0);
-        assert_eq!(pixels[[1, 0, 1]], 45.0);
-    }
-
-    #[test]
-    fn unscale_ranges_applies_source_band_affine() {
-        let ranges = vec![(0.0, 1000.0), (10.0, 20.0)];
-        let bidx = vec![0usize, 1];
-        let out = unscale_ranges(&ranges, &bidx, &[so(0.01, 5.0), so(2.0, 0.0)]);
-        assert_eq!(out[0], (0.0 * 0.01 + 5.0, 1000.0 * 0.01 + 5.0));
-        assert_eq!(out[1], (10.0 * 2.0, 20.0 * 2.0));
-    }
-
-    #[test]
-    fn negative_scale_keeps_stretch_bounds_ordered() {
-        assert_eq!(
-            unscale_ranges(&[(10.0, 20.0)], &[0], &[so(-2.0, 100.0)]),
-            vec![(60.0, 80.0)]
-        );
-    }
-
-    #[test]
-    fn masked_pixels_do_not_expand_expression_or_fallback_stretch() {
-        let image = crate::pixel::ImageData {
-            pixels: crate::pixel::PixelData::F64(ndarray::array![[[1.0, 2.0, 10000.0]]]),
-            mask: Some(ndarray::array![[true, true, false]]),
-            crs: crate::crs::Crs::epsg(4326),
-            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 1.0, 0.0, -1.0]),
-            nodata: None,
-            bbox: Bbox::new(0.0, 0.0, 3.0, 1.0),
-        };
-        let rpn = crate::render::expression::parse_expression("b1").unwrap();
-        assert_eq!(expression_rescale(&image, &rpn, None), Some((1.0, 2.0)));
-        let style = crate::style::TileStyle::default();
-        let compiled = std::sync::Arc::new(crate::style::params::compile(&style).unwrap());
-        let outcome = super::effective_compiled_sync(
-            &style,
-            &compiled,
-            &image,
-            Some(&None),
-            &[],
-            &super::EffectiveMemo::new(1),
-        )
-        .unwrap();
-        let super::EffectiveOutcome::Ready(result) = outcome else {
-            panic!("stats supplied")
-        };
-        assert_eq!(result.rescale, vec![(1.0, 2.0)]);
-    }
-
-    #[test]
-    fn expression_rescale_all_nonfinite_returns_none() {
-        use crate::pixel::{ImageData, PixelData};
-        use crate::render::expression::parse_expression;
-        // every pixel 0/0 → NaN → no finite value → None.
-        let pixels = PixelData::F64(
-            ndarray::Array3::from_shape_vec((2, 1, 2), vec![0.0, 0.0, 0.0, 0.0]).unwrap(),
-        );
-        let img = ImageData {
-            pixels,
-            mask: None,
-            crs: crate::crs::Crs::epsg(3857),
-            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
-            nodata: None,
-            bbox: crate::bounds::Bbox::new(0.0, 0.0, 2.0, 1.0),
-        };
-        let rpn = parse_expression("(b2-b1)/(b2+b1)").unwrap();
-        assert!(expression_rescale(&img, &rpn, None).is_none());
-    }
-
-    #[test]
-    fn expression_rescale_uses_synthetic_band_range_not_band_stats() {
-        use crate::pixel::{ImageData, PixelData};
-        use crate::render::expression::parse_expression;
-        // 2 bands, 1x3. NDVI=(b2-b1)/(b2+b1):
-        //   px0: b1=1000,b2=3000 → 2000/4000 = 0.5
-        //   px1: b1=2000,b2=2000 → 0/4000 = 0.0
-        //   px2: b1=0,b2=0       → 0/0 = NaN (skipped)
-        let pixels = PixelData::F64(
-            ndarray::Array3::from_shape_vec(
-                (2, 1, 3),
-                vec![1000.0, 2000.0, 0.0, 3000.0, 2000.0, 0.0],
-            )
-            .unwrap(),
-        ); // (2,1,3): band0=b1=[1000,2000,0], band1=b2=[3000,2000,0]
-        let img = ImageData {
-            pixels,
-            mask: None,
-            crs: crate::crs::Crs::epsg(3857),
-            transform: crate::bounds::GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, -1.0]),
-            nodata: None,
-            bbox: crate::bounds::Bbox::new(0.0, 0.0, 3.0, 1.0),
-        };
-        let rpn = parse_expression("(b2-b1)/(b2+b1)").unwrap();
-        let (lo, hi) = expression_rescale(&img, &rpn, None).expect("finite range");
-        assert!((lo - 0.0).abs() < 1e-9, "lo={lo}");
-        assert!((hi - 0.5).abs() < 1e-9, "hi={hi}");
-        assert!(hi < 1.0, "range must be NDVI units, not DN");
-    }
-
-    #[tokio::test]
-    async fn fallback_stretch_does_not_unscale_physical_values_twice() {
-        use super::*;
-        use crate::crs::Crs;
-        let style = TileStyle {
-            unscale: true,
-            ..TileStyle::default()
-        };
-        let compiled = compile_cached(&style).await.unwrap();
-        let image = ImageData {
-            pixels: PixelData::F64(
-                ndarray::Array3::from_shape_vec((1, 1, 2), vec![10.0, 20.0]).unwrap(),
-            ),
-            mask: None,
-            crs: Crs::epsg(3857),
-            transform: GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 1.0, 0.0, -1.0]),
-            nodata: None,
-            bbox: Bbox::new(0.0, 0.0, 2.0, 1.0),
-        };
-        let outcome = effective_compiled_sync(
-            &style,
-            &compiled,
-            &image,
-            Some(&None),
-            &[ScaleOffset {
-                scale: 0.1,
-                offset: 0.0,
-            }],
-            &EffectiveMemo::new(1),
-        )
-        .unwrap();
-        let EffectiveOutcome::Ready(result) = outcome else {
-            panic!("unexpected stats request")
-        };
-        assert_eq!(result.rescale, vec![(10.0, 20.0)]);
-    }
-
-    #[test]
-    fn u8_default_request_keeps_rescale_empty() {
-        // effective_compiled's u8 short-circuit is reached when:
-        //   rescale empty  &&  stretch_kind None  &&  PixelData::U8
-        // We assert the decision predicate here (pure, no IO):
-        use crate::style::TileStyle;
-        let style = TileStyle::from_query("").unwrap();
-        assert!(style.rescale.is_empty());
-        assert!(style.resolved_stretch().unwrap().is_none());
-        // The combination above + U8 → effective_compiled returns the
-        // input Arc unchanged (verified by the full-suite run, which
-        // exercises real u8 fixtures through render()).
     }
 }

@@ -355,14 +355,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("OpenLayers viewer: {http_base}/openlayers");
     println!("Leaflet viewer: {http_base}/leaflet");
     let tile_base = format!("{http_base}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}");
-    println!("Tile endpoint: {tile_base}.png");
-    println!("  WebP tiles: {tile_base}.webp");
-    println!("  JPEG tiles: {tile_base}.jpg");
-    println!("  (the path extension picks the format; WebP/JPEG require: --features webp,jpeg)");
+    let style_query = "version=2.0&type=gray&bidx=1";
+    println!("Tile endpoint: {tile_base}.png?{style_query}");
+    #[cfg(feature = "webp")]
+    println!("  WebP tiles: {tile_base}.webp?{style_query}&format=webp&lossless=true");
     println!("Formats endpoint: {http_base}/formats");
     if mosaic_loaded {
         println!(
-            "Mosaic endpoint: {http_base}/mosaic/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?pixel_selection=first"
+            "Mosaic endpoint: {http_base}/mosaic/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?{style_query}&pixel_selection=first&stage=before_channels"
         );
     } else {
         println!("Mosaic endpoint: disabled (set ASYNC_GEOTIFF_MOSAIC=<mosaic.json> to enable)");
@@ -681,22 +681,27 @@ mod tests {
             Arc::new(BlockCache::new(CacheConfig::default())),
         )
         .with_stac_mosaic(Arc::new(mosaic));
-        let response = server::mosaic_tile_handler(
-            axum::extract::State(demo_state),
-            axum::extract::Path((
-                "WebMercatorQuad".to_string(),
-                coord.z,
-                coord.x,
-                format!("{}.png", coord.y),
-            )),
-            axum::extract::Query(Vec::new()),
-        )
-        .await;
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let tile = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("render STAC fixture tile");
-        assert!(!tile.is_empty());
+        for query in [
+            "version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&pixel_selection=first&stage=before_channels",
+            "version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&pixel_selection=mean&stage=after_channels",
+        ] {
+            let response = server::mosaic_tile_handler(
+                axum::extract::State(demo_state.clone()),
+                axum::extract::Path((
+                    "WebMercatorQuad".to_string(),
+                    coord.z,
+                    coord.x,
+                    format!("{}.png", coord.y),
+                )),
+                axum::extract::RawQuery(Some(query.to_owned())),
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let tile = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("render STAC fixture tile");
+            assert!(!tile.is_empty());
+        }
         let requests = requests.lock().await;
         assert!(requests.iter().all(|request| {
             request["collections"] == json!(["demo-collection"])
@@ -740,7 +745,7 @@ mod tests {
         let mut visible = false;
         for ty in y - 1..=y + 1 {
             for tx in x - 1..=x + 1 {
-                let response = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{tx}/{ty}.png?stretch=stddev&resampling=bilinear&reproject=bilinear")).send().await.unwrap();
+                let response = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{tx}/{ty}.png?version=2.0&type=gray&bidx=1&method=linear&rescale=0,65535&resampling=bilinear&reproject=bilinear")).send().await.unwrap();
                 assert!(
                     response.status() == reqwest::StatusCode::OK
                         || response.status() == reqwest::StatusCode::NO_CONTENT,
@@ -760,7 +765,7 @@ mod tests {
             visible,
             "single-band viewport must retain visible source pixels"
         );
-        let invalid = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{x}/{y}.png?bidx=1&bidx=2&bidx=3&stretch=stddev")).send().await.unwrap();
+        let invalid = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{x}/{y}.png?version=2.0&type=rgb&bidx=1&bidx=2&bidx=3")).send().await.unwrap();
         assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
         task.abort();
     }

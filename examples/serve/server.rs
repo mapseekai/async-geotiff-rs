@@ -8,7 +8,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::Method;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -20,7 +20,7 @@ use async_geotiff::error::{AgError, AgResult};
 use async_geotiff::io::{BlockCache, BlockCacheStats, CogReader, ReaderConfig};
 #[cfg(feature = "stac")]
 use async_geotiff::mosaic::StacSource;
-use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler, PixelSelection};
+use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler};
 use async_geotiff::style::{TileFormat, TileStyle};
 use async_geotiff::tiler::{Tiler, TilerConfig};
 use async_geotiff::tms::{TileCoord, TileMatrixSet};
@@ -154,16 +154,11 @@ pub enum Mosaic {
 }
 
 impl Mosaic {
-    async fn tile(
-        &self,
-        coord: TileCoord,
-        selection: PixelSelection,
-        style: &TileStyle,
-    ) -> AgResult<Option<bytes::Bytes>> {
+    async fn tile(&self, coord: TileCoord, style: &TileStyle) -> AgResult<Option<bytes::Bytes>> {
         match self {
-            Self::Json(mosaic) => mosaic.tile(coord, selection, style).await,
+            Self::Json(mosaic) => mosaic.tile(coord, style).await,
             #[cfg(feature = "stac")]
-            Self::Stac(mosaic) => mosaic.tile(coord, selection, style).await,
+            Self::Stac(mosaic) => mosaic.tile(coord, style).await,
         }
     }
 }
@@ -348,6 +343,7 @@ pub async fn tile_handler(
     State(state): State<AppState>,
     Path((tms, z, x, ye)): Path<(String, u8, u32, String)>,
     Query(params): Query<Vec<(String, String)>>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
     let mut timer = StageTimer::new("tile");
     let (y_str, ext) = ye.split_once('.').unwrap_or((ye.as_str(), "png"));
@@ -378,7 +374,7 @@ pub async fn tile_handler(
         .find(|(k, _)| k == "dataset")
         .map(|(_, v)| v.clone());
 
-    let style = match style_from_tile_params(&params, path_format) {
+    let style = match style_from_tile_query(raw.as_deref().unwrap_or(""), path_format) {
         Ok(s) => s,
         Err(e) => return error_response(e),
     };
@@ -392,7 +388,7 @@ pub async fn tile_handler(
         z,
         x,
         y,
-        format: &style.format,
+        format: &style.format(),
         dataset: dataset.as_deref(),
     });
     #[cfg(not(feature = "perf-tracing"))]
@@ -423,7 +419,7 @@ pub async fn tile_handler(
                 with_cors(
                     (
                         [
-                            ("content-type", style.format.content_type()),
+                            ("content-type", style.format().content_type()),
                             // COG tiles are immutable for a given URL+style, so
                             // let browsers reuse them across pan/zoom instead of
                             // re-rendering (and re-fetching upstream ranges).
@@ -450,25 +446,14 @@ pub async fn tile_handler(
     .await
 }
 
-fn parse_pixel_selection(s: &str) -> Option<PixelSelection> {
-    match s {
-        "first" => Some(PixelSelection::First),
-        "highest" => Some(PixelSelection::Highest),
-        "lowest" => Some(PixelSelection::Lowest),
-        "mean" => Some(PixelSelection::Mean),
-        "median" => Some(PixelSelection::Median),
-        _ => None,
-    }
-}
-
 /// `GET /mosaic/tiles/{tms}/{z}/{x}/{y}.{ext}?pixel_selection=first&...`
 /// Serves the startup-loaded MosaicJSON mosaic. Styling query params are
-/// the same as `/tiles`; `pixel_selection` picks the reducer (default
-/// `first`).
+/// the same as `/tiles`. Q2 requires `pixel_selection` and `stage`;
+/// both are validated by the Raster Style SDK.
 pub async fn mosaic_tile_handler(
     State(state): State<AppState>,
     Path((tms, z, x, ye)): Path<(String, u8, u32, String)>,
-    Query(params): Query<Vec<(String, String)>>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
     let mut timer = StageTimer::new("mosaic_tile");
     let Some(mosaic) = state.mosaic.clone() else {
@@ -504,23 +489,7 @@ pub async fn mosaic_tile_handler(
         }
     };
 
-    let selection = match params.iter().find(|(k, _)| k == "pixel_selection") {
-        Some((_, v)) => match parse_pixel_selection(v) {
-            Some(s) => s,
-            None => {
-                return with_cors(
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("unknown pixel_selection: {v} (first|highest|lowest|mean|median)"),
-                    )
-                        .into_response(),
-                )
-            }
-        },
-        None => PixelSelection::First,
-    };
-
-    let style = match style_from_tile_params(&params, path_format) {
+    let style = match style_from_tile_query(raw.as_deref().unwrap_or_default(), path_format) {
         Ok(s) => s,
         Err(e) => return error_response(e),
     };
@@ -534,7 +503,7 @@ pub async fn mosaic_tile_handler(
         z,
         x,
         y,
-        format: &style.format,
+        format: &style.format(),
         dataset: None,
     });
     #[cfg(not(feature = "perf-tracing"))]
@@ -548,7 +517,6 @@ pub async fn mosaic_tile_handler(
                     x,
                     y,
                 },
-                selection,
                 &style,
             )
             .await;
@@ -560,7 +528,7 @@ pub async fn mosaic_tile_handler(
                 with_cors(
                     (
                         [
-                            ("content-type", style.format.content_type()),
+                            ("content-type", style.format().content_type()),
                             // COG tiles are immutable for a given URL+style, so
                             // let browsers reuse them across pan/zoom instead of
                             // re-rendering (and re-fetching upstream ranges).
@@ -601,26 +569,30 @@ fn tile_format_from_extension(ext: &str) -> AgResult<TileFormat> {
     Ok(format)
 }
 
-fn style_from_tile_params(
-    params: &[(String, String)],
-    path_format: TileFormat,
-) -> AgResult<TileStyle> {
-    path_format.ensure_available()?;
-    let mut style = TileStyle::from_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
-    if style.format == path_format {
-        return Ok(style);
+/// Keep Q2 bytes intact: context parameters are separated before SDK decoding.
+fn style_from_tile_query(raw: &str, format: TileFormat) -> AgResult<TileStyle> {
+    let mut context_keys = std::collections::HashSet::new();
+    let mut fragments = Vec::new();
+    for fragment in raw.split('&') {
+        let key = url::form_urlencoded::parse(fragment.as_bytes())
+            .next()
+            .map(|(k, _)| k.into_owned())
+            .unwrap_or_default();
+        if matches!(key.as_str(), "dataset" | "mode" | "_v") {
+            if !context_keys.insert(key.clone()) {
+                return Err(AgError::query(key, "duplicate context parameter"));
+            }
+        } else {
+            fragments.push(fragment);
+        }
     }
-    if params.iter().any(|(k, _)| k == "format") {
+    let style = TileStyle::from_raster_query(&fragments.join("&"))?;
+    if style.format() != format {
         return Err(AgError::query(
-            "format",
-            format!(
-                "query format {} does not match path extension {}",
-                style.format.extension(),
-                path_format.extension()
-            ),
+            "/image/format",
+            "must match the tile path extension",
         ));
     }
-    style.format = path_format;
     Ok(style)
 }
 
@@ -661,15 +633,11 @@ fn cache_stats_json(stats: &BlockCacheStats) -> String {
     .to_string()
 }
 
-/// `GET /formats` -> JSON array of the tile output formats this build can
-/// actually encode, e.g. `[{"value":"png","label":"PNG"}, ...]`. WebP/JPEG only
-/// appear when the server was built with their cargo features, so viewers can
-/// list only formats that won't 400. The `value` is the tile path extension
-/// (`.png`/`.webp`/`.jpg`), which is what drives the output format.
+/// `GET /formats` returns supported Raster Style encodings in this build.
 pub async fn formats_handler() -> Response {
     use async_geotiff::style::TileFormat;
 
-    let available: Vec<serde_json::Value> = [TileFormat::Png, TileFormat::Webp, TileFormat::Jpeg]
+    let available: Vec<serde_json::Value> = [TileFormat::Png, TileFormat::Webp]
         .into_iter()
         .filter(TileFormat::is_available)
         .map(|f| {
@@ -965,11 +933,124 @@ fn with_cors(mut response: Response) -> Response {
 mod tests {
     use super::*;
 
-    fn params(items: &[(&str, &str)]) -> Vec<(String, String)> {
-        items
+    #[cfg(feature = "proj")]
+    #[tokio::test]
+    async fn raster_mosaic_q2_over_http_matches_single_source_pixels() {
+        use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
+        let store = Arc::new(InMemory::new());
+        for key in ["a", "b"] {
+            store
+                .put(
+                    &ObjectPath::from(key),
+                    bytes::Bytes::from_static(include_bytes!(
+                        "../../tests/fixtures/rgb_nodata.tif"
+                    ))
+                    .into(),
+                )
+                .await
+                .unwrap();
+        }
+        let reader = CogReader::open_object_store(store.clone(), "a")
+            .await
+            .unwrap();
+        let tiler = Tiler::new(Arc::new(reader));
+        let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
+        let z = 14;
+        let grid = 2_f64.powi(z);
+        let x = (((w + e) / 2. + 180.) / 360. * grid).floor() as u32;
+        let lat = ((s + n) / 2.).to_radians();
+        let y = ((1. - lat.tan().asinh() / std::f64::consts::PI) / 2. * grid).floor() as u32;
+        let source = MosaicJsonSource::from_str(r#"{"mosaicjson":"0.0.3","minzoom":1,"maxzoom":1,"quadkey_zoom":1,"tiles":{"0":["a","b"],"1":["a","b"],"2":["a","b"],"3":["a","b"]}}"#).unwrap();
+        let mosaic = MosaicTiler::builder(source)
+            .backend(async_geotiff::mosaic::Backend::Store(store))
+            .build();
+        let state = AppState::new(
+            Some(Arc::new(tiler)),
+            None,
+            vec![],
+            "http://127.0.0.1:0",
+            Arc::new(BlockCache::new(async_geotiff::io::CacheConfig::default())),
+        )
+        .with_mosaic(Arc::new(mosaic));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let q = "version=2.0&type=gray&expression=b1%2Bb2&method=linear&rescale=0,510&opacity=0.5";
+        let path = format!("tiles/WebMercatorQuad/{z}/{x}/{y}.png");
+        let response = client
+            .get(format!("{base}/{path}?{q}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let expected = image::load_from_memory(&response.bytes().await.unwrap())
+            .unwrap()
+            .to_rgba8();
+        assert!(expected.pixels().any(|p| p[3] > 0));
+        for stage in ["before_channels", "after_channels"] {
+            let response = client
+                .get(format!(
+                    "{base}/mosaic/{path}?{q}&pixel_selection=mean&stage={stage}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let actual = image::load_from_memory(&response.bytes().await.unwrap())
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(actual, expected);
+        }
+        for extra in [
+            "",
+            "&pixel_selection=first",
+            "&pixel_selection=first&stage=before_channels&stage=after_channels",
+            "&pixel_selection=first&stage=before_channels&stretch=stddev",
+        ] {
+            let response = client
+                .get(format!("{base}/mosaic/{path}?{q}{extra}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        }
+        for prefix in ["", "mosaic/"] {
+            for query in [
+                "",
+                "bidx=1",
+                "stretch=stddev",
+                "version=2.0&type=gray&bidx=1&unscale=true",
+            ] {
+                let response = client
+                    .get(format!("{base}/{prefix}{path}?{query}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::BAD_REQUEST,
+                    "{prefix} {query}"
+                );
+            }
+        }
+        let formats = client
+            .get(format!("{base}/formats"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let formats: serde_json::Value = serde_json::from_slice(&formats).unwrap();
+        assert!(formats
+            .as_array()
+            .unwrap()
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect()
+            .all(|f| f["value"] == "png" || f["value"] == "webp"));
+        task.abort();
     }
 
     #[tokio::test]
@@ -1111,8 +1192,35 @@ mod tests {
 
     #[test]
     fn png_extension_keeps_default_format() {
-        let style = style_from_tile_params(&params(&[]), TileFormat::Png).unwrap();
-        assert_eq!(style.format, TileFormat::Png);
+        let style = style_from_tile_query("version=2.0&type=gray&bidx=1", TileFormat::Png).unwrap();
+        assert_eq!(style.format(), TileFormat::Png);
+    }
+
+    #[test]
+    fn q2_transport_preserves_encoding_and_rejects_mixed_parameters() {
+        let parse = |raw: &str| style_from_tile_query(raw, TileFormat::Png);
+        let valid = "version=2.0&type=gray&expression=b1%2Bb1&dataset=a%26b.tif&_v=1";
+        assert!(parse(valid).unwrap().raster_style_json().contains("2.0"));
+        assert!(
+            parse("version=2.0&type=gray&bidx=1&pixel_selection=mean&stage=after_channels").is_ok()
+        );
+        assert!(parse("version=2.0&type=gray&bidx=1&pixel_selection=first").is_err());
+        assert!(parse("version=2.0&type=gray&bidx=1&pixel_selection=first&stage=before_channels&stage=after_channels").is_err());
+        for query in [
+            "",
+            "bidx=1",
+            "stretch=stddev",
+            "rescale=0,255",
+            "dataset=a",
+            "version=2.0&type=gray&expression=b1+b1",
+            "version=2.0&type=gray&bidx=1&stretch=stddev",
+            "version=2.0&type=gray&bidx=1&dataset=a&dataset=b",
+            "version=2.0&type=gray&type=gray&bidx=1",
+            "type=gray&bidx=1",
+            "version=2.0&type=gray&bidx=1&method=percentile&percentiles=98,2",
+        ] {
+            assert!(parse(query).is_err(), "{query}");
+        }
     }
 
     #[cfg(feature = "webp")]
@@ -1122,8 +1230,12 @@ mod tests {
             tile_format_from_extension("webp").unwrap(),
             TileFormat::Webp
         );
-        let style = style_from_tile_params(&params(&[]), TileFormat::Webp).unwrap();
-        assert_eq!(style.format, TileFormat::Webp);
+        let style = style_from_tile_query(
+            "version=2.0&type=gray&bidx=1&format=webp&lossless=true",
+            TileFormat::Webp,
+        )
+        .unwrap();
+        assert_eq!(style.format(), TileFormat::Webp);
     }
 
     #[cfg(feature = "jpeg")]
@@ -1134,8 +1246,11 @@ mod tests {
             tile_format_from_extension("jpeg").unwrap(),
             TileFormat::Jpeg
         );
-        let style = style_from_tile_params(&params(&[]), TileFormat::Jpeg).unwrap();
-        assert_eq!(style.format, TileFormat::Jpeg);
+        assert!(style_from_tile_query(
+            "version=2.0&type=gray&bidx=1&format=jpeg",
+            TileFormat::Jpeg
+        )
+        .is_err());
     }
 
     #[cfg(not(feature = "webp"))]
@@ -1155,8 +1270,11 @@ mod tests {
     #[cfg(feature = "webp")]
     #[test]
     fn query_format_must_match_path_extension() {
-        let err =
-            style_from_tile_params(&params(&[("format", "webp")]), TileFormat::Png).unwrap_err();
+        let err = style_from_tile_query(
+            "version=2.0&type=gray&bidx=1&format=webp&lossless=true",
+            TileFormat::Png,
+        )
+        .unwrap_err();
         assert!(matches!(err, AgError::Query { .. }));
     }
 }

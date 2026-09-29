@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?,
     );
     let tiler = Tiler::new(reader);
-    let style = TileStyle::from_query("colormap_name=viridis&rescale=0,3000")?;
+    let style = TileStyle::from_raster_query("version=2.0&type=pseudocolor&bidx=1&colormap_name=viridis&method=linear&rescale=0,3000")?;
     let coord = TileCoord {
         tms: TileMatrixSet::WebMercatorQuad,
         z: 0,
@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`TileStyle::from_query` accepts the same query string used by the example HTTP
+`TileStyle::from_raster_query` accepts the same query string used by the example HTTP
 server, without the leading `?`. Save the example as `src/main.rs`, then run
 `cargo run`. The pinned URL is a small, range-capable test COG; replace it
 after verifying the integration.

@@ -19,7 +19,7 @@ flowchart LR
     CPU --> Warp[Warp and resampling]
     Warp --> Render[Rescale / colormap / composite]
     Style --> Render
-    Render --> Encode[PNG / WebP / JPEG]
+    Render --> Encode[PNG / lossless WebP]
     Encode --> Result[Option&lt;Bytes&gt;]
     Mosaic[MosaicTiler] --> ReaderPool[ReaderPool]
     ReaderPool --> Reader
@@ -33,7 +33,7 @@ flowchart LR
 | `CogReader` | Open a COG, read metadata and overviews, select and stitch native blocks, and sample points or windows. |
 | `BlockCache` | Share decoded native blocks across readers under one byte budget; coalesce concurrent cold fetches. |
 | `Tiler` | Plan a tile, choose an overview, read the source window, warp when required, and render encoded bytes. |
-| `TileStyle` | Parse and validate titiler-style query parameters before rendering. |
+| `TileStyle` | Validate Raster Style JSON/Q2 and bind supported rendering capabilities. |
 | `MosaicTiler` | Find assets, open readers through a pool, warp each asset, reduce overlapping pixels, and render once. |
 | `CpuLimiter` | Bound CPU-heavy blocking work across readers and tilers. |
 
@@ -49,8 +49,10 @@ flowchart LR
 5. Same-CRS tiles use an affine fast path. Cross-CRS tiles use an inverse warp;
    EPSG:4326 ↔ EPSG:3857 has a closed-form fast path, while other pairs require
    the `proj` feature.
-6. The render pipeline applies nodata, scaling, optional band math, rescaling,
-   colormaps or RGB composition, and the requested output encoder.
+6. Source nodata is excluded before interpolation. The Raster Style pipeline
+   evaluates channels, applies fixed-range stretching, Gamma, color mapping and
+   opacity, then encodes PNG or lossless WebP. Metadata scale/offset calibration
+   is currently rejected.
 
 ## Concurrency model {#concurrency}
 

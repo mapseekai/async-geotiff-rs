@@ -32,7 +32,6 @@ use crate::request::{
 use crate::resource::WorkBudget;
 use crate::style::params::compile_cached;
 use crate::style::TileStyle;
-use crate::tiler::render_composite;
 use crate::tiler::Tiler;
 use crate::tms::TileCoord;
 
@@ -270,20 +269,13 @@ impl<S: MosaicSource> MosaicTiler<S> {
         self.pool.invalidate(key, source_id).await;
     }
 
-    /// Render one mosaicked tile. `style` is shared by all assets but
-    /// applies in two phases: read/warp params (resampling/reproject,
-    /// request nodata and per-source unscale) per-asset; render params once on
-    /// the composite. Multiple assets use composite-tile statistics for stretch;
-    /// one asset preserves the single-source dataset-statistics behavior.
+    /// Render one mosaicked tile using the document's mosaic selection and stage.
+    /// Read/warp each asset, merge before or after channel expressions, then
+    /// apply stretch, colors, Gamma and opacity once to the result.
     /// Required asset failures and fan-out overflow return errors, never partial tiles.
     /// `First` does not open lower-priority assets once coverage is complete.
-    pub async fn tile(
-        &self,
-        coord: TileCoord,
-        selection: PixelSelection,
-        style: &TileStyle,
-    ) -> AgResult<Option<Bytes>> {
-        self.tile_with_options(coord, selection, style, &RequestOptions::default())
+    pub async fn tile(&self, coord: TileCoord, style: &TileStyle) -> AgResult<Option<Bytes>> {
+        self.tile_with_options(coord, style, &RequestOptions::default())
             .await
     }
 
@@ -291,7 +283,6 @@ impl<S: MosaicSource> MosaicTiler<S> {
     pub async fn tile_with_options(
         &self,
         coord: TileCoord,
-        selection: PixelSelection,
         style: &TileStyle,
         options: &RequestOptions,
     ) -> AgResult<Option<Bytes>> {
@@ -299,8 +290,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
             .run(self.cfg.request_timeout, options, |context| async move {
                 self.work_budget
                     .run_request(&context, |attempt| async move {
-                        self.tile_in_request(coord, selection, style, &attempt)
-                            .await
+                        self.tile_in_request(coord, style, &attempt).await
                     })
                     .await
             })
@@ -310,17 +300,30 @@ impl<S: MosaicSource> MosaicTiler<S> {
     async fn tile_in_request(
         &self,
         coord: TileCoord,
-        selection: PixelSelection,
         style: &TileStyle,
         context: &RequestContext,
     ) -> AgResult<Option<Bytes>> {
+        let mosaic = style.raster.mosaic.as_ref().ok_or_else(|| {
+            AgError::query(
+                "/mosaic",
+                "multi-source requests require pixel_selection and stage",
+            )
+        })?;
+        let selection = mosaic.selection();
+        let raster_rank = mosaic.rank;
         let mut context = context.clone();
         context.check()?;
         let compiled = compile_cached(style).await?;
         if self.cfg.chunk_size == 0 {
             return Err(AgError::Mosaic("chunk_size must be non-zero".into()));
         }
-        let assets = self.source.assets_for_tile(coord).await?;
+        style.raster.statistics.check_scope(true)?;
+        let statistical = style.raster.stretch.needs_statistics();
+        let assets = if statistical {
+            self.source.statistics_assets().await?
+        } else {
+            self.source.assets_for_tile(coord).await?
+        };
         context.check()?;
         if assets.is_empty() {
             return Ok(None);
@@ -334,22 +337,19 @@ impl<S: MosaicSource> MosaicTiler<S> {
                 assets.len()
             )));
         }
-        if assets.len() == 1 {
-            let asset = &assets[0];
-            let reader = self.pool.get_or_open(&asset.url, &asset.source_id).await?;
-            context.check()?;
-            return Tiler::new(reader)
-                .with_request_limiter(self.requests.clone())
-                .with_work_budget(self.work_budget.clone())
-                .tile_in_request(coord, style, &context)
-                .await;
-        }
-
         let mut reducer: Option<Reducer<NonEmptyReducer>> = None;
+        let raster = if statistical {
+            let mut readers = Vec::with_capacity(assets.len());
+            for asset in &assets {
+                context.check()?;
+                readers.push(self.pool.get_or_open(&asset.url, &asset.source_id).await?);
+            }
+            crate::style::statistics::resolve(style, &readers, true, &context).await?
+        } else {
+            compiled.raster.clone()
+        };
         let mut fed = 0usize;
         let mut retained_bytes = 0usize;
-        let selected_bands = compiled.bidx.as_slice();
-
         // First usually needs only one STAC scene. Check coverage before opening
         // the next asset instead of speculatively downloading a whole chunk.
         let chunk_size = if selection == PixelSelection::First {
@@ -366,7 +366,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
                     let reader = self.pool.get_or_open(&a.url, &a.source_id).await?;
                     context.check()?;
                     let bands = u64::from(reader.data_ifd(0)?.samples_per_pixel())
-                        .max(selected_bands.len() as u64);
+                        .max(style.raster.mosaic_band_count() as u64);
                     // Warped image plus its temporary F64 reducer input.
                     // Streaming reducers release this after the chunk is fed;
                     // Median retains its samples until finish.
@@ -386,9 +386,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
                     let tiler = Tiler::new(reader)
                         .with_request_limiter(self.requests.clone())
                         .with_work_budget(self.work_budget.clone());
-                    let img = tiler
-                        .warp_tile_in_request(coord, style, &child, selected_bands)
-                        .await?;
+                    let img = tiler.warp_tile_in_request(coord, style, &child).await?;
                     Ok::<_, AgError>((img, reservation))
                 }
             });
@@ -448,7 +446,10 @@ impl<S: MosaicSource> MosaicTiler<S> {
                         cancellation.check()?;
                         match r.as_mut() {
                             Some(r) => r.feed(&img)?,
-                            None => r = Some(Reducer::new(selection).feed(&img)?),
+                            None => {
+                                let reducer = Reducer::new_raster(selection, raster_rank);
+                                r = Some(reducer.feed(&img)?);
+                            }
                         }
                         added += 1;
                     }
@@ -476,15 +477,6 @@ impl<S: MosaicSource> MosaicTiler<S> {
         // Bound the composite render with the same shared CPU limiter the
         // per-asset reads/warps used, so it doesn't add an unbounded blocking
         // job on top of the mosaic's CPU budget.
-        let mut style = style.clone();
-        let compiled = if selected_bands.is_empty() {
-            compiled
-        } else {
-            // Reduction already selected/reordered the original source bands.
-            // Statistics and rendering now index the resulting compact array.
-            style.bidx = (1..=selected_bands.len() as u32).collect();
-            compile_cached(&style).await?
-        };
         let permit = self.pool.cpu_limiter().acquire().await?;
         let cancellation = context.clone();
         let bytes = tokio::task::spawn_blocking(move || {
@@ -492,7 +484,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
             cancellation.check()?;
             let img = reducer.finish()?;
             cancellation.check()?;
-            render_composite(&img, &style, &compiled)
+            raster.render_mosaic(&img, compiled.format)
         })
         .await
         .map_err(|e| AgError::Mosaic(format!("render join: {e}")))??;
@@ -518,6 +510,13 @@ fn median_retained_bytes(
 
 #[cfg(test)]
 mod tests {
+    fn mosaic_style(selection: PixelSelection, style: &TileStyle) -> TileStyle {
+        let mut document: serde_json::Value =
+            serde_json::from_str(style.raster_style_json()).unwrap();
+        document["mosaic"] = serde_json::json!({"pixel_selection": format!("{selection:?}").to_lowercase(), "stage": "after_channels"});
+        TileStyle::from_json(&document.to_string()).unwrap()
+    }
+
     use super::*;
     use crate::bounds::Bbox;
     use crate::io::CogReader;
@@ -586,23 +585,20 @@ mod tests {
                 y,
             };
             for query in [
-                "",
-                "bidx=1",
-                "stretch=minmax",
-                "stretch=percent&pc=10,90",
-                "unscale=true",
-                "expression=b1*2",
-                "bidx=1&rescale=0,200&colormap_name=viridis",
-                "nodata=100&reproject=bilinear",
+                "version=2.0&type=gray&bidx=1",
+                "version=2.0&type=gray&bidx=1&method=linear&rescale=0,1000",
+                "version=2.0&type=gray&expression=b1*2",
+                "version=2.0&type=pseudocolor&bidx=1&rescale=0,200&colormap_name=viridis&method=linear",
+                "version=2.0&type=gray&nodata=100&reproject=bilinear&bidx=1",
             ] {
-                let style = TileStyle::from_query(query).unwrap();
+                let style = TileStyle::from_raster_query(query).unwrap();
                 let expected = single
                     .tile(coord, &style)
                     .await
                     .unwrap()
                     .expect("fixture must cover tile");
                 let actual = m
-                    .tile(coord, PixelSelection::First, &style)
+                    .tile(coord, &mosaic_style(PixelSelection::First, &style))
                     .await
                     .unwrap()
                     .expect("asset must render");
@@ -632,7 +628,10 @@ mod tests {
             y: 398,
         };
         assert!(mosaic
-            .tile(coord, PixelSelection::Mean, &TileStyle::default())
+            .tile(
+                coord,
+                &mosaic_style(PixelSelection::Mean, &TileStyle::default())
+            )
             .await
             .unwrap()
             .is_some());
@@ -670,7 +669,10 @@ mod tests {
             y: 0,
         };
         let error = mosaic
-            .tile(coord, PixelSelection::Mean, &TileStyle::default())
+            .tile(
+                coord,
+                &mosaic_style(PixelSelection::Mean, &TileStyle::default()),
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeding limit"));
@@ -697,7 +699,10 @@ mod tests {
             y: 398,
         };
         assert!(mosaic
-            .tile(coord, PixelSelection::Mean, &TileStyle::default())
+            .tile(
+                coord,
+                &mosaic_style(PixelSelection::Mean, &TileStyle::default())
+            )
             .await
             .is_err());
     }
@@ -734,7 +739,10 @@ mod tests {
         };
         assert!(matches!(
             mosaic
-                .tile(coord, PixelSelection::First, &TileStyle::default())
+                .tile(
+                    coord,
+                    &mosaic_style(PixelSelection::First, &TileStyle::default())
+                )
                 .await,
             Err(AgError::DeadlineExceeded)
         ));
@@ -757,7 +765,10 @@ mod tests {
                 y: 398,
             };
             assert!(mosaic
-                .tile(coord, PixelSelection::Mean, &TileStyle::default())
+                .tile(
+                    coord,
+                    &mosaic_style(PixelSelection::Mean, &TileStyle::default())
+                )
                 .await
                 .unwrap()
                 .is_some());
@@ -778,7 +789,7 @@ mod tests {
     async fn mosaic_with_no_assets_returns_none() {
         // No asset covers the tile → "no tile", not a synthesised blank one.
         let m = MosaicTiler::new(NoAssets);
-        let style = TileStyle::from_query("").unwrap();
+        let style = TileStyle::from_raster_query("version=2.0&type=gray&bidx=1").unwrap();
         let out = m
             .tile(
                 TileCoord {
@@ -787,8 +798,7 @@ mod tests {
                     x: 0,
                     y: 0,
                 },
-                PixelSelection::First,
-                &style,
+                &mosaic_style(PixelSelection::First, &style),
             )
             .await
             .unwrap();
@@ -803,10 +813,9 @@ mod tests {
             x: 0,
             y: 0,
         };
-        let mut style = TileStyle::default();
-        style.tilesize = 0;
+        let style = TileStyle::default();
         assert!(MosaicTiler::new(NoAssets)
-            .tile(coord, PixelSelection::First, &style)
+            .tile(coord, &style)
             .await
             .is_err());
         let mosaic = MosaicTiler::builder(NoAssets)
@@ -816,7 +825,10 @@ mod tests {
             })
             .build();
         assert!(mosaic
-            .tile(coord, PixelSelection::First, &TileStyle::default())
+            .tile(
+                coord,
+                &mosaic_style(PixelSelection::First, &TileStyle::default())
+            )
             .await
             .is_err());
     }
@@ -836,7 +848,10 @@ mod tests {
             y: 0,
         };
         assert!(mosaic
-            .tile(coord, PixelSelection::First, &TileStyle::default())
+            .tile(
+                coord,
+                &mosaic_style(PixelSelection::First, &TileStyle::default())
+            )
             .await
             .is_err());
     }

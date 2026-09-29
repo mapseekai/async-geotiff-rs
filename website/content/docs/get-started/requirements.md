@@ -6,7 +6,7 @@ weight: 10
 
 ## Library and examples {#library}
 
-- Rust 1.88 or newer, matching `Cargo.toml`.
+- Rust 1.92 or newer, matching `Cargo.toml`.
 - The default feature set requires system `libproj` 9.x.
 - Git is required when working from the repository.
 

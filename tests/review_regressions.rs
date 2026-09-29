@@ -26,7 +26,7 @@ fn image(pixels: PixelData, mask: Option<Array2<bool>>) -> ImageData {
 }
 
 fn alphas(image: &ImageData, query: &str) -> Vec<u8> {
-    let style = compile(&TileStyle::from_query(query).unwrap()).unwrap();
+    let style = compile(&TileStyle::from_raster_query(query).unwrap()).unwrap();
     let bytes = render(image, &style).unwrap();
     image::load_from_memory(&bytes)
         .unwrap()
@@ -43,12 +43,15 @@ fn fractional_nodata_does_not_mask_integer_rgb() {
         None,
     );
     for query in [
-        "nodata=1.5",
-        "nodata=1.5&bidx=1&bidx=2&bidx=3&color_formula=gamma%20RGB%201",
+        "version=2.0&type=rgb&nodata=1.5&bidx=1&bidx=2&bidx=3",
+        "version=2.0&type=rgb&nodata=1.5&bidx=1&bidx=2&bidx=3&color_formula=gamma%20rgb%201",
     ] {
         assert_eq!(alphas(&img, query), vec![255], "{query}");
     }
-    assert_eq!(alphas(&img, "nodata=1"), vec![0]);
+    assert_eq!(
+        alphas(&img, "version=2.0&type=rgb&nodata=1&bidx=1&bidx=2&bidx=3"),
+        vec![0]
+    );
 }
 
 #[test]
@@ -63,7 +66,13 @@ fn rgb_render_honors_strided_masks() {
             PixelData::U8(Array3::from_elem((3, 2, 2), 100)),
             PixelData::U16(Array3::from_elem((3, 2, 2), 100)),
         ] {
-            assert_eq!(alphas(&image(pixels, Some(mask.clone())), ""), expected);
+            assert_eq!(
+                alphas(
+                    &image(pixels, Some(mask.clone())),
+                    "version=2.0&type=rgb&bidx=1&bidx=2&bidx=3"
+                ),
+                expected
+            );
         }
     }
 }
@@ -71,9 +80,9 @@ fn rgb_render_honors_strided_masks() {
 #[test]
 fn generic_render_masks_infinite_nodata() {
     for (sentinel, query) in [
-        (f32::INFINITY, "nodata=inf"),
-        (f32::NEG_INFINITY, "nodata=-inf"),
-        (f32::NAN, "nodata=nan"),
+        (f32::INFINITY, "version=2.0&type=gray&bidx=1"),
+        (f32::NEG_INFINITY, "version=2.0&type=gray&bidx=1"),
+        (f32::NAN, "version=2.0&type=gray&nodata=nan&bidx=1"),
     ] {
         let img = image(
             PixelData::F32(Array3::from_shape_vec((1, 1, 2), vec![sentinel, 10.0]).unwrap()),
@@ -164,7 +173,10 @@ async fn passthrough_uses_the_destination_grid() {
         .unwrap();
     let reader = Arc::new(CogReader::open_object_store(store, "a").await.unwrap());
     let image = Tiler::new(reader)
-        .warp_tile(coord(), &TileStyle::from_query("tilesize=64").unwrap())
+        .warp_tile(
+            coord(),
+            &TileStyle::from_raster_query("version=2.0&type=gray&tilesize=64&bidx=1").unwrap(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -177,6 +189,13 @@ async fn passthrough_uses_the_destination_grid() {
 
 #[cfg(feature = "mosaic")]
 mod mosaic {
+    fn mosaic_style(selection: PixelSelection, style: &TileStyle) -> TileStyle {
+        let mut document: serde_json::Value =
+            serde_json::from_str(style.raster_style_json()).unwrap();
+        document["mosaic"] = serde_json::json!({"pixel_selection": format!("{selection:?}").to_lowercase(), "stage": "after_channels"});
+        TileStyle::from_json(&document.to_string()).unwrap()
+    }
+
     use super::*;
     use async_geotiff::mosaic::{
         AssetRef, Backend, MosaicJsonSource, MosaicSource, MosaicTiler, PixelSelection,
@@ -184,6 +203,9 @@ mod mosaic {
     struct Fixed(Vec<AssetRef>);
     #[async_trait::async_trait]
     impl MosaicSource for Fixed {
+        async fn statistics_assets(&self) -> async_geotiff::error::AgResult<Vec<AssetRef>> {
+            Ok(self.0.clone())
+        }
         async fn assets_for_tile(
             &self,
             _: TileCoord,
@@ -225,6 +247,148 @@ mod mosaic {
     }
 
     #[tokio::test]
+    async fn statistical_stretch_uses_complete_mosaic_after_both_stages() {
+        let mosaic = mosaic_with_nodata(0.0, false).await;
+        for stage in ["before_channels", "after_channels"] {
+            for selection in ["first", "mean", "median"] {
+                let style=TileStyle::from_raster_query(&format!("version=2.0&type=rgb&bidx=2&bidx=3&bidx=1&method=minmax&pixel_selection={selection}&stage={stage}&tilesize=64")).unwrap();
+                let bytes = mosaic.tile(coord(), &style).await.unwrap().unwrap();
+                assert!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .pixels()
+                        .all(|p| p.0 == [128, 128, 128, 255]),
+                    "{stage} {selection}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raster_mosaic_real_tiffs_support_all_methods_and_both_stages() {
+        let mosaic = mosaic_with_nodata(0.0, false).await;
+        for stage in ["before_channels", "after_channels"] {
+            for (method, expected) in [
+                ("first", [200, 30, 10, 128]),
+                (
+                    "highest",
+                    if stage == "before_channels" {
+                        [100, 40, 20, 128]
+                    } else {
+                        [200, 30, 10, 128]
+                    },
+                ),
+                (
+                    "lowest",
+                    if stage == "before_channels" {
+                        [200, 30, 10, 128]
+                    } else {
+                        [100, 40, 20, 128]
+                    },
+                ),
+                ("mean", [150, 35, 15, 128]),
+                ("median", [150, 35, 15, 128]),
+            ] {
+                let style = TileStyle::from_raster_query(&format!("version=2.0&type=rgb&bidx=2&bidx=3&bidx=1&tilesize=64&opacity=0.5&pixel_selection={method}&stage={stage}")).unwrap();
+                let bytes = mosaic.tile(coord(), &style).await.unwrap().unwrap();
+                let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+                assert!(image.pixels().all(|p| p.0 == expected), "{stage} {method}");
+            }
+        }
+        let style = TileStyle::from_raster_query(
+            "version=2.0&type=gray&bidx=2&tilesize=64&pixel_selection=mean&stage=before_channels",
+        )
+        .unwrap();
+        let mosaic = mosaic_with_nodata(0.0, true).await;
+        let bytes = mosaic.tile(coord(), &style).await.unwrap().unwrap();
+        assert!(image::load_from_memory(&bytes)
+            .unwrap()
+            .to_rgba8()
+            .pixels()
+            .all(|p| p.0 == [150, 150, 150, 255]));
+    }
+
+    #[tokio::test]
+    async fn raster_mosaic_short_circuit_failures_limits_and_selection_conflicts() {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("full"),
+                world_fixture(0.0, Some([10, 200, 30])).into(),
+            )
+            .await
+            .unwrap();
+        let assets: Vec<_> = ["full", "missing"]
+            .into_iter()
+            .map(|key| AssetRef {
+                url: key.into(),
+                source_id: key.into(),
+                bbox: Bbox::new(-180., -90., 0., 90.),
+            })
+            .collect();
+        let limiter = async_geotiff::request::RequestLimiter::new(1);
+        let budget = async_geotiff::resource::WorkBudget::new(64 * 1024 * 1024);
+        let mosaic = MosaicTiler::builder(Fixed(assets.clone()))
+            .backend(Backend::Store(store.clone()))
+            .request_limiter(limiter.clone())
+            .work_budget(budget.clone())
+            .build();
+        for stage in ["before_channels", "after_channels"] {
+            let style = TileStyle::from_raster_query(&format!("version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&tilesize=64&pixel_selection=first&stage={stage}")).unwrap();
+            let bytes = mosaic.tile(coord(), &style).await.unwrap().unwrap();
+            assert!(image::load_from_memory(&bytes)
+                .unwrap()
+                .to_rgba8()
+                .pixels()
+                .all(|p| p.0 == [10, 200, 30, 255]));
+
+            let required = TileStyle::from_raster_query(&format!(
+                "version=2.0&type=gray&bidx=1&tilesize=64&pixel_selection=mean&stage={stage}"
+            ))
+            .unwrap();
+            assert!(mosaic.tile(coord(), &required).await.is_err());
+            // A failed sibling may leave a blocking job draining; its admission
+            // stays held until completion, including on the next loop iteration.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while limiter.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(limiter.available_permits(), 1);
+        assert!(budget.peak_bytes() <= budget.limit_bytes());
+        drop(mosaic);
+        assert_eq!(budget.used_bytes(), 0);
+        let capped = MosaicTiler::builder(Fixed(assets))
+            .backend(Backend::Store(store))
+            .config(async_geotiff::mosaic::MosaicConfig {
+                max_assets_per_tile: 1,
+                ..Default::default()
+            })
+            .build();
+        let missing = TileStyle::from_raster_query("version=2.0&type=gray&bidx=1").unwrap();
+        assert!(capped
+            .tile(coord(), &missing)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("require"));
+        let style = TileStyle::from_raster_query(
+            "version=2.0&type=gray&bidx=1&pixel_selection=first&stage=before_channels",
+        )
+        .unwrap();
+        assert!(capped
+            .tile(coord(), &style)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeding limit"));
+    }
+
+    #[tokio::test]
     async fn first_stops_before_unneeded_assets() {
         let store = Arc::new(InMemory::new());
         for (name, samples) in [("empty", [0, 0, 0]), ("full", [10, 200, 30])] {
@@ -236,8 +400,10 @@ mod mosaic {
                 .await
                 .unwrap();
         }
-        let style =
-            TileStyle::from_query("tilesize=64&bidx=1&bidx=2&bidx=3&rescale=0,255").unwrap();
+        let style = TileStyle::from_raster_query(
+            "version=2.0&type=rgb&tilesize=64&bidx=1&bidx=2&bidx=3&rescale=0,255&method=linear",
+        )
+        .unwrap();
         for keys in [vec!["full", "missing"], vec!["empty", "full", "missing"]] {
             let assets = keys
                 .into_iter()
@@ -251,7 +417,7 @@ mod mosaic {
                 .backend(Backend::Store(store.clone()))
                 .build();
             let bytes = mosaic
-                .tile(coord(), PixelSelection::First, &style)
+                .tile(coord(), &mosaic_style(PixelSelection::First, &style))
                 .await
                 .expect("covered First tile must not open missing lower-priority assets")
                 .unwrap();
@@ -261,7 +427,7 @@ mod mosaic {
             }
             // Other reducers still require every asset and must propagate its failure.
             assert!(mosaic
-                .tile(coord(), PixelSelection::Mean, &style)
+                .tile(coord(), &mosaic_style(PixelSelection::Mean, &style))
                 .await
                 .is_err());
         }
@@ -291,8 +457,13 @@ mod mosaic {
         assert!(mosaic
             .tile(
                 coord(),
-                PixelSelection::First,
-                &TileStyle::from_query("tilesize=64&rescale=0,255").unwrap()
+                &mosaic_style(
+                    PixelSelection::First,
+                    &TileStyle::from_raster_query(
+                        "version=2.0&type=gray&tilesize=64&rescale=0,255&bidx=1&method=linear"
+                    )
+                    .unwrap()
+                )
             )
             .await
             .is_err());
@@ -325,23 +496,23 @@ mod mosaic {
             (
                 PixelSelection::Highest,
                 [200, 30, 10, 255],
-                [67, 67, 67, 255],
+                [200, 200, 200, 255],
             ),
             (
                 PixelSelection::Lowest,
                 [100, 40, 20, 255],
-                [182, 182, 182, 255],
+                [100, 100, 100, 255],
             ),
         ] {
             for (query, expected) in [
                 (
-                    "tilesize=64&bidx=2&bidx=3&bidx=1&rescale=0,255&rescale=0,255&rescale=0,255",
+                    "version=2.0&type=rgb&tilesize=64&bidx=2&bidx=3&bidx=1&rescale=0,255&rescale=0,255&rescale=0,255&method=linear",
                     expected_rgb,
                 ),
-                ("tilesize=64&bidx=2&rescale=0,255", expected_grey),
+                ("version=2.0&type=gray&tilesize=64&bidx=2&rescale=0,255&method=linear", expected_grey),
             ] {
                 let output = mosaic
-                    .tile(coord(), selection, &TileStyle::from_query(query).unwrap())
+                    .tile(coord(), &mosaic_style(selection, &TileStyle::from_raster_query(query).unwrap()))
                     .await
                     .unwrap()
                     .unwrap();
@@ -363,14 +534,16 @@ mod mosaic {
         for shift in [0.0, 0.01] {
             let mosaic = mosaic_with_nodata(shift, true).await;
             for query in [
-                "tilesize=64&bidx=2&rescale=0,255",
-                "tilesize=64&bidx=2&rescale=0,255&unscale=true",
+                "version=2.0&type=gray&tilesize=64&bidx=2&rescale=0,255&method=linear",
+                "version=2.0&type=gray&tilesize=64&bidx=2&rescale=0,255&method=linear",
             ] {
                 let output = mosaic
                     .tile(
                         coord(),
-                        PixelSelection::Highest,
-                        &TileStyle::from_query(query).unwrap(),
+                        &mosaic_style(
+                            PixelSelection::Highest,
+                            &TileStyle::from_raster_query(query).unwrap(),
+                        ),
                     )
                     .await
                     .unwrap()
@@ -381,7 +554,7 @@ mod mosaic {
                         .to_rgba8()
                         .get_pixel(32, 32)
                         .0,
-                    [67, 67, 67, 255],
+                    [200, 200, 200, 255],
                     "{shift} {query}"
                 );
             }
@@ -392,14 +565,8 @@ mod mosaic {
     async fn mosaic_accepts_nearly_aligned_assets() {
         let output = mosaic_with_nodata(1e-7, false)
             .await
-            .tile(
-                coord(),
-                PixelSelection::Mean,
-                &TileStyle::from_query(
-                    "tilesize=64&bidx=1&bidx=2&bidx=3&rescale=0,255&rescale=0,255&rescale=0,255",
-                )
-                .unwrap(),
-            )
+            .tile(coord(), &mosaic_style(PixelSelection::Mean, &TileStyle::from_raster_query("version=2.0&type=rgb&tilesize=64&bidx=1&bidx=2&bidx=3&rescale=0,255&rescale=0,255&rescale=0,255&method=linear")
+                .unwrap()))
             .await
             .unwrap()
             .unwrap();
@@ -500,7 +667,8 @@ fn cancelled_decode_keeps_admission_until_job_exits() {
                 tiler
                     .tile_with_options(
                         coord(),
-                        &TileStyle::from_query("tilesize=64").unwrap(),
+                        &TileStyle::from_raster_query("version=2.0&type=gray&tilesize=64&bidx=1")
+                            .unwrap(),
                         &options,
                     )
                     .await
@@ -558,11 +726,15 @@ fn cancelled_decode_keeps_admission_until_job_exits() {
 
 #[test]
 fn composite_get_masks_infinite_nodata() {
-    use async_geotiff::render::composite::{ColourDefinition, Composite, HandleGet};
-    let gradient =
-        Composite::from_definition(&ColourDefinition::Named("viridis".into()), None, None).unwrap();
     for nd in [f64::INFINITY, f64::NEG_INFINITY] {
-        assert_eq!(gradient.get(&[nd], Some(&[nd]))[3], 0);
+        let img = image(PixelData::F64(Array3::from_elem((1, 1, 1), nd)), None);
+        assert_eq!(
+            alphas(
+                &img,
+                "version=2.0&type=pseudocolor&bidx=1&colormap_name=viridis"
+            ),
+            vec![0]
+        );
     }
 }
 
@@ -634,4 +806,65 @@ async fn point_masks_infinite_nodata() {
             .unwrap()
             .valid
     );
+}
+
+#[tokio::test]
+async fn incompatible_statistics_scope_errors_even_outside_coverage() {
+    let store = Arc::new(InMemory::new());
+    store
+        .put(&ObjectPath::from("scope"), world_fixture(0., None).into())
+        .await
+        .unwrap();
+    let reader = Arc::new(CogReader::open_object_store(store, "scope").await.unwrap());
+    let style = TileStyle::from_json(r#"{"version":"2.0","renderer":{"type":"gray","bidx":[1]},"stretch":{"method":"minmax"},"statistics":{"scope":"mosaic","accuracy":"exact"}}"#).unwrap();
+    let outside = TileCoord { x: 1, ..coord() };
+    let error = Tiler::new(reader).tile(outside, &style).await.unwrap_err();
+    assert!(
+        error.to_string().contains("requires dataset statistics"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn statistical_stretch_is_shared_across_dataset_tiles() {
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("stats"),
+            world_fixture(0., Some([10, 20, 30])).into(),
+        )
+        .await
+        .unwrap();
+    let reader = Arc::new(CogReader::open_object_store(store, "stats").await.unwrap());
+    let tiler = Tiler::new(reader);
+    for method in [
+        "minmax",
+        "percentile&percentiles=2,98",
+        "stddev&stddev=2",
+        "histogram_equalization",
+    ] {
+        let style = TileStyle::from_raster_query(&format!(
+            "version=2.0&type=gray&bidx=2&method={method}&tilesize=64"
+        ))
+        .unwrap();
+        for coord in [
+            coord(),
+            TileCoord {
+                tms: TileMatrixSet::WorldCrs84Quad,
+                z: 1,
+                x: 0,
+                y: 0,
+            },
+        ] {
+            let bytes = tiler.tile(coord, &style).await.unwrap().unwrap();
+            assert!(
+                image::load_from_memory(&bytes)
+                    .unwrap()
+                    .to_rgba8()
+                    .pixels()
+                    .all(|p| p.0 == [128, 128, 128, 255]),
+                "{method}"
+            );
+        }
+    }
 }

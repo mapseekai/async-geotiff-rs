@@ -19,31 +19,30 @@ HTTP API 属于 `examples/serve.rs`，不会进入库本身的依赖表面。
 | `GET`、`HEAD /data/{name}` | 通过范围请求提供本地 TIFF。 |
 
 支持的 TMS 名称是 `WebMercatorQuad` 和 `WorldCRS84Quad`。扩展名支持 `png`，
-以及 feature 控制的 `webp`、`jpg`、`jpeg`。
+以及 feature 控制的无损 `webp`。
 
-## 样式参数 {#parameters}
+## Raster Style Q2 {#parameters}
 
-| 参数 | 可重复 | 默认值或示例 | 含义 |
-| --- | ---: | --- | --- |
-| `bidx` | 是 | `bidx=1&bidx=2&bidx=3` | 从 1 开始的源波段选择。 |
-| `expression` | 否 | `(b5-b4)/(b5+b4)` | 生成一个派生波段的算术表达式。 |
-| `rescale` | 是 | `0,3000` | 显式逐波段 `min,max`，拉伸优先级最高。 |
-| `stretch` | 否 | `minmax`、`percent`、`stddev` | 自动拉伸模式。 |
-| `pc` | 否 | `2,98` | `stretch=percent` 使用的百分位裁剪。 |
-| `sigma` | 否 | `2.0` | 标准差倍数。 |
-| `nodata` | 否 | `nan`、`inf`、`-inf` 或浮点数 | 覆盖数据集 nodata。 |
-| `colormap_name` | 否 | `viridis` | 内置单波段色带。 |
-| `color_formula` | 否 | `gamma RGB 1.5` | 支持的 rio-color 操作序列。 |
-| `resampling` | 否 | `nearest` | 源读取或缩放重采样核。 |
-| `reproject` | 否 | `nearest` | 重投影阶段的重采样核。 |
-| `tilesize` | 否 | `256` | 64、128、256、512 或 1024。 |
-| `format` | 否 | `png` | 可选格式断言，必须与路径扩展名一致。 |
+两条瓦片路由只接受完整 Q2：`version=2.0&type=...`。未知字段、旧格式和未实现能力报错。
+`dataset`、`mode`、`_v` 是独立请求上下文，不能重复；资产地址不属于样式。
 
-重采样核包括 `nearest`、`bilinear`、`cubic`、`cubic_spline`、`lanczos` 和
-`average`。average 下采样时计算盒式均值，上采样时使用 nearest 行为。
+| 参数 | 是否可重复 | 含义 |
+| --- | --- | --- |
+| `version` / `type` | 否 | `2.0` 与 gray/rgb/pseudocolor/categorized/single_color。 |
+| `bidx` | 是 | 从 1 开始的源波段索引，RGB 恰好三个。 |
+| `expression` | 否 | 灰度一个表达式；RGB 三个分号分隔的表达式；与 bidx 互斥。 |
+| `method` / `rescale` | 范围可重复 | none、linear、minmax、percentile、stddev、histogram_equalization、curve；参数与共享统计网格见样式指南。 |
+| `colormap_name` / `colormap` | 否 | 伪彩色色表；原生色表是精确值或半开区间。 |
+| `nodata` | 否 | 有限数值或 nan。 |
+| `color_formula` | 是 | 已支持 Gamma 操作，按顺序应用。 |
+| `opacity` | 否 | 0–1，默认 1。 |
+| `resampling` / `reproject` | 否 | nearest、bilinear、cubic、cubic_spline、lanczos、average。 |
+| `tilesize` | 否 | 64、128、256（默认）、512、1024。 |
+| `format` / `lossless` | 否 | png（默认）或 webp&lossless=true；format 必须与路径一致。 |
+| `pixel_selection` / `stage` | 否 | mosaic 必填；first/highest/lowest/mean/median 与 before_channels/after_channels。 |
+| `rank_channel` | 否 | highest/lowest 的排序通道位置，从 1 开始。 |
 
-镶嵌瓦片路由还接受 `pixel_selection=first`、`highest`、`lowest`、`mean` 或
-`median`，默认值为 `first`。
+原始 Q2 中 `+` 必须编码为 `%2B`；不能先解码后直接拼接。样式语义与限制见[样式指南](../../guides/styling/)。
 
 ## 响应 {#responses}
 

@@ -41,6 +41,7 @@
         backdrop-filter: blur(12px);
       }
 
+      .field[hidden] { display: none; }
       .field {
         display: grid;
         gap: 4px;
@@ -162,6 +163,18 @@
         </select>
       </div>
       <div class="field">
+        <label for="stage">Merge stage</label>
+        <select id="stage" name="stage">
+          <option value="before_channels">Before band math</option>
+          <option value="after_channels">After band math</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="rank_channel">Rank channel</label>
+        <input id="rank_channel" name="rank_channel" type="number" min="1" step="1" value="1"
+               title="Channel position at the selected merge stage, starting at 1">
+      </div>
+      <div class="field">
         <label for="colormap">Colormap</label>
         <select id="colormap" name="colormap_name">
           <option value="">greys</option>
@@ -175,22 +188,31 @@
       </div>
       <div class="field">
         <label for="stretch">Stretch</label>
-        <select id="stretch" name="stretch">
-          <option value="auto">auto (stddev 2σ)</option>
-          <option value="custom">custom (rescale)</option>
-          <option value="minmax">min/max</option>
-          <option value="percent">percentile</option>
-          <option value="stddev">mean ± kσ</option>
+        <select id="stretch" name="method">
+          <option value="none">none (0–255)</option>
+          <option value="linear">linear (rescale)</option>
+          <option value="minmax">minmax</option>
+          <option value="percentile">percentile</option>
+          <option value="stddev">standard deviation</option>
+          <option value="histogram_equalization">histogram equalization</option>
+          <option value="curve">curve</option>
         </select>
-      </div>
-      <div class="field">
-        <label for="stretchArg" id="stretchArgLabel">pc / σ</label>
-        <input id="stretchArg" type="text" autocomplete="off" spellcheck="false"
-               placeholder="2,98 or 2.5">
       </div>
       <div class="field wide">
         <label for="rescale">Rescale</label>
         <input id="rescale" name="rescale" type="text" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field" id="percentiles-field" hidden>
+        <label for="percentiles">Percentiles (low, high)</label>
+        <input id="percentiles" name="percentiles" type="text" value="2,98" />
+      </div>
+      <div class="field" id="stddev-field" hidden>
+        <label for="stddev">Standard deviations</label>
+        <input id="stddev" name="stddev" type="number" min="0.000001" step="any" value="2" />
+      </div>
+      <div class="field wide" id="curves-field" hidden>
+        <label for="curves">Curves ([[x,u],…] per channel)</label>
+        <input id="curves" name="curves" type="text" value="[[[0,0],[128,0.5],[255,1]]]" />
       </div>
       <div class="field">
         <label for="bidx">Bands</label>
@@ -253,9 +275,7 @@
         return controls.mode && controls.mode.value === "mosaic";
       }
 
-      // The server is titiler-style: the path extension drives the output
-      // format, and any ?format= must agree. Build the path with the selected
-      // extension so .webp/.jpg requests aren't rejected against a .png path.
+      // Path extension and Raster Style image.format must agree.
       function currentExt() {
         return (controls.format && controls.format.value) || "png";
       }
@@ -273,10 +293,14 @@
         basemap: document.getElementById("basemap"),
         mode: document.getElementById("mode"),
         pixelSelection: document.getElementById("pixel_selection"),
+        stage: document.getElementById("stage"),
+        rankChannel: document.getElementById("rank_channel"),
         colormap: document.getElementById("colormap"),
         stretch: document.getElementById("stretch"),
-        stretchArg: document.getElementById("stretchArg"),
         rescale: document.getElementById("rescale"),
+        percentiles: document.getElementById("percentiles"),
+        stddev: document.getElementById("stddev"),
+        curves: document.getElementById("curves"),
         bidx: document.getElementById("bidx"),
         expression: document.getElementById("expression"),
         ndvi: document.getElementById("ndvi"),
@@ -289,13 +313,15 @@
 
       controls.mode.value = pageParams.get("mode") ?? SERVER_DEFAULT_MODE;
       controls.pixelSelection.value = pageParams.get("pixel_selection") ?? "first";
+      controls.stage.value = pageParams.get("stage") ?? "before_channels";
+      controls.rankChannel.value = pageParams.get("rank_channel") ?? "1";
       controls.colormap.value = pageParams.get("colormap_name") ?? "";
-      controls.stretch.value =
-        pageParams.get("stretch") ??
-        (pageParams.getAll("rescale").length ? "custom" : "auto");
-      controls.stretchArg.value =
-        pageParams.get("pc") ?? pageParams.get("sigma") ?? "";
+      controls.stretch.value = pageParams.get("method") ?? "none";
       controls.rescale.value = pageParams.getAll("rescale").join(";") || "0,255;0,255;0,255";
+      for (const field of ["percentiles", "stddev", "curves"]) {
+        const value = pageParams.get(field);
+        if (value !== null) controls[field].value = value;
+      }
       controls.bidx.value = pageParams.getAll("bidx").join(",");
       let rgbPresetPending = pageParams.get("mode") !== "mosaic" && controls.bidx.value.replace(/\s/g, "") === "1,2,3";
       controls.expression.value = pageParams.get("expression") ?? "";
@@ -347,6 +373,32 @@
           .forEach((item) => params.append(name, item));
       }
 
+      let datasetBands = 1;
+      function protocolParams(params) {
+        params.set("version", "2.0");
+        if (isMosaic()) {
+          params.set("stage", controls.stage.value);
+          if (["highest", "lowest"].includes(controls.pixelSelection.value)) params.set("rank_channel", controls.rankChannel.value || "1");
+        }
+        const expression = params.get("expression");
+        if (!expression && !params.has("bidx")) {
+          const bands = controls.colormap.value || datasetBands < 3 ? [1] : [1,2,3];
+          for (const band of bands) params.append("bidx", String(band));
+        }
+        const count = expression ? expression.split(";").length : params.getAll("bidx").length;
+        params.set("type", count === 3 ? "rgb" : (controls.colormap.value ? "pseudocolor" : "gray"));
+        if (count === 3) params.delete("colormap_name");
+        params.set("method", controls.stretch.value);
+        params.set("opacity", controls.opacity.value);
+        if (count === 1 && params.getAll("rescale").length > 1) {
+          const first = params.get("rescale"); params.delete("rescale"); params.append("rescale", first);
+        }
+        params.set("format", controls.format.value || "png");
+        if (controls.format.value === "webp") params.set("lossless", "true");
+        params.sort();
+        return params;
+      }
+
       function tileParams() {
         const params = new URLSearchParams();
         params.set("mode", isMosaic() ? "mosaic" : "single");
@@ -365,56 +417,34 @@
             appendRepeated(params, "bidx", controls.bidx.value, ",");
           }
         }
-        // Auto means the advertised global mean ± 2σ stretch, not the U8 raw-value fast path.
-        // Explicitly send it so every tile resolves the same dataset statistics.
-        const mode = controls.stretch.value;
-        const arg = controls.stretchArg.value.trim();
-        if (mode === "custom") {
-          const ranges = controls.rescale.value
-            .split(";")
-            .map((range) => range.trim())
-            .filter(Boolean);
-          for (const range of expression ? ranges.slice(0, 1) : ranges) {
-            params.append("rescale", range);
-          }
-        } else if (mode === "minmax") {
-          params.set("stretch", "minmax");
-        } else if (mode === "percent") {
-          params.set("stretch", "percent");
-          if (arg) params.set("pc", arg);
-        } else if (mode === "stddev") {
-          params.set("stretch", "stddev");
-          if (arg) params.set("sigma", arg);
-        } else {
-          params.set("stretch", "stddev");
+        if (controls.stretch.value === "linear") {
+          appendRepeated(params, "rescale", controls.rescale.value, ";");
         }
+        if (controls.stretch.value === "percentile") params.set("percentiles", controls.percentiles.value);
+        if (controls.stretch.value === "stddev") params.set("stddev", controls.stddev.value);
+        if (controls.stretch.value === "curve") params.set("curves", controls.curves.value);
         if (controls.colormap.value) {
           params.set("colormap_name", controls.colormap.value);
         }
         params.set("resampling", controls.resampling.value);
         params.set("reproject", controls.resampling.value);
         params.set("tilesize", controls.tilesize.value || "256");
-        // Omit format=png so the default request stays byte-identical to the
-        // pre-format behaviour; only webp/jpg are sent explicitly.
-        const fmt = controls.format.value;
-        if (fmt && fmt !== "png") {
-          params.set("format", fmt);
-        }
-        return params;
+        return protocolParams(params);
       }
 
       // Bumped on every Apply. Appended only to the map's tile-source URL
       // (not the permalink) so a style change forces MapLibre AND the
       // browser HTTP cache to treat every zoom level's tiles as new —
       // otherwise cached overview/child tiles keep the previous style on
-      // zoom. The server ignores unknown query keys, so `_v` is inert.
+      // zoom. The server handles `_v` separately from style parameters.
       let styleVersion = 0;
       let rasterReady = false;
+      let styleReady = false;
 
       function tileUrl() {
         const params = tileParams();
         params.set("_v", String(styleVersion));
-        return `${tileOrigin()}${tilePath()}?${params.toString()}`;
+        return `${tileOrigin()}${tilePath()}?${params.toString().replace(/\+/g, "%20")}`;
       }
 
       function syncStatus() {
@@ -425,6 +455,8 @@
         const mosaic = isMosaic();
         controls.dataset.disabled = mosaic;
         controls.pixelSelection.disabled = !mosaic;
+        controls.stage.disabled = !mosaic;
+        controls.rankChannel.disabled = controls.stage.disabled || !["highest", "lowest"].includes(controls.pixelSelection.value);
       }
 
       function syncPermalink() {
@@ -436,7 +468,7 @@
         const center = map.getCenter();
         params.set("center", `${center.lng.toFixed(5)},${center.lat.toFixed(5)}`);
         params.set("zoom", map.getZoom().toFixed(2));
-        window.history.replaceState(null, "", `/maplibre?${params.toString()}`);
+        window.history.replaceState(null, "", `/maplibre?${params.toString().replace(/\+/g, "%20")}`);
       }
 
       const map = new maplibregl.Map({
@@ -460,7 +492,7 @@
         zoom: parseZoom()
       });
       function applyBasemap() {
-        if (!map.isStyleLoaded()) return;
+        if (!styleReady) return;
         if (map.getLayer("osm-raster")) map.removeLayer("osm-raster");
         if (controls.basemap.value === "osm") {
           map.addLayer(
@@ -469,7 +501,11 @@
           );
         }
       }
-      map.on("load", applyBasemap);
+      map.on("load", () => {
+        styleReady = true;
+        applyBasemap();
+        document.getElementById("style-form").requestSubmit();
+      });
 
 
       map.addControl(new maplibregl.NavigationControl(), "top-right");
@@ -478,17 +514,14 @@
       document.getElementById("style-form").addEventListener("submit", (event) => {
         event.preventDefault();
         if (!rasterReady && !isMosaic()) return;
-        if (!map.isStyleLoaded()) {
-          map.once("load", () => document.getElementById("style-form").requestSubmit());
-          return;
-        }
+        // Source loading must not block edits after the initial style is ready.
+        if (!styleReady) return;
         styleVersion += 1;
         // setTiles() only refreshes currently-visible tiles; MapLibre's
         // per-zoom tile pyramid keeps tiles fetched with the old URL, so
         // zooming reverts to the original style. Fully rebuild the source
         // and layer to invalidate the whole pyramid. Re-adding cog-raster
         // last keeps it above osm-raster.
-        const opacity = Number(controls.opacity.value);
         if (map.getLayer("cog-raster")) {
           map.removeLayer("cog-raster");
         }
@@ -507,20 +540,17 @@
           id: "cog-raster",
           type: "raster",
           source: "cog-raster",
-          paint: { "raster-opacity": opacity }
+          paint: { "raster-opacity": 1 }
         });
         syncStatus();
         syncPermalink();
       });
 
-      controls.opacity.addEventListener("input", () => {
-        if (map.getLayer("cog-raster")) map.setPaintProperty("cog-raster", "raster-opacity", Number(controls.opacity.value));
+      controls.opacity.addEventListener("change", () => {
+        document.getElementById("style-form").requestSubmit();
       });
 
-      // Populate the Format switcher from /formats. The server lists only
-      // formats this build can encode (PNG always; WebP/JPG only when the
-      // server was started with `--features webp,jpeg`), so we never offer a
-      // format that would 400 and break tiles. Falls back to PNG-only.
+      // The server advertises supported Raster Style output formats.
       (async function loadFormats() {
         const wanted = pageParams.get("format") ?? "png";
         try {
@@ -537,14 +567,7 @@
           }
           const has = formats.some((f) => f.value === wanted);
           controls.format.value = has ? wanted : "png";
-          const submitResolvedFormat = () => {
-            document.getElementById("style-form").requestSubmit();
-          };
-          if (map.isStyleLoaded()) {
-            submitResolvedFormat();
-          } else {
-            map.once("load", submitResolvedFormat);
-          }
+          document.getElementById("style-form").requestSubmit();
         } catch (err) {
           console.warn("format list unavailable", err);
         }
@@ -592,6 +615,7 @@
           if (controls.dataset.value !== ds) return;
           const bands = Number(r.headers.get("x-raster-bands"));
           if (Number.isInteger(bands) && bands > 0) {
+            datasetBands = bands;
             if (bands < 3 && controls.bidx.value.replace(/\s/g, "") === "1,2,3") {
               controls.bidx.value = "";
               const note = document.getElementById("band-note");
@@ -626,6 +650,7 @@
           document.getElementById("style-form").requestSubmit();
         }
       });
+      controls.pixelSelection.addEventListener("change", syncSourceUi);
       controls.mode.addEventListener("change", async () => {
         syncSourceUi();
         if (!isMosaic()) {
@@ -636,15 +661,12 @@
       });
 
 
-      // Reflect which companion arg the chosen stretch mode consumes,
-      // and disable the rescale box unless in custom mode.
       function syncStretchUi() {
-        const m = controls.stretch.value;
-        const label = document.getElementById("stretchArgLabel");
-        label.textContent = m === "percent" ? "pc (lo,hi)"
-          : m === "stddev" ? "σ (k)" : "pc / σ";
-        controls.stretchArg.disabled = !(m === "percent" || m === "stddev");
-        controls.rescale.disabled = m !== "custom";
+        controls.rescale.disabled = controls.stretch.value !== "linear";
+        for (const [field, method] of [["percentiles", "percentile"], ["stddev", "stddev"], ["curves", "curve"]]) {
+          controls[field].disabled = controls.stretch.value !== method;
+          document.getElementById(`${field}-field`).hidden = controls[field].disabled;
+        }
       }
 
       function isExpressionMode() {
@@ -659,7 +681,7 @@
       function applyNdvi() {
         controls.expression.value = "(b5-b4)/(b5+b4)";
         controls.bidx.value = "";
-        controls.stretch.value = "custom";
+        controls.stretch.value = "linear";
         controls.rescale.value = "-1,1";
         controls.colormap.value = "viridis";
         syncStretchUi();
@@ -683,10 +705,6 @@
       });
 
       map.on("moveend", syncPermalink);
-      map.on("load", () => {
-        syncStatus();
-        if (isMosaic()) document.getElementById("style-form").requestSubmit();
-      });
       syncStatus();
     </script>
   </body>

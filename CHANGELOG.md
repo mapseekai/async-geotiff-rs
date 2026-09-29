@@ -11,6 +11,32 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+- Add minmax, percentile, stddev, histogram equalization and curve stretch to
+  Raster Style and all three viewers. Statistical methods share a fixed full-footprint
+  grid across tiles; fixed MosaicJSON collections support both merge stages.
+- Fix viewer zoom controls covered by the toolbar and MapLibre Apply requests
+  being dropped while source tiles load.
+
+### ⚠️ BREAKING
+
+- Require Rust 1.92 and adopt `raster-style` 0.3.0 (protocol 2.0) for style
+  input. Use `TileStyle::from_json`, `from_raster_query` or `from_raster_style`.
+  Remove the legacy query parser, mutable style fields, `Stretch`,
+  `ColourDefinition`, `Colour`, `lut_from_stops` and `compile_validated` APIs.
+- HTTP tile requests require Q2 `version=2.0&type=...`. Old and unknown
+  parameters fail validation. The default is gray band 1 with a fixed 0–255
+  range; there is no implicit statistics-based stretch or metadata unscale.
+- Mosaic selection now belongs to the style document. Call
+  `mosaic.tile(coord, &style)` or `tile_with_options(coord, &style, &options)`.
+  Support five selection methods, before/after-channel stages and explicit
+  ranking channels with whole-tuple validity. `Tiler::warp_tile` returns compact
+  dependencies or evaluated channels instead of all source bands.
+- Reject unsupported protocol capabilities explicitly, including source Alpha,
+  external statistics snapshots, nontrivial calibration, terrain rendering, advanced
+  expressions/effects, JPEG and lossy WebP. The low-level JPEG encoder remains
+  available separately. Align HTTP, viewers, Rust examples and documentation
+  with the supported JSON/Q2 contract.
+
 ### Fixed
 
 - Recover tile/warp/mosaic requests from transient working-memory contention:

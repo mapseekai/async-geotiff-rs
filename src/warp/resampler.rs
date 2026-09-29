@@ -51,8 +51,8 @@ impl Resampling {
     }
 
     /// Like [`sample`] but skips invalid neighbours and renormalizes weights.
-    /// Cubic/Lanczos retain signed weights; non-positive or near-zero total
-    /// support returns `fill` to avoid unstable division at mask boundaries.
+    /// Cubic/Lanczos retain signed weights, including negative total support.
+    /// Zero total support or a non-finite result returns `fill`.
     #[inline]
     pub fn sample_masked(
         self,
@@ -123,6 +123,8 @@ impl Resampling {
                         Self::CubicSpline if x < 1.0 => (4.0 - 6.0 * x * x + 3.0 * x * x * x) / 6.0,
                         Self::CubicSpline if x < 2.0 => (2.0 - x).powi(3) / 6.0,
                         Self::Lanczos if x == 0.0 => 1.0,
+                        // Keep sinc's integer zeros exact at masked pixel centers.
+                        Self::Lanczos if x.fract() == 0.0 => 0.0,
                         Self::Lanczos if x < 3.0 => {
                             let p = std::f64::consts::PI * x;
                             (p.sin() / p) * ((p / 3.0).sin() / (p / 3.0))
@@ -147,8 +149,9 @@ impl Resampling {
                         total += k;
                     }
                 }
-                if total > 1e-12 {
-                    sum / total
+                let value = sum / total;
+                if total != 0.0 && value.is_finite() {
+                    value
                 } else {
                     fill
                 }
@@ -483,6 +486,42 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
     use ndarray::array;
+
+    #[test]
+    fn signed_kernel_support_preserves_valid_samples_and_rejects_zero_support() {
+        let values = array![[10.0, 20.0, 30.0, 40.0]];
+        let only_first = array![[true, false, false, false]];
+        let none = array![[false, false, false, false]];
+        for kernel in [Resampling::Cubic, Resampling::Lanczos] {
+            for col in [0.5, 1.5] {
+                assert_relative_eq!(
+                    kernel.sample_masked(values.view(), Some(only_first.view()), col, 0.0, -1.0),
+                    10.0,
+                    epsilon = 1e-12
+                );
+            }
+            for mask in [&only_first, &none] {
+                assert_eq!(
+                    kernel.sample_masked(values.view(), Some(mask.view()), 1.0, 0.0, -1.0),
+                    -1.0
+                );
+            }
+            let overflow = array![[-f64::MAX, f64::MAX, f64::MAX, -f64::MAX]];
+            assert_eq!(kernel.sample(overflow.view(), 1.5, 0.0, -1.0), -1.0);
+        }
+        // A small but nonzero B-spline weight is still valid support.
+        assert_relative_eq!(
+            Resampling::CubicSpline.sample_masked(
+                values.view(),
+                Some(only_first.view()),
+                1.9999,
+                0.0,
+                -1.0
+            ),
+            10.0,
+            epsilon = 1e-12
+        );
+    }
 
     #[test]
     fn nearest_at_pixel_corners() {

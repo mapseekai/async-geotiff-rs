@@ -1,6 +1,6 @@
 //! async-geotiff: pure-Rust async COG → XYZ tile renderer.
 //!
-//! See `docs/superpowers/specs/2026-05-14-async-geotiff-rs-design.md`.
+//! Style inputs use Raster Style 2.0 JSON/Q2; see [`style::TileStyle`].
 
 mod blocking;
 pub use blocking::CpuLimiter;

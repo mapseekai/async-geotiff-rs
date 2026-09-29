@@ -49,10 +49,10 @@ cargo run --release --example serve
 
 ## 可选输出格式 {#formats}
 
-PNG 始终可用。WebP 与 JPEG 需要显式启用：
+PNG 始终可用。无损 WebP 需要显式启用：
 
 ```bash
-cargo run --release --features webp,jpeg --example serve -- \
+cargo run --release --features webp --example serve -- \
   https://example.com/cog.tif
 ```
 
