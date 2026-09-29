@@ -319,11 +319,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
         }
         style.raster.statistics.check_scope(true)?;
         let statistical = style.raster.stretch.needs_statistics();
-        let assets = if statistical {
-            self.source.statistics_assets().await?
-        } else {
-            self.source.assets_for_tile(coord).await?
-        };
+        let assets = self.source.assets_for_tile(coord).await?;
         context.check()?;
         if assets.is_empty() {
             return Ok(None);
@@ -339,12 +335,27 @@ impl<S: MosaicSource> MosaicTiler<S> {
         }
         let mut reducer: Option<Reducer<NonEmptyReducer>> = None;
         let raster = if statistical {
-            let mut readers = Vec::with_capacity(assets.len());
-            for asset in &assets {
+            let statistics_assets = self.source.statistics_assets().await?;
+            if cap > 0 && statistics_assets.len() > cap {
+                return Err(AgError::Mosaic(format!(
+                    "statistics binds {} assets, exceeding limit {cap}",
+                    statistics_assets.len()
+                )));
+            }
+            let mut readers = Vec::with_capacity(statistics_assets.len());
+            for asset in &statistics_assets {
                 context.check()?;
                 readers.push(self.pool.get_or_open(&asset.url, &asset.source_id).await?);
             }
-            crate::style::statistics::resolve(style, &readers, true, &context).await?
+            crate::style::statistics::resolve(
+                style,
+                &readers,
+                true,
+                &self.pool.cpu_limiter(),
+                &self.work_budget,
+                &context,
+            )
+            .await?
         } else {
             compiled.raster.clone()
         };

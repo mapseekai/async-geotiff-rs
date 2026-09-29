@@ -1,4 +1,4 @@
-//! Regressions for MAP-209 through MAP-215; all fixtures are deterministic.
+//! Rendering, migration and resource regressions with deterministic fixtures.
 use async_geotiff::{
     bounds::{Bbox, GeoTransform},
     crs::Crs,
@@ -865,6 +865,193 @@ async fn statistical_stretch_is_shared_across_dataset_tiles() {
                     .all(|p| p.0 == [128, 128, 128, 255]),
                 "{method}"
             );
+        }
+    }
+}
+
+#[tokio::test]
+async fn statistics_respects_tiler_work_budget() {
+    use async_geotiff::resource::WorkBudget;
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("audit-stats"),
+            world_fixture(0., Some([10, 20, 30])).into(),
+        )
+        .await
+        .unwrap();
+    let mut cfg = async_geotiff::io::ReaderConfig::default();
+    let reader_budget = WorkBudget::new(512 * 1024 * 1024);
+    cfg.work_budget = reader_budget.clone();
+    let reader = Arc::new(
+        CogReader::builder()
+            .reader_config(cfg)
+            .open_object_store(store, "audit-stats")
+            .await
+            .unwrap(),
+    );
+    let tile_budget = WorkBudget::new(32 * 1024 * 1024);
+    let tiler = Tiler::new(reader).with_work_budget(tile_budget.clone());
+    let style =
+        TileStyle::from_raster_query("version=2.0&type=gray&bidx=2&method=minmax&tilesize=64")
+            .unwrap();
+    let result = tiler.tile(coord(), &style).await;
+    assert!(
+        matches!(result, Err(async_geotiff::error::AgError::ResourceLimit(_))),
+        "statistics grid exceeds configured 32 MiB tiler budget"
+    );
+}
+
+#[tokio::test]
+async fn statistics_cache_isolates_private_readers() {
+    use async_tiff::reader::ObjectReader;
+    let style =
+        TileStyle::from_raster_query("version=2.0&type=gray&bidx=2&method=minmax&tilesize=64")
+            .unwrap();
+    let mut outputs = Vec::new();
+    for value in [20, 100] {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("audit-cache"),
+                world_fixture(0., Some([10, value, 30])).into(),
+            )
+            .await
+            .unwrap();
+        // Explicit immutable opaque readers, independent default block caches.
+        let reader = CogReader::builder()
+            .source_id("local-dataset")
+            .snapshot_policy(async_geotiff::io::SnapshotPolicy::AssumeImmutable)
+            .open(ObjectReader::new(store, ObjectPath::from("audit-cache")))
+            .await
+            .unwrap();
+        let bytes = Tiler::new(Arc::new(reader))
+            .tile(coord(), &style)
+            .await
+            .unwrap()
+            .unwrap();
+        let rgba = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        outputs.push(rgba.get_pixel(32, 32).0);
+    }
+    assert_eq!(
+        outputs,
+        vec![[128, 128, 128, 255]; 2],
+        "each constant dataset needs its own range"
+    );
+}
+
+#[tokio::test]
+async fn sample_size_integer_valued_float_is_not_ignored() {
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("audit-float-sample"),
+            world_fixture(0., None).into(),
+        )
+        .await
+        .unwrap();
+    let reader = Arc::new(
+        CogReader::open_object_store(store, "audit-float-sample")
+            .await
+            .unwrap(),
+    );
+    let tiler = Tiler::new(reader);
+    let mut outputs = Vec::new();
+    for sample in ["1", "1.0", "q2"] {
+        let query_input = sample == "q2";
+        let sample = if query_input { "1" } else { sample };
+        let style=TileStyle::from_json(&format!(r#"{{"version":"2.0","renderer":{{"type":"gray","bidx":[2]}},"stretch":{{"method":"minmax"}},"statistics":{{"scope":"dataset","accuracy":"sample","sample_size":{sample}}},"image":{{"tilesize":64}}}}"#)).unwrap();
+        let style = if query_input {
+            let sdk =
+                async_geotiff::style::RasterStyle::from_json(&style.raster_style_json()).unwrap();
+            TileStyle::from_raster_query(&raster_style::encode_query(&sdk).unwrap()).unwrap()
+        } else {
+            style
+        };
+        let bytes = tiler.tile(coord(), &style).await.unwrap().unwrap();
+        let rgba = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let colors: std::collections::HashSet<_> =
+            rgba.pixels().filter(|p| p.0[3] > 0).map(|p| p.0).collect();
+        assert!(
+            colors.len() <= 3,
+            "one sampled value makes a degenerate minmax range with only 0,128,255"
+        );
+        assert!(!colors.is_empty());
+        assert!(colors.iter().all(|p| [0, 128, 255].contains(&p[0])));
+        outputs.push(rgba.into_raw());
+    }
+    assert!(
+        outputs.windows(2).all(|pair| pair[0] == pair[1]),
+        "JSON Schema integer-valued 1.0 must have same sampling as 1"
+    );
+}
+
+#[cfg(feature = "mosaic")]
+#[tokio::test]
+async fn statistical_mosaic_preserves_index_coverage() {
+    use async_geotiff::mosaic::{Backend, MosaicJsonSource, MosaicTiler};
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("audit-mosaic-coverage"),
+            world_fixture(0., Some([10, 20, 30])).into(),
+        )
+        .await
+        .unwrap();
+    let source=MosaicJsonSource::from_str(r#"{"mosaicjson":"0.0.3","minzoom":1,"maxzoom":10,"quadkey_zoom":1,"bounds":[-180,-90,0,90],"tiles":{"0":["audit-mosaic-coverage"]}}"#).unwrap();
+    let tiler = MosaicTiler::builder(source)
+        .backend(Backend::Store(store))
+        .build();
+    // Tile 2 is absent from index, but falls inside the raw TIFF footprint.
+    let coord = TileCoord {
+        tms: TileMatrixSet::WebMercatorQuad,
+        z: 1,
+        x: 0,
+        y: 1,
+    };
+    for method in ["none", "minmax"] {
+        let style=TileStyle::from_raster_query(&format!("version=2.0&type=gray&bidx=2&method={method}&pixel_selection=first&stage=before_channels&tilesize=64")).unwrap();
+        let output = tiler.tile(coord, &style).await.unwrap();
+        assert!(
+            output.is_none(),
+            "stretch must not create coverage absent from MosaicJSON index"
+        );
+    }
+}
+
+#[cfg(feature = "mosaic")]
+#[tokio::test]
+async fn statistical_mosaic_rejects_partitioned_collection() {
+    use async_geotiff::mosaic::{Backend, MosaicJsonSource, MosaicTiler};
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("constant"),
+            world_fixture(0., Some([10, 20, 30])).into(),
+        )
+        .await
+        .unwrap();
+    let style = TileStyle::from_raster_query("version=2.0&type=gray&bidx=2&method=minmax&pixel_selection=first&stage=before_channels&tilesize=64").unwrap();
+    let coord = TileCoord {
+        tms: TileMatrixSet::WebMercatorQuad,
+        z: 1,
+        x: 0,
+        y: 0,
+    };
+    for (zoom, key) in [(0, ""), (1, "0")] {
+        let document = serde_json::json!({"mosaicjson":"0.0.3","minzoom":0,"maxzoom":10,"quadkey_zoom":zoom,"bounds":[-180,-90,0,90],"tiles":{key:["constant"]}});
+        let source = MosaicJsonSource::from_str(&document.to_string()).unwrap();
+        let tiler = MosaicTiler::builder(source)
+            .backend(Backend::Store(store.clone()))
+            .build();
+        let result = tiler.tile(coord, &style).await;
+        if zoom == 0 {
+            let rgba = image::load_from_memory(&result.unwrap().unwrap())
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(rgba.get_pixel(32, 32).0, [128, 128, 128, 255]);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("quadkey_zoom=0"));
         }
     }
 }

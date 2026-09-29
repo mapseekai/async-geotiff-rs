@@ -101,14 +101,16 @@ Omitted statistics means dataset/mosaic scope, sample accuracy and a maximum of
 resolution source pixel. NoData samples are discarded without replacement. Empty
 statistics give transparent output; a constant range maps its value to 0.5.
 
-Statistics are shared across tiles and cached with source revision/order and the
+Statistics are shared across tiles and cached with reader instance/order and the
 full normalized style. CPU work, source reads and retained median inputs use the
 existing resource limits. Complete reads of the selected overview can be rejected
 when they exceed the work budget. Two cached plans bound retained CDF storage.
 
-MosaicJSON provides a complete fixed collection; statistical rendering uses that
-collection's global paint order. Custom `MosaicSource` implementations must provide
-`statistics_assets()`. Unbound dynamic STAC collections, viewport scope and external
+MosaicJSON with `quadkey_zoom=0` provides a complete fixed collection for statistics.
+Partitioned MosaicJSON statistical stretches fail explicitly: flattening its index
+would lose coverage masks and regional paint order. Tile rendering always uses the
+index-selected assets. Custom `MosaicSource` implementations must provide
+`statistics_assets()` whose full-footprint composite preserves tile selection semantics. Unbound dynamic STAC collections, viewport scope and external
 `statistics.ref` snapshots fail explicitly. Low-level `render(ImageData, ...)`
 requires a resolved plan for statistical methods; use the tilers to bind it.
 

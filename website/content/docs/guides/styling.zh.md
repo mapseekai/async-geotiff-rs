@@ -88,11 +88,13 @@ mask 从源继承；overview 根据各源完整范围和固定网格尺寸选择
 `statistics={"scope":"dataset","accuracy":"exact"}` 遍历**该绑定网格**所有像元，
 不表示遍历源数据原生分辨率的全部像元。无效采样丢弃且不补采；空统计输出透明；常量范围映射到 0.5。
 
-统计结果跨瓦片共享，缓存绑定源修订、顺序及完整规范化样式。统计计算、源读取和 median 保留输入
+统计结果跨瓦片共享，缓存绑定 reader 实例、顺序及完整规范化样式。统计计算、源读取和 median 保留输入
 受现有 CPU/内存预算约束；选定 overview 的完整读取超过预算时明确报错。最多缓存两个统计计划。
 
-MosaicJSON 提供固定完整源集合，统计拉伸按其全局绘制顺序执行。自定义 `MosaicSource` 需实现
-`statistics_assets()`；未绑定集合的动态 STAC、viewport 和外部 `statistics.ref` 暂报错。
+`quadkey_zoom=0` 的 MosaicJSON 提供固定完整源集合。分区 MosaicJSON 的统计拉伸暂报错，
+避免摊平索引后丢失覆盖范围和分区绘制顺序；瓦片始终使用索引选中的源。
+自定义 `MosaicSource` 的 `statistics_assets()` 必须提供与瓦片选择语义一致的完整合成集合。
+未绑定集合的动态 STAC、viewport 和外部 `statistics.ref` 暂报错。
 低层 `render(ImageData, ...)` 不能自行推断完整数据范围；统计类方法通过 tiler 绑定后执行。
 
 ## 表达式 {#expressions}

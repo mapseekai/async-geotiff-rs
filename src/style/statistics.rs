@@ -1,11 +1,13 @@
 //! Shared statistics on a fixed 1024² EPSG:4326 footprint grid, never tile-local.
 use super::{raster::RasterPlan, TileStyle};
 use crate::{
+    blocking::CpuLimiter,
     bounds::Bbox,
     crs::Crs,
     error::{AgError, AgResult},
     io::CogReader,
     request::RequestContext,
+    resource::WorkBudget,
 };
 use std::sync::{Arc, OnceLock};
 use tokio::sync::OnceCell;
@@ -17,6 +19,8 @@ pub(crate) async fn resolve(
     style: &TileStyle,
     readers: &[Arc<CogReader>],
     mosaic: bool,
+    cpu: &CpuLimiter,
+    budget: &WorkBudget,
     context: &RequestContext,
 ) -> AgResult<Arc<RasterPlan>> {
     style.raster.statistics.check_scope(mosaic)?;
@@ -34,7 +38,7 @@ pub(crate) async fn resolve(
         .get_with(key, async { Arc::new(OnceCell::new()) })
         .await;
     let result = entry
-        .get_or_try_init(|| compute(style, readers, mosaic, context))
+        .get_or_try_init(|| compute(style, readers, mosaic, cpu, budget, context))
         .await?;
     context.check()?;
     Ok(result.clone())
@@ -44,13 +48,13 @@ async fn compute(
     style: &TileStyle,
     readers: &[Arc<CogReader>],
     mosaic: bool,
+    cpu: &CpuLimiter,
+    budget: &WorkBudget,
     context: &RequestContext,
 ) -> AgResult<Arc<RasterPlan>> {
-    let first = readers
-        .first()
-        .ok_or_else(|| AgError::query("statistics", "no bound sources"))?;
-    let cpu = first.cpu_limiter();
-    let budget = first.work_budget();
+    if readers.is_empty() {
+        return Err(AgError::query("statistics", "no bound sources"));
+    }
     let permit = cpu.acquire().await?;
     let sources = readers.to_vec();
     let ctx = context.clone();
@@ -197,4 +201,64 @@ async fn compute(
     })
     .await
     .map_err(|e| AgError::Warp(format!("statistics resolve: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn statistics_waits_for_callers_cpu_limiter() {
+        use crate::request::{RequestLimiter, RequestOptions};
+        use object_store::{memory::InMemory, path::Path, ObjectStoreExt};
+        use std::time::Duration;
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &Path::from("fixture"),
+                bytes::Bytes::from_static(include_bytes!("../../tests/fixtures/rgb_nodata.tif"))
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let reader = Arc::new(
+            CogReader::builder()
+                .reader_config(crate::io::ReaderConfig {
+                    work_budget: WorkBudget::new(512 * 1024 * 1024),
+                    ..Default::default()
+                })
+                .open_object_store(store, "fixture")
+                .await
+                .unwrap(),
+        );
+        let reader_budget = reader.work_budget();
+        let baseline = reader_budget.peak_bytes();
+        let cpu = CpuLimiter::new(1);
+        let _held = cpu.acquire().await.unwrap();
+        let style =
+            TileStyle::from_raster_query("version=2.0&type=gray&bidx=2&method=minmax").unwrap();
+        let result = RequestLimiter::new(1)
+            .run(
+                Duration::from_millis(30),
+                &RequestOptions::default(),
+                |context| async move {
+                    compute(
+                        &style,
+                        &[reader],
+                        false,
+                        &cpu,
+                        &WorkBudget::new(512 * 1024 * 1024),
+                        &context,
+                    )
+                    .await
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(AgError::DeadlineExceeded)));
+        assert_eq!(
+            reader_budget.peak_bytes(),
+            baseline,
+            "statistics must not run using the reader's free CPU pool"
+        );
+    }
 }

@@ -190,6 +190,8 @@ pub struct CogReader {
     /// Logical source id; combined with level/kind/tile to key the shared
     /// block cache so identical tiles from the same source are reused.
     source_id: Arc<str>,
+    // Instance identity also isolates opaque readers with independently scoped source IDs.
+    statistics_id: u64,
     /// Shared decoded-block cache (may be shared across readers).
     block_cache: Arc<BlockCache>,
     /// Shared CPU-job limiter, covering decode + stitch here and warp + render
@@ -555,6 +557,7 @@ impl CogReader {
             alpha_bands,
             band_scale_offset,
             source_id: Arc::from(config.source_id.as_str()),
+            statistics_id: NEXT_SOURCE_ID.fetch_add(1, Ordering::Relaxed),
             block_cache: config.block_cache.clone(),
             cpu: config
                 .cpu_limiter
@@ -628,8 +631,8 @@ impl CogReader {
         &self.src_crs
     }
 
-    pub(crate) fn statistics_identity(&self) -> &str {
-        &self.source_id
+    pub(crate) fn statistics_identity(&self) -> u64 {
+        self.statistics_id
     }
 
     pub fn transform(&self) -> GeoTransform {

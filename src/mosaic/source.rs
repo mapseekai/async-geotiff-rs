@@ -35,6 +35,8 @@ pub trait MosaicSource: Send + Sync {
     async fn assets_for_tile(&self, coord: TileCoord) -> AgResult<Vec<AssetRef>>;
 
     /// Complete immutable source collection in paint order for shared statistics.
+    /// Its full-footprint composite must match the tile selection semantics;
+    /// sources with spatial index masks or regional ordering must return an error.
     /// Dynamic sources must bind a finite collection before enabling statistical stretch.
     async fn statistics_assets(&self) -> AgResult<Vec<AssetRef>> {
         Err(crate::error::AgError::query(

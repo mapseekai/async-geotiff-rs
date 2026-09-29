@@ -220,6 +220,13 @@ fn validate_document(doc: &mut MosaicJson) -> AgResult<()> {
 #[async_trait::async_trait]
 impl MosaicSource for MosaicJsonSource {
     async fn statistics_assets(&self) -> AgResult<Vec<AssetRef>> {
+        // A flat collection cannot represent per-quadkey coverage and paint order.
+        if self.quadkey_zoom != 0 {
+            return Err(AgError::query(
+                "statistics",
+                "MosaicJSON statistical stretch requires quadkey_zoom=0; partitioned statistics are unsupported",
+            ));
+        }
         self.assets_for_tile(TileCoord {
             tms: TileMatrixSet::WebMercatorQuad,
             z: 0,

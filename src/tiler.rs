@@ -403,6 +403,8 @@ impl Tiler {
             style,
             std::slice::from_ref(&self.reader),
             false,
+            &self.cpu,
+            &self.work_budget,
             context,
         )
         .await?;

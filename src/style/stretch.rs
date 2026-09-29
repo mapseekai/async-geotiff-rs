@@ -228,7 +228,8 @@ impl Statistics {
             sample_size: if v["accuracy"] == "exact" {
                 None
             } else {
-                Some(v["sample_size"].as_u64().unwrap_or(1_000_000) as usize)
+                // The validated SDK value stores JSON integers as f64 too.
+                Some(v["sample_size"].as_f64().unwrap_or(1_000_000.) as usize)
             },
         })
     }
