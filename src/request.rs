@@ -69,6 +69,7 @@ impl RequestLimiter {
             cancellation: RequestCancellation::default(),
             deadline,
             work: Vec::new(),
+            work_admission: None,
         };
         let _guard = CancelOnDrop(context.cancellation.clone());
         context.check()?;
@@ -130,6 +131,7 @@ pub(crate) struct RequestContext {
     cancellation: RequestCancellation,
     deadline: Instant,
     work: Vec<crate::resource::WorkReservation>,
+    work_admission: Option<Arc<crate::resource::WorkAdmission>>,
 }
 
 impl RequestContext {
@@ -152,6 +154,17 @@ impl RequestContext {
             request.check()?;
         }
         result
+    }
+
+    pub(crate) fn with_work_admission(&self, admission: crate::resource::WorkAdmission) -> Self {
+        let mut next = self.clone();
+        next.work_admission = Some(Arc::new(admission));
+        next
+    }
+
+    /// Readers capture the scoped context before spawning decode/stitch jobs.
+    pub(crate) async fn scope<F: Future>(&self, work: F) -> F::Output {
+        CURRENT_REQUEST.scope(self.clone(), work).await
     }
 
     pub(crate) fn with_work(&self, reservation: crate::resource::WorkReservation) -> Self {
@@ -248,6 +261,7 @@ mod tests {
             cancellation: RequestCancellation::default(),
             deadline: Instant::now() + Duration::from_secs(1),
             work: Vec::new(),
+            work_admission: None,
         };
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

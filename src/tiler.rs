@@ -315,7 +315,11 @@ impl Tiler {
     ) -> AgResult<Option<Arc<ImageData>>> {
         self.requests
             .run(self.request_timeout, options, |context| async move {
-                self.warp_tile_in_request(coord, style, &context, &[]).await
+                self.work_budget
+                    .run_request(&context, |attempt| async move {
+                        self.warp_tile_in_request(coord, style, &attempt, &[]).await
+                    })
+                    .await
             })
             .await
     }
@@ -489,7 +493,11 @@ impl Tiler {
     ) -> AgResult<Option<Bytes>> {
         self.requests
             .run(self.request_timeout, options, |context| async move {
-                self.tile_in_request(coord, style, &context).await
+                self.work_budget
+                    .run_request(&context, |attempt| async move {
+                        self.tile_in_request(coord, style, &attempt).await
+                    })
+                    .await
             })
             .await
     }

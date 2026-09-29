@@ -11,6 +11,15 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover tile/warp/mosaic requests from transient working-memory contention:
+  unwind the failed attempt, queue behind active requests, and retry once with
+  exclusive admission under the original deadline. Keep the 512 MiB working
+  budget, request-count limit, and nonblocking nested reservations unchanged.
+  Cancellation retains the memory-admission guard until any running blocking
+  job actually exits. Intrinsically oversized requests still fail.
+
 ## [0.11.0] - 2026-09-20
 
 ### ⚠️ BREAKING

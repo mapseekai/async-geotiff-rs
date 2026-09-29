@@ -297,7 +297,11 @@ impl<S: MosaicSource> MosaicTiler<S> {
     ) -> AgResult<Option<Bytes>> {
         self.requests
             .run(self.cfg.request_timeout, options, |context| async move {
-                self.tile_in_request(coord, selection, style, &context)
+                self.work_budget
+                    .run_request(&context, |attempt| async move {
+                        self.tile_in_request(coord, selection, style, &attempt)
+                            .await
+                    })
                     .await
             })
             .await

@@ -1,22 +1,36 @@
 //! Shared accounting for active library working buffers, separate from caches
-//! and caller-owned completed outputs. Reservations reject overload immediately:
+//! and caller-owned completed outputs. Individual reservations stay nonblocking:
 //! waiting while holding other allocations can deadlock a multi-stage pipeline.
+//! Public tile requests use a shared admission gate. On memory pressure the
+//! entire failed attempt unwinds before one exclusive retry, inside the original
+//! request deadline. This drains competing requests without raising the byte cap.
 
 use crate::error::{AgError, AgResult};
+use crate::request::RequestContext;
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, OnceLock,
 };
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 #[derive(Debug)]
 struct State {
     limit: u64,
     used: AtomicU64,
     peak: AtomicU64,
+    requests: Arc<RwLock<()>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct WorkBudget(Arc<State>);
+
+/// Retained by request contexts, including jobs that outlive cancellation.
+#[derive(Debug)]
+pub(crate) enum WorkAdmission {
+    Shared { _permit: OwnedRwLockReadGuard<()> },
+    Exclusive { _permit: OwnedRwLockWriteGuard<()> },
+}
 
 /// Clones retain one reservation, for example across a cancelled blocking job.
 #[derive(Clone, Debug)]
@@ -34,7 +48,49 @@ impl WorkBudget {
             limit: limit_bytes,
             used: AtomicU64::new(0),
             peak: AtomicU64::new(0),
+            requests: Arc::new(RwLock::new(())),
         }))
+    }
+
+    /// Run only at a public request boundary, never inside a read/warp stage.
+    /// A failed attempt must release all its buffers before waiting for the
+    /// exclusive gate. Blocking jobs retain the shared guard via RequestContext,
+    /// so the retry cannot overlap work left behind by a cancelled child future.
+    /// Tokio's writer-preferring queue prevents new readers starving a retry.
+    ///
+    /// ResourceLimit may also denote an intrinsically oversized plan. One retry
+    /// in isolation distinguishes that from contention without an unbounded loop;
+    /// a second failure is returned unchanged. Other errors are never retried.
+    pub(crate) async fn run_request<T, F, Fut>(
+        &self,
+        context: &RequestContext,
+        work: F,
+    ) -> AgResult<T>
+    where
+        F: Fn(RequestContext) -> Fut,
+        Fut: Future<Output = AgResult<T>>,
+    {
+        context.check()?;
+        let result = {
+            let permit = self.0.requests.clone().read_owned().await;
+            let attempt = context.with_work_admission(WorkAdmission::Shared { _permit: permit });
+            attempt.check()?;
+            attempt.scope(work(attempt.clone())).await
+        };
+        if !matches!(result, Err(AgError::ResourceLimit(_))) {
+            return result;
+        }
+        // Do not upgrade a held read lock or keep a failed attempt's context.
+        // Its last blocking job, if any, is allowed to finish before this wait.
+        context.check()?;
+        tracing::debug!(
+            limit_bytes = self.0.limit,
+            "retrying request after working-memory pressure"
+        );
+        let permit = self.0.requests.clone().write_owned().await;
+        let attempt = context.with_work_admission(WorkAdmission::Exclusive { _permit: permit });
+        attempt.check()?;
+        attempt.scope(work(attempt.clone())).await
     }
 
     /// All default readers/tilers/pools share this 512 MiB working allowance.
@@ -111,3 +167,7 @@ mod tests {
         assert_eq!(budget.used_bytes(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "resource_backpressure_tests.rs"]
+mod backpressure_tests;
