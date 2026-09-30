@@ -432,13 +432,20 @@ impl Resampling {
             return fill;
         }
         // Sub-pixel footprint => nearest (NOT bilinear — no interpolation).
+        if !rx.is_finite() || !ry.is_finite() || rx < 0.0 || ry < 0.0 {
+            return fill;
+        }
         if rx < 0.5 && ry < 0.5 {
             return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
         }
         let c_lo = ((sc - rx).ceil().max(0.0)) as usize;
-        let c_hi = ((sc + rx).floor() as i64).clamp(0, w as i64 - 1) as usize;
+        let c_hi = ((sc + rx).floor() as i64).min(w as i64 - 1);
         let r_lo = ((sr - ry).ceil().max(0.0)) as usize;
-        let r_hi = ((sr + ry).floor() as i64).clamp(0, h as i64 - 1) as usize;
+        let r_hi = ((sr + ry).floor() as i64).min(h as i64 - 1);
+        if c_hi < 0 || r_hi < 0 {
+            return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
+        }
+        let (c_hi, r_hi) = (c_hi as usize, r_hi as usize);
 
         // Anisotropic footprints (one thin axis) can reverse a center-membership
         // bound, leaving an empty box. Fall back to Nearest rather than emit a
@@ -447,26 +454,139 @@ impl Resampling {
             return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
         }
 
-        // Categorical rasters have few distinct classes → a small Vec of
-        // (value, count) is cheaper than hashing f64 (which isn't Hash/Eq).
-        let mut tally: Vec<(f64, u32)> = Vec::new();
-        for r in r_lo..=r_hi {
-            for c in c_lo..=c_hi {
-                let ok = match valid {
-                    Some(m) => m[[r, c]],
-                    None => true,
-                };
-                if !ok {
-                    continue;
-                }
-                let val = view[[r, c]];
-                if let Some(e) = tally.iter_mut().find(|(v, _)| *v == val) {
-                    e.1 += 1;
-                } else {
-                    tally.push((val, 1));
-                }
-            }
+        mode_from_samples(
+            (r_lo..=r_hi).flat_map(|r| {
+                (c_lo..=c_hi)
+                    .filter(move |&c| valid.is_none_or(|m| m[[r, c]]))
+                    .map(move |c| view[[r, c]])
+            }),
+            fill,
+        )
+    }
+
+    /// Mode counts source pixel centers inside the actual projected footprint.
+    pub(crate) fn sample_mode_polygon(
+        self,
+        view: ArrayView2<f64>,
+        valid: Option<ArrayView2<bool>>,
+        corners: [(f64, f64); 4],
+        fill: f64,
+    ) -> f64 {
+        if corners
+            .iter()
+            .any(|&(x, y)| !x.is_finite() || !y.is_finite())
+        {
+            return fill;
         }
+        let xmin = corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+        let xmax = corners
+            .iter()
+            .map(|p| p.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let ymin = corners.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let ymax = corners
+            .iter()
+            .map(|p| p.1)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let (sc, sr) = ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5);
+        if corners[0].1 == corners[1].1
+            && corners[2].1 == corners[3].1
+            && corners[0].0 == corners[3].0
+            && corners[1].0 == corners[2].0
+        {
+            return self.sample_mode(
+                view,
+                valid,
+                sc,
+                sr,
+                (xmax - xmin) * 0.5,
+                (ymax - ymin) * 0.5,
+                fill,
+            );
+        }
+        if xmax - xmin < 1.0 && ymax - ymin < 1.0 {
+            return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
+        }
+        let (h, w) = view.dim();
+        let c0 = (xmin - 1e-10).ceil().clamp(0.0, w as f64) as usize;
+        let c1 = ((xmax + 1e-10).floor() + 1.0).clamp(0.0, w as f64) as usize;
+        let r0 = (ymin - 1e-10).ceil().clamp(0.0, h as f64) as usize;
+        let r1 = ((ymax + 1e-10).floor() + 1.0).clamp(0.0, h as f64) as usize;
+        let mut centers = 0;
+        let value = mode_from_samples(
+            (r0..r1)
+                .flat_map(|r| (c0..c1).map(move |c| (r, c)))
+                .filter(|&(r, c)| point_in_footprint((c as f64, r as f64), &corners))
+                .inspect(|_| centers += 1)
+                .filter(|&(r, c)| valid.is_none_or(|m| m[[r, c]]))
+                .map(|(r, c)| view[[r, c]]),
+            fill,
+        );
+        if centers == 0 {
+            // Thin footprints may contain no center; retain nearest fallback.
+            Self::Nearest.sample_masked(view, valid, sc, sr, fill)
+        } else {
+            value
+        }
+    }
+}
+
+fn point_in_footprint((x, y): (f64, f64), corners: &[(f64, f64); 4]) -> bool {
+    let mut inside = false;
+    for i in 0..4 {
+        let (ax, ay) = corners[i];
+        let (bx, by) = corners[(i + 1) % 4];
+        let cross = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+        let tolerance = 1e-10 * ((bx - ax).abs() + (by - ay).abs()).max(1.0);
+        if cross.abs() <= tolerance
+            && x >= ax.min(bx) - 1e-10
+            && x <= ax.max(bx) + 1e-10
+            && y >= ay.min(by) - 1e-10
+            && y <= ay.max(by) + 1e-10
+        {
+            return true;
+        }
+        if (ay > y) != (by > y) && x < (bx - ax) * (y - ay) / (by - ay) + ax {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn mode_from_samples(samples: impl Iterator<Item = f64>, fill: f64) -> f64 {
+    // Keep the inexpensive small-class path; its scan has a fixed ceiling.
+    const SMALL_CLASS_LIMIT: usize = 32;
+    let mut tally: Vec<(f64, usize)> = Vec::new();
+    let mut sorted_samples: Option<Vec<f64>> = None;
+    for value in samples.filter(|v| v.is_finite()) {
+        if let Some(values) = &mut sorted_samples {
+            values.push(value);
+        } else if let Some((_, count)) = tally.iter_mut().find(|(v, _)| *v == value) {
+            *count += 1;
+        } else if tally.len() < SMALL_CLASS_LIMIT {
+            tally.push((value, 1));
+        } else {
+            let mut values = Vec::new();
+            for (value, count) in tally.drain(..) {
+                values.extend(std::iter::repeat_n(value, count));
+            }
+            values.push(value);
+            sorted_samples = Some(values);
+        }
+    }
+    if let Some(mut values) = sorted_samples {
+        values.sort_unstable_by(f64::total_cmp);
+        let mut best = (fill, 0);
+        let mut i = 0;
+        while i < values.len() {
+            let end = i + values[i..].partition_point(|v| *v == values[i]);
+            if end - i > best.1 {
+                best = (values[i], end - i);
+            }
+            i = end;
+        }
+        best.0
+    } else {
         tally
             .into_iter()
             .reduce(|best, cur| {
@@ -664,6 +784,95 @@ mod tests {
     #[test]
     fn parse_mode() {
         assert_eq!(Resampling::parse("mode"), Some(Resampling::Mode));
+    }
+
+    #[test]
+    fn mode_high_cardinality_preserves_counts_ties_and_signed_zero() {
+        let unique = ndarray::Array2::from_shape_fn((256, 256), |(r, c)| (r * 256 + c) as f64);
+        assert_eq!(
+            Resampling::Mode.sample_mode(unique.view(), None, 127.5, 127.5, 127.5, 127.5, -1.),
+            0.
+        );
+        // Promote to sorted samples only after some repeated small-class values.
+        let values = std::iter::repeat_n(99., 12)
+            .chain(std::iter::repeat_n(-0., 7))
+            .chain((1..1000).map(|n| n as f64))
+            .chain(std::iter::repeat_n(0., 7));
+        assert_eq!(mode_from_samples(values, -1.), 0.);
+        assert_eq!(
+            mode_from_samples((0..100).map(|n| n as f64).chain([91., 92.]), -1.),
+            91.
+        );
+        assert_eq!(
+            mode_from_samples([f64::NAN, f64::INFINITY].into_iter(), -1.),
+            -1.
+        );
+    }
+
+    #[test]
+    fn mode_rotated_footprint_excludes_outer_corners_and_respects_mask() {
+        let a = array![[9., 2., 9.], [3., 1., 4.], [9., 5., 9.]];
+        let corners = [(1., 0.), (2., 1.), (1., 2.), (0., 1.)];
+        assert_eq!(
+            Resampling::Mode.sample_mode_polygon(a.view(), None, corners, -1.),
+            1.
+        );
+        let mut mask = ndarray::Array2::from_elem((3, 3), true);
+        mask[[1, 1]] = false;
+        assert_eq!(
+            Resampling::Mode.sample_mode_polygon(a.view(), Some(mask.view()), corners, -1.),
+            2.
+        );
+        mask.fill(false);
+        assert_eq!(
+            Resampling::Mode.sample_mode_polygon(a.view(), Some(mask.view()), corners, -1.),
+            -1.
+        );
+        assert_eq!(
+            Resampling::Mode.sample_mode_polygon(
+                a.view(),
+                None,
+                corners.map(|(x, y)| (x + 10., y)),
+                -1.
+            ),
+            -1.
+        );
+        for shift in [(-10., 0.), (0., -10.), (0., 10.)] {
+            assert_eq!(
+                Resampling::Mode.sample_mode_polygon(
+                    a.view(),
+                    None,
+                    corners.map(|(x, y)| (x + shift.0, y + shift.1)),
+                    -1.
+                ),
+                -1.
+            );
+        }
+        for (x, y) in [(-10., 1.), (1., -10.), (10., 1.), (1., 10.)] {
+            assert_eq!(
+                Resampling::Mode.sample_mode(a.view(), None, x, y, 1., 1., -1.),
+                -1.
+            );
+        }
+        assert_eq!(
+            Resampling::Mode.sample_mode_polygon(a.view(), None, [(f64::NAN, 0.); 4], -1.),
+            -1.
+        );
+    }
+
+    #[test]
+    fn mode_sheared_footprint_and_thin_fallback() {
+        let a = array![[9., 1., 9.], [2., 1., 9.], [2., 9., 9.]];
+        let corners = [(0.5, -0.5), (1.5, -0.5), (0.5, 2.5), (-0.5, 2.5)];
+        assert_eq!(
+            Resampling::Mode.sample_mode_polygon(a.view(), None, corners, -1.),
+            1.
+        );
+        let thin = [(0., 0.2), (2., 0.2), (2.1, 0.3), (0.1, 0.3)];
+        assert_eq!(
+            Resampling::Mode.sample_mode_polygon(a.view(), None, thin, -1.),
+            1.
+        );
     }
 
     #[test]

@@ -151,6 +151,8 @@ mod workload {
         }
     }
 
+    // One renderer per workload; boxing does not reduce resident working memory.
+    #[allow(clippy::large_enum_variant)]
     enum Renderer {
         Single(Tiler),
         Mosaic(MosaicTiler<Fixed>),

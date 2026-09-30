@@ -21,12 +21,14 @@ use async_geotiff::io::{BlockCache, BlockCacheStats, CogReader, ReaderConfig};
 #[cfg(feature = "stac")]
 use async_geotiff::mosaic::StacSource;
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler};
+use async_geotiff::resource::WorkBudget;
 use async_geotiff::style::{TileFormat, TileStyle};
 use async_geotiff::tiler::{Tiler, TilerConfig};
 use async_geotiff::tms::{TileCoord, TileMatrixSet};
 use async_geotiff::CpuLimiter;
 
 const MAX_DATA_RESPONSE_BYTES: u64 = 32 << 20;
+const MAX_DATA_BUFFER_BYTES: u64 = 128 << 20;
 #[cfg(feature = "perf-tracing")]
 static NEXT_TILE_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -185,6 +187,9 @@ pub struct AppState {
     slow_tile_ms: Option<u64>,
     request_slots: Arc<tokio::sync::Semaphore>,
     request_timeout: Duration,
+    // Independent from tile admission: admitted tiles fetch this origin.
+    data_slots: Arc<tokio::sync::Semaphore>,
+    data_budget: WorkBudget,
 }
 
 impl AppState {
@@ -195,6 +200,9 @@ impl AppState {
         http_base: impl Into<String>,
         block_cache: Arc<BlockCache>,
     ) -> Self {
+        // Compile the SDK schema and Q2 bindings before accepting requests.
+        TileStyle::from_raster_query("version=2.0&type=gray&bidx=1")
+            .expect("built-in Raster Style is supported");
         Self {
             default_tiler,
             data_dir,
@@ -209,6 +217,8 @@ impl AppState {
             slow_tile_ms: None,
             request_slots: Arc::new(tokio::sync::Semaphore::new(64)),
             request_timeout: Duration::from_secs(30),
+            data_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            data_budget: WorkBudget::new(MAX_DATA_BUFFER_BYTES),
         }
     }
 
@@ -756,6 +766,9 @@ pub async fn data_file_handler(
     let Some(dir) = state.data_dir.clone() else {
         return with_cors((StatusCode::NOT_FOUND, "no data dir").into_response());
     };
+    let Ok(data_slot) = state.data_slots.clone().try_acquire_owned() else {
+        return error_response(AgError::Overloaded);
+    };
     use object_store::ObjectStore;
     let store = match object_store::local::LocalFileSystem::new_with_prefix(&dir) {
         Ok(store) => store,
@@ -862,6 +875,10 @@ pub async fn data_file_handler(
                 .into_response(),
         );
     }
+    let reservation = match state.data_budget.try_reserve(len) {
+        Ok(reservation) => reservation,
+        Err(error) => return error_response(error),
+    };
 
     if file.seek(SeekFrom::Start(start)).await.is_err() {
         return with_cors((StatusCode::INTERNAL_SERVER_ERROR, "seek").into_response());
@@ -886,7 +903,22 @@ pub async fn data_file_handler(
             format!("bytes {}-{}/{}", start, start + len - 1, total),
         );
     }
-    match builder.body(Body::from(buf)) {
+    struct AccountedResponse {
+        bytes: Vec<u8>,
+        _work: async_geotiff::resource::WorkReservation,
+        _slot: tokio::sync::OwnedSemaphorePermit,
+    }
+    impl AsRef<[u8]> for AccountedResponse {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    let body = bytes::Bytes::from_owner(AccountedResponse {
+        bytes: buf,
+        _work: reservation,
+        _slot: data_slot,
+    });
+    match builder.body(Body::from(body)) {
         Ok(resp) => with_cors(resp),
         Err(_) => with_cors((StatusCode::INTERNAL_SERVER_ERROR, "body").into_response()),
     }
@@ -941,6 +973,77 @@ fn with_cors(mut response: Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn data_response_budget_follows_body_bytes_and_uses_independent_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("test.tif"), b"abcd")
+            .await
+            .unwrap();
+        let mut state = AppState::new(
+            None,
+            Some(dir.path().to_owned()),
+            vec!["test.tif".into()],
+            "http://127.0.0.1",
+            Arc::new(BlockCache::new(Default::default())),
+        );
+        state.data_budget = WorkBudget::new(8);
+        state.data_slots = Arc::new(tokio::sync::Semaphore::new(4));
+        let _tile_slot = state
+            .request_slots
+            .clone()
+            .acquire_many_owned(64)
+            .await
+            .unwrap();
+        let get = || {
+            data_file_handler(
+                State(state.clone()),
+                Path("test.tif".into()),
+                Method::GET,
+                HeaderMap::new(),
+            )
+        };
+        let first = get().await;
+        let second = get().await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(state.data_budget.used_bytes(), 8);
+        assert_eq!(state.data_slots.available_permits(), 2);
+        assert_eq!(get().await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(second);
+        assert_eq!(state.data_budget.used_bytes(), 4);
+        let bytes = axum::body::to_bytes(first.into_body(), 4).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"abcd");
+        let cloned = bytes.clone();
+        drop(bytes);
+        assert_eq!(state.data_budget.used_bytes(), 4);
+        assert_eq!(state.data_slots.available_permits(), 3);
+        drop(cloned);
+        assert_eq!(state.data_budget.used_bytes(), 0);
+        assert_eq!(state.data_slots.available_permits(), 4);
+
+        state.data_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let slot = state.data_slots.clone().acquire_owned().await.unwrap();
+        let response = data_file_handler(
+            State(state.clone()),
+            Path("test.tif".into()),
+            Method::GET,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(slot);
+        let head = data_file_handler(
+            State(state.clone()),
+            Path("test.tif".into()),
+            Method::HEAD,
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(state.data_budget.used_bytes(), 0);
+        assert_eq!(state.data_slots.available_permits(), 1);
+    }
 
     #[cfg(feature = "proj")]
     #[tokio::test]

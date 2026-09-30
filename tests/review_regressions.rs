@@ -963,7 +963,7 @@ async fn sample_size_integer_valued_float_is_not_ignored() {
         let style=TileStyle::from_json(&format!(r#"{{"version":"2.0","renderer":{{"type":"gray","bidx":[2]}},"stretch":{{"method":"minmax"}},"statistics":{{"scope":"dataset","accuracy":"sample","sample_size":{sample}}},"image":{{"tilesize":64}}}}"#)).unwrap();
         let style = if query_input {
             let sdk =
-                async_geotiff::style::RasterStyle::from_json(&style.raster_style_json()).unwrap();
+                async_geotiff::style::RasterStyle::from_json(style.raster_style_json()).unwrap();
             TileStyle::from_raster_query(&raster_style::encode_query(&sdk).unwrap()).unwrap()
         } else {
             style

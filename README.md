@@ -80,6 +80,24 @@ assets still use the default HTTP access policy, which rejects loopback and
 link-local destinations so the demo cannot become a client-controlled public
 proxy.
 
+STAC discovery follows same-origin GET/POST pagination in server order and
+rejects incomplete results when limits are exceeded: 1 MiB per response,
+8 MiB total responses, 128 pages and 8 MiB of asset metadata. The asset count
+uses `MosaicConfig::max_assets_per_tile`; setting it to zero disables only
+that count limit. Direct source calls can pass `DiscoveryOptions` to
+`assets_for_tile_with_options`. Custom `MosaicSource` implementations should
+override this method and `statistics_assets_with_options` to apply limits
+before allocating; their compatibility defaults validate returned assets.
+
+`StacSource::new` keeps its existing signature and disables automatic proxy
+discovery. For authentication, explicit proxies or custom HTTP timeouts, use
+`StacSource::with_http_client(api_url, http, collections, asset_key)?`, passing
+your configured **reqwest 0.11** client. The old `with_client(stac_client::Client,
+...)` constructor is deprecated and discovery now returns an error: that
+opaque client's transport cannot enforce response byte limits. Carry its
+authentication into the HTTP client's default headers when migrating; it
+is never silently discarded.
+
 ## Styles and migration
 
 All styles use Raster Style 2.0 JSON/Q2:

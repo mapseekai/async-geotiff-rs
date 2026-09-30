@@ -69,6 +69,9 @@ impl Projector {
 }
 
 #[cfg(feature = "proj")]
+const PROJ_CACHE_CAPACITY: usize = 32;
+
+#[cfg(feature = "proj")]
 thread_local! {
     /// Per-blocking-thread cache of `(src, dst) → Projector`. `Proj` is
     /// `!Send`, so we cannot share across threads — this is the only
@@ -88,20 +91,26 @@ pub fn with_cached<R>(
     f: impl FnOnce(&Projector) -> AgResult<R>,
 ) -> AgResult<R> {
     let key = (src.clone(), dst.clone());
-    // 1) Materialise/insert under a short mutable borrow.
-    PROJ_CACHE.with(|cell| -> AgResult<()> {
-        if !cell.borrow().contains_key(&key) {
-            let p = Projector::new(src, dst)?;
-            cell.borrow_mut().insert(key.clone(), Rc::new(p));
+    let cached = PROJ_CACHE.with(|cell| cell.borrow().get(&key).cloned());
+    let proj = match cached {
+        Some(projector) => projector,
+        None => {
+            let projector = Rc::new(Projector::new(src, dst)?);
+            PROJ_CACHE.with(|cell| {
+                let mut cache = cell.borrow_mut();
+                // ponytail: bounded arbitrary eviction; use LRU if CRS churn causes misses.
+                if cache.len() >= PROJ_CACHE_CAPACITY {
+                    if let Some(evicted) = cache.keys().next().cloned() {
+                        cache.remove(&evicted);
+                    }
+                }
+                cache.insert(key, projector.clone());
+            });
+            projector
         }
-        Ok(())
-    })?;
-    // 2) Clone the Rc and release the borrow before calling `f` — `f` is
-    //    free to re-enter `with_cached` for any other key without
-    //    triggering RefCell BorrowMutError.
-    let proj: Rc<Projector> = PROJ_CACHE
-        .with(|cell| cell.borrow().get(&key).cloned())
-        .expect("just inserted if missing");
+    };
+    // Keep a local Rc and release the borrow before `f`: reentrant calls may
+    // evict this cache entry without invalidating the active FFI handle.
     f(&proj)
 }
 
@@ -247,6 +256,40 @@ impl Projector {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn projector_cache_is_bounded_reusable_and_reentrant() {
+        PROJ_CACHE.with(|cell| cell.borrow_mut().clear());
+        let from = Crs::epsg(4326);
+        let to = Crs::epsg(32601);
+        let weak = with_cached(&from, &to, |_| {
+            Ok(PROJ_CACHE.with(|cell| Rc::downgrade(&cell.borrow()[&(from.clone(), to.clone())])))
+        })
+        .unwrap();
+        with_cached(&from, &to, |projector| {
+            assert!(std::ptr::eq(
+                projector,
+                Rc::as_ptr(&weak.upgrade().unwrap())
+            ));
+            for zone in 2..=PROJ_CACHE_CAPACITY as u32 + 2 {
+                with_cached(&from, &Crs::epsg(32600 + zone), |_| Ok(()))?;
+            }
+            assert_eq!(
+                PROJ_CACHE.with(|cell| cell.borrow().len()),
+                PROJ_CACHE_CAPACITY
+            );
+            // Eviction must not drop a handle still used by an outer callback.
+            assert!(weak.upgrade().is_some());
+            projector.convert(&mut [(-177., 0.)])?;
+            Ok(())
+        })
+        .unwrap();
+        PROJ_CACHE.with(|cell| cell.borrow_mut().clear());
+        assert!(weak.upgrade().is_none());
+        let error = with_cached(&from, &Crs::new("invalid CRS"), |_| Ok(()));
+        assert!(error.is_err());
+        assert_eq!(PROJ_CACHE.with(|cell| cell.borrow().len()), 0);
+    }
 
     #[test]
     fn polar_boundary_includes_extremum_between_corners() {

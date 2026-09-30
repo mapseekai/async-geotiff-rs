@@ -143,7 +143,6 @@ async fn multi_asset_mosaic_retries_whole_request_not_nested_stages() {
 }
 
 #[cfg(feature = "mosaic")]
-
 fn mosaic_style(selection: async_geotiff::mosaic::PixelSelection, style: &TileStyle) -> TileStyle {
     let mut document: serde_json::Value = serde_json::from_str(style.raster_style_json()).unwrap();
     document["mosaic"] = serde_json::json!({"pixel_selection": format!("{selection:?}").to_lowercase(), "stage": "after_channels"});

@@ -12,7 +12,7 @@ pub(crate) mod stac;
 
 pub use mosaicjson::{MosaicDataType, MosaicJson, MosaicJsonSource};
 pub use selection::PixelSelection;
-pub use source::{AssetRef, MosaicSource};
+pub use source::{AssetRef, DiscoveredAssets, DiscoveryOptions, MosaicSource};
 pub use ssrf::HttpAccessPolicy;
 #[cfg(feature = "stac")]
 pub use stac::StacSource;
@@ -319,7 +319,17 @@ impl<S: MosaicSource> MosaicTiler<S> {
         }
         style.raster.statistics.check_scope(true)?;
         let statistical = style.raster.stretch.needs_statistics();
-        let assets = self.source.assets_for_tile(coord).await?;
+        let discovery_options = DiscoveryOptions {
+            max_assets: self.cfg.max_assets_per_tile,
+            work_budget: self.work_budget.clone(),
+            cpu_limiter: self.pool.cpu_limiter(),
+            ..DiscoveryOptions::default()
+        };
+        let discovered = self
+            .source
+            .assets_for_tile_with_options(coord, &discovery_options)
+            .await?;
+        let assets = &discovered.assets;
         context.check()?;
         if assets.is_empty() {
             return Ok(None);
@@ -335,7 +345,11 @@ impl<S: MosaicSource> MosaicTiler<S> {
         }
         let mut reducer: Option<Reducer<NonEmptyReducer>> = None;
         let raster = if statistical {
-            let statistics_assets = self.source.statistics_assets().await?;
+            let discovered_statistics = self
+                .source
+                .statistics_assets_with_options(&discovery_options)
+                .await?;
+            let statistics_assets = &discovered_statistics.assets;
             if cap > 0 && statistics_assets.len() > cap {
                 return Err(AgError::Mosaic(format!(
                     "statistics binds {} assets, exceeding limit {cap}",
@@ -343,7 +357,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
                 )));
             }
             let mut readers = Vec::with_capacity(statistics_assets.len());
-            for asset in &statistics_assets {
+            for asset in statistics_assets {
                 context.check()?;
                 readers.push(self.pool.get_or_open(&asset.url, &asset.source_id).await?);
             }

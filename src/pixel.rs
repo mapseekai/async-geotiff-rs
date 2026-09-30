@@ -4,8 +4,8 @@ use ndarray::{Array2, Array3};
 
 /// Decoded pixel buffer in `(bands, height, width)` planar layout.
 ///
-/// Always permuted to `(H, W, bands)` interleaved at the read/warp seam
-/// before entering the render pipeline.
+/// Reading, warping, and mosaic reduction retain this planar layout. Renderers
+/// interleave selected channels when producing encoded image bytes.
 #[derive(Debug, Clone)]
 pub enum PixelData {
     U8(Array3<u8>),

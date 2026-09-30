@@ -1,7 +1,9 @@
 //! `MosaicJsonSource` — read-only consumer of a pre-built cogeo-mosaic
 //! MosaicJSON document (quadkey index). Building the index is out of scope.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
+
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -9,7 +11,9 @@ use serde_json::Value;
 use crate::bounds::Bbox;
 use crate::error::{AgError, AgResult};
 use crate::mosaic::quadkey::{lookup, QkLookup};
-use crate::mosaic::source::{AssetRef, MosaicSource};
+use crate::mosaic::source::{
+    AssetDiscovery, AssetRef, DiscoveredAssets, DiscoveryOptions, MosaicSource,
+};
 use crate::tms::{TileCoord, TileMatrixSet};
 
 // MosaicJson mirrors the MosaicJSON 0.0.3 schema. Some fields are not
@@ -109,9 +113,10 @@ fn default_version() -> String {
 ///
 /// MosaicJSON quadkey indices are defined in the WebMercatorQuad tile matrix;
 /// using this source with another TMS is not meaningful.
+#[derive(Clone)]
 pub struct MosaicJsonSource {
-    doc: MosaicJson,
-    tile_keys: Vec<String>,
+    doc: Arc<MosaicJson>,
+    tile_keys: Arc<Vec<String>>,
     quadkey_zoom: u8,
     bbox: Bbox,
 }
@@ -128,10 +133,10 @@ impl MosaicJsonSource {
         let mut tile_keys: Vec<_> = doc.tiles.keys().cloned().collect();
         tile_keys.sort_unstable();
         Ok(Self {
-            tile_keys,
+            tile_keys: Arc::new(tile_keys),
             quadkey_zoom,
             bbox: Bbox::new(b[0], b[1], b[2], b[3]),
-            doc,
+            doc: Arc::new(doc),
         })
     }
 
@@ -244,39 +249,97 @@ impl MosaicSource for MosaicJsonSource {
             ));
         }
 
-        let mut urls: Vec<&str> = Vec::new();
-        match lookup(coord.z, coord.x, coord.y, self.quadkey_zoom) {
-            QkLookup::Exact(key) => {
-                if let Some(v) = self.doc.tiles.get(&key) {
-                    urls.extend(v.iter().map(String::as_str));
-                }
-            }
-            QkLookup::Prefix(prefix) => {
-                for key in &self.tile_keys[prefix_key_range(&self.tile_keys, &prefix)] {
-                    if let Some(v) = self.doc.tiles.get(key) {
-                        urls.extend(v.iter().map(String::as_str));
+        Ok(self
+            .assets_for_tile_with_options(coord, &DiscoveryOptions::default())
+            .await?
+            .into_assets())
+    }
+
+    async fn statistics_assets_with_options(
+        &self,
+        options: &DiscoveryOptions,
+    ) -> AgResult<DiscoveredAssets> {
+        if self.quadkey_zoom != 0 {
+            return Err(AgError::query("statistics", "MosaicJSON statistical stretch requires quadkey_zoom=0; partitioned statistics are unsupported"));
+        }
+        self.assets_for_tile_with_options(
+            TileCoord {
+                tms: TileMatrixSet::WebMercatorQuad,
+                z: 0,
+                x: 0,
+                y: 0,
+            },
+            options,
+        )
+        .await
+    }
+
+    async fn assets_for_tile_with_options(
+        &self,
+        coord: TileCoord,
+        options: &DiscoveryOptions,
+    ) -> AgResult<DiscoveredAssets> {
+        if coord.tms != TileMatrixSet::WebMercatorQuad {
+            return Err(AgError::query(
+                "tms",
+                "MosaicJSON quadkey indexes only support WebMercatorQuad",
+            ));
+        }
+        let source = self.clone();
+        let options = options.clone();
+        let permit = options.cpu_limiter.acquire().await?;
+        let request = crate::request::RequestContext::current();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::request::RequestContext::run_blocking(request.clone(), || {
+                let mut out = AssetDiscovery::new(options.clone());
+                let mut add = |urls: &[String]| -> AgResult<()> {
+                    for url in urls {
+                        if let Some(request) = &request {
+                            request.check()?;
+                        }
+                        let prefix = source.doc.asset_prefix.as_deref().unwrap_or("");
+                        let len = prefix
+                            .len()
+                            .checked_add(url.len())
+                            .filter(|n| *n <= options.max_asset_bytes)
+                            .ok_or_else(|| {
+                                AgError::ResourceLimit(
+                                    "asset URL exceeds discovery byte limit".into(),
+                                )
+                            })?;
+                        if prefix.is_empty() {
+                            out.push(url, url, source.bbox)?;
+                        } else {
+                            let _temporary = options.work_budget.try_reserve(len as u64)?;
+                            let href = format!("{prefix}{url}");
+                            out.push(&href, &href, source.bbox)?;
+                        }
+                    }
+                    Ok(())
+                };
+                match lookup(coord.z, coord.x, coord.y, source.quadkey_zoom) {
+                    QkLookup::Exact(key) => {
+                        if let Some(urls) = source.doc.tiles.get(&key) {
+                            add(urls)?;
+                        }
+                    }
+                    QkLookup::Prefix(prefix) => {
+                        for key in &source.tile_keys[prefix_key_range(&source.tile_keys, &prefix)] {
+                            if let Some(request) = &request {
+                                request.check()?;
+                            }
+                            if let Some(urls) = source.doc.tiles.get(key) {
+                                add(urls)?;
+                            }
+                        }
                     }
                 }
-            }
-        }
-        // Asset lists carry paint priority. Prefix queries traverse sorted keys,
-        // but preserve the first occurrence of each asset within those lists.
-        let mut seen = HashSet::new();
-        urls.retain(|url| seen.insert(*url));
-        Ok(urls
-            .into_iter()
-            .map(|url| {
-                let url = match &self.doc.asset_prefix {
-                    Some(prefix) => format!("{prefix}{url}"),
-                    None => url.to_owned(),
-                };
-                AssetRef {
-                    source_id: url.clone(),
-                    url,
-                    bbox: self.bbox,
-                }
+                Ok(out.finish())
             })
-            .collect())
+        })
+        .await
+        .map_err(|e| AgError::Mosaic(format!("discovery join: {e}")))?
     }
 }
 
@@ -397,6 +460,54 @@ mod tests {
         assert_eq!(doc.tilematrixset.as_ref().unwrap()["id"], "WebMercatorQuad");
         assert!(doc.layers.contains_key("rgb"));
         assert!(doc.extra.contains_key("vendor:extension"));
+    }
+
+    #[tokio::test]
+    async fn bounded_discovery_counts_unique_urls_and_keeps_leases() {
+        let source = MosaicJsonSource::from_str(r#"{"mosaicjson":"0.0.3","minzoom":0,"maxzoom":1,"quadkey_zoom":0,"tiles":{"": ["a", "a", "b"]}}"#).unwrap();
+        let budget = crate::resource::WorkBudget::new(4096);
+        let options = DiscoveryOptions {
+            max_assets: 2,
+            work_budget: budget.clone(),
+            ..DiscoveryOptions::default()
+        };
+        let assets = source
+            .statistics_assets_with_options(&options)
+            .await
+            .unwrap();
+        assert_eq!(
+            assets
+                .assets()
+                .iter()
+                .map(|a| a.url.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(budget.used_bytes() > 0);
+        drop(assets);
+        assert_eq!(budget.used_bytes(), 0);
+        let capped = DiscoveryOptions {
+            max_assets: 1,
+            ..options.clone()
+        };
+        assert!(source
+            .assets_for_tile_with_options(coord_for_quadkey(""), &capped)
+            .await
+            .is_err());
+        assert!(source
+            .statistics_assets_with_options(&capped)
+            .await
+            .is_err());
+        assert_eq!(budget.used_bytes(), 0);
+        let tiny = DiscoveryOptions {
+            max_asset_bytes: 1,
+            ..options
+        };
+        assert!(matches!(
+            source.statistics_assets_with_options(&tiny).await,
+            Err(AgError::ResourceLimit(_))
+        ));
+        assert_eq!(budget.used_bytes(), 0);
     }
 
     #[test]

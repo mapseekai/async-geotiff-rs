@@ -6,7 +6,7 @@ use crate::bounds::GeoTransform;
 use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
 use crate::io::cog::CogReader;
-use crate::warp::Projector;
+use crate::warp::projection::with_cached;
 
 /// Pixel value(s) sampled at a coordinate.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,8 +23,8 @@ pub struct PointValue {
 /// Reproject `(x, y)` from `coord_crs` to `src_crs`, map to an integer level-0
 /// pixel via `transform.inverse()`, and bounds-check against `(width, height)`.
 /// Returns `Ok(None)` if the point is outside the extent or the projection's
-/// valid domain. `Projector` is `!Send`; this fn is fully synchronous so the
-/// projector never crosses an await.
+/// valid domain. Non-identity projection uses the blocking thread's cached
+/// projector; it is created and dropped without crossing an await.
 fn coord_to_pixel(
     x: f64,
     y: f64,
@@ -40,7 +40,7 @@ fn coord_to_pixel(
         (x, y)
     } else {
         let mut pts = [(x, y)];
-        match Projector::new(coord_crs, src_crs)?.convert(&mut pts) {
+        match with_cached(coord_crs, src_crs, |projector| projector.convert(&mut pts)) {
             Ok(()) => pts[0],
             Err(AgError::ProjectionDomain(_)) => return Ok(None),
             Err(e) => return Err(e),
@@ -108,16 +108,24 @@ impl CogReader {
             out
         };
 
-        // Reproject + map to pixel (synchronous; Projector dropped before await).
-        let (col, row) = match coord_to_pixel(
-            x,
-            y,
-            coord_crs,
-            self.src_crs(),
-            self.transform(),
-            width,
-            height,
-        )? {
+        let transform = self.transform();
+        let pixel = if coord_crs == self.src_crs() {
+            coord_to_pixel(x, y, coord_crs, self.src_crs(), transform, width, height)?
+        } else {
+            let permit = self.cpu_limiter().acquire().await?;
+            let coord_crs = coord_crs.clone();
+            let src_crs = self.src_crs().clone();
+            let request = crate::request::RequestContext::current();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                crate::request::RequestContext::run_blocking(request, || {
+                    coord_to_pixel(x, y, &coord_crs, &src_crs, transform, width, height)
+                })
+            })
+            .await
+            .map_err(|error| AgError::Warp(format!("point projection task: {error}")))??
+        };
+        let (col, row) = match pixel {
             Some(p) => p,
             None => return Ok(None),
         };
@@ -170,6 +178,52 @@ mod tests {
     use super::*;
     use crate::bounds::GeoTransform;
     use crate::crs::Crs;
+
+    #[cfg(feature = "proj")]
+    #[tokio::test]
+    async fn point_projection_obeys_cpu_budget_and_queued_cancellation() {
+        use crate::request::{RequestLimiter, RequestOptions};
+        use std::time::Duration;
+        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap());
+        let cpu = crate::CpuLimiter::new(1);
+        let reader = CogReader::builder()
+            .cpu_limiter(cpu.clone())
+            .open_object_store(store, "tests/fixtures/projected.tif")
+            .await
+            .unwrap();
+        let (width, height) = reader.level_dimensions(0).unwrap();
+        let source_point = reader
+            .transform()
+            .forward(f64::from(width) / 2. + 0.5, f64::from(height) / 2. + 0.5);
+        let mut geographic = [source_point];
+        crate::warp::mercator::mercator_to_lonlat(&mut geographic);
+        let (lon, lat) = geographic[0];
+        let reference = reader.point(lon, lat, &Crs::epsg(4326), &[]).await.unwrap();
+        assert!(reference.is_some());
+        let permit = cpu.acquire().await.unwrap();
+        // Identity conversion remains inline and can use the warm native block.
+        let identity = reader
+            .point(source_point.0, source_point.1, reader.src_crs(), &[])
+            .await
+            .unwrap();
+        assert_eq!(identity, reference);
+        let requests = RequestLimiter::new(1);
+        let geographic_crs = Crs::epsg(4326);
+        let result = requests
+            .run(
+                Duration::from_millis(30),
+                &RequestOptions::default(),
+                |_| reader.point(lon, lat, &geographic_crs, &[]),
+            )
+            .await;
+        assert!(matches!(result, Err(AgError::DeadlineExceeded)));
+        assert_eq!(requests.available_permits(), 1);
+        drop(permit);
+        assert_eq!(
+            reader.point(lon, lat, &Crs::epsg(4326), &[]).await.unwrap(),
+            reference
+        );
+    }
 
     // origin (0,0), 1 unit/pixel, north-up: world (X,Y) → pixel (col=X, row=-Y).
     fn tr() -> GeoTransform {
@@ -276,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn point_reprojects_lonlat_onto_non_4326_dataset() {
         // Fixture is EPSG:3857; querying in lon/lat (4326) forces the
-        // reprojection branch in `coord_to_pixel` (Projector::new + convert),
+        // reprojection branch in `coord_to_pixel` (cached Projector + convert),
         // unlike the 4326 fixture where the equal-CRS short-circuit fires.
         use object_store::local::LocalFileSystem;
         let fs = std::sync::Arc::new(LocalFileSystem::new_with_prefix(".").unwrap());
