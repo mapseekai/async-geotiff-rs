@@ -680,13 +680,22 @@ pub async fn bounds_handler(
         Ok(bands) => bands,
         Err(error) => return error_response(error),
     };
+    let default_stretch = match tiler.is_u8() {
+        Ok(true) => "none",
+        Ok(false) => "minmax",
+        Err(error) => return error_response(error),
+    };
     match tiler.wgs84_bounds() {
         Ok([w, s, e, n]) => with_cors(
             (
                 [
                     ("content-type", "application/json".to_owned()),
                     ("x-raster-bands", bands.to_string()),
-                    ("access-control-expose-headers", "x-raster-bands".to_owned()),
+                    ("x-raster-default-stretch", default_stretch.to_owned()),
+                    (
+                        "access-control-expose-headers",
+                        "x-raster-bands, x-raster-default-stretch".to_owned(),
+                    ),
                 ],
                 format!("[{w},{s},{e},{n}]"),
             )
@@ -1055,35 +1064,45 @@ mod tests {
 
     #[tokio::test]
     async fn bounds_report_single_band_for_viewer_presets() {
-        let reader = CogReader::builder()
-            .snapshot_policy(async_geotiff::io::SnapshotPolicy::AssumeImmutable)
-            .open_object_store(
-                Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap()),
-                "tests/fixtures/uint16.tif",
-            )
-            .await
-            .unwrap();
-        let cache = Arc::new(BlockCache::new(async_geotiff::io::CacheConfig::default()));
-        let state = AppState::new(
-            Some(Arc::new(Tiler::new(Arc::new(reader)))),
-            None,
-            vec![],
-            "http://127.0.0.1:0",
-            cache,
-        );
-        let response = bounds_handler(State(state), Query(vec![])).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response
-                .headers()
-                .get("x-raster-bands")
-                .expect("viewer needs actual band count"),
-            "1"
-        );
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(serde_json::from_slice::<Vec<f64>>(&body).unwrap().len(), 4);
+        for (path, bands, stretch) in [
+            ("tests/fixtures/uint16.tif", "1", "minmax"),
+            ("tests/fixtures/rgb_nodata.tif", "3", "none"),
+        ] {
+            let reader = CogReader::builder()
+                .snapshot_policy(async_geotiff::io::SnapshotPolicy::AssumeImmutable)
+                .open_object_store(
+                    Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap()),
+                    path,
+                )
+                .await
+                .unwrap();
+            let cache = Arc::new(BlockCache::new(async_geotiff::io::CacheConfig::default()));
+            let state = AppState::new(
+                Some(Arc::new(Tiler::new(Arc::new(reader)))),
+                None,
+                vec![],
+                "http://127.0.0.1:0",
+                cache,
+            );
+            let response = bounds_handler(State(state), Query(vec![])).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-raster-bands")
+                    .expect("viewer needs actual band count"),
+                bands
+            );
+            assert_eq!(response.headers()["x-raster-default-stretch"], stretch);
+            assert!(response.headers()["access-control-expose-headers"]
+                .to_str()
+                .unwrap()
+                .contains("x-raster-default-stretch"));
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<Vec<f64>>(&body).unwrap().len(), 4);
+        }
     }
 
     #[tokio::test]

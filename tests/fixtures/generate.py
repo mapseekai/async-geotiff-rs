@@ -5,13 +5,12 @@ import struct
 import zlib
 
 
-def tiff(*, bits=8, bands=3, epsg=4326, deflate=False):
+def tiff(*, bits=8, bands=3, epsg=4326, deflate=False, sizes=(64, 32), tile_size=32):
     data = bytearray(b"II\x2a\x00\x08\x00\x00\x00")
     previous_next = None
-    for level, size in enumerate((64, 32)):
+    for level, size in enumerate(sizes):
         if len(data) % 2:
             data.append(0)
-        tile_size = 32
         tiles = (size // tile_size) ** 2
         scale = (0.001 if epsg == 4326 else 100.0) * 2**level
         origin = (10.0, 20.064) if epsg == 4326 else (1113194.9, 2279430.9)
@@ -72,5 +71,5 @@ def tiff(*, bits=8, bands=3, epsg=4326, deflate=False):
 
 if __name__ == "__main__":
     root = Path(__file__).parent
-    for name, options in (("rgb_nodata.tif", {}), ("uint16.tif", {"bits": 16, "bands": 1}), ("projected.tif", {"epsg": 3857}), ("rgb_deflate.tif", {"deflate": True})):
+    for name, options in (("rgb_nodata.tif", {}), ("uint16.tif", {"bits": 16, "bands": 1}), ("projected.tif", {"epsg": 3857}), ("rgb_deflate.tif", {"deflate": True}), ("rgb_uint16_statistics.tif", {"bits": 16, "deflate": True, "sizes": (1792,), "tile_size": 256})):
         (root / name).write_bytes(tiff(**options))

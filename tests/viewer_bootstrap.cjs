@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 
-async function check(viewer) {
+async function check(viewer, method = null, defaultStretch = "none") {
   const html = fs.readFileSync(`examples/${viewer}.html`, "utf8");
   const requests = [], pending = [], maps = [], elements = new Map();
   class Element {
@@ -51,7 +51,7 @@ async function check(viewer) {
   class Layer { setSource() {} setOpacity() {} }
   const context = {
     console, URLSearchParams, Number, Boolean,
-    window:{location:{search:"?dataset=single.tif&version=2.0&type=rgb&bidx=1&bidx=2&bidx=3", protocol:"http:", origin:"http://test"}, history:{replaceState() {}}},
+    window:{location:{search:"?dataset=single.tif&version=2.0&type=rgb&bidx=1&bidx=2&bidx=3" + (method === null ? "" : `&method=${method}`), protocol:"http:", origin:"http://test"}, history:{replaceState() {}}},
     document:{getElementById:id => elements.get(id), createElement:() => new Element()},
     Option: function(label, value) { this.value = value; this.textContent = label; },
     fetch:url => new Promise(resolve => pending.push({url,resolve})),
@@ -64,7 +64,8 @@ async function check(viewer) {
   const flush = async () => { for (let i=0;i<10;i++) await Promise.resolve(); };
   const reply = (part, data, bands) => {
     const call = pending.find(p=>p.url.includes(part)); assert.ok(call, `${viewer}: missing ${part}`);
-    call.resolve({ok:true,json:async()=>data,headers:{get:()=>bands ?? null}});
+    pending.splice(pending.indexOf(call), 1);
+    call.resolve({ok:true,json:async()=>data,headers:{get:name=>name === "x-raster-bands" ? bands ?? null : name === "x-raster-default-stretch" ? defaultStretch : null}});
   };
   assert.equal(requests.length,0,`${viewer}: raster fetched during bootstrap`);
   maps.forEach(map=>map.emitLoad());
@@ -80,10 +81,16 @@ async function check(viewer) {
     assert.deepEqual(params.getAll("bidx"),["1"],`${viewer}: expected explicit single-band selection`);
     assert.equal(params.get("version"),"2.0");
     assert.equal(params.get("type"),"gray");
-    assert.equal(params.get("method"),"none");
+    assert.equal(params.get("method"),method ?? defaultStretch);
     assert.equal(params.has("stretch"),false);
   }
   const fields = viewer === "maplibre" ? "controls" : "c";
+  // A user's None selection survives later metadata, including UInt16 defaults.
+  vm.runInContext(`${fields}.stretch.value = "none"`, context);
+  for (const change of elements.get("stretch").events.change ?? []) await change();
+  const bounds = vm.runInContext("flyToDataset()", context);
+  reply("/bounds", [0,0,1,1], "1"); await bounds;
+  assert.equal(new URL(vm.runInContext("tileUrl()", context)).searchParams.get("method"), "none");
   vm.runInContext(`${fields}.expression.value = "b1+b1;b1;b1"; ${fields}.stretch.value = "linear"; ${fields}.rescale.value = "0,100;0,200;0,300"`, context);
   let generated = vm.runInContext("tileUrl()", context);
   let params = new URL(generated).searchParams;
@@ -132,6 +139,10 @@ async function check(viewer) {
     assert.equal(latest.get("pixel_selection"), "highest");
     assert.equal(latest.get("stage"), "after_channels");
   }
-  console.log(`${viewer}: delayed dataset/metadata bootstrap passed`);
+  console.log(`${viewer}: delayed metadata, default ${defaultStretch}, explicit ${method ?? "auto"} passed`);
 }
-(async()=>{for(const viewer of ["maplibre","leaflet","openlayers"]) await check(viewer);})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{for(const viewer of ["maplibre","leaflet","openlayers"]) {
+  await check(viewer);
+  await check(viewer, null, "minmax");
+  await check(viewer, "none", "minmax");
+}})().catch(error=>{console.error(error);process.exitCode=1;});

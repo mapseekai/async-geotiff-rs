@@ -287,6 +287,7 @@
       const SERVER_DEFAULT_ZOOM = "__ASYNC_GEOTIFF_DEFAULT_ZOOM__";
       const SERVER_DEFAULT_MODE = "__ASYNC_GEOTIFF_DEFAULT_MODE__";
       const pageParams = new URLSearchParams(window.location.search);
+      let automaticStretch = !pageParams.has("method");
 
       const controls = {
         dataset: document.getElementById("dataset"),
@@ -613,6 +614,11 @@
           );
           if (!r.ok) return;
           if (controls.dataset.value !== ds) return;
+          const defaultStretch = r.headers.get("x-raster-default-stretch");
+          if (automaticStretch && ["none", "minmax"].includes(defaultStretch)) {
+            controls.stretch.value = defaultStretch;
+            syncStretchUi();
+          }
           const bands = Number(r.headers.get("x-raster-bands"));
           if (Number.isInteger(bands) && bands > 0) {
             datasetBands = bands;
@@ -679,6 +685,7 @@
       }
 
       function applyNdvi() {
+        automaticStretch = false;
         controls.expression.value = "(b5-b4)/(b5+b4)";
         controls.bidx.value = "";
         controls.stretch.value = "linear";
@@ -689,6 +696,7 @@
         document.getElementById("style-form").requestSubmit();
       }
       controls.stretch.addEventListener("change", () => {
+        automaticStretch = false;
         syncStretchUi();
         document.getElementById("style-form").requestSubmit();
       });

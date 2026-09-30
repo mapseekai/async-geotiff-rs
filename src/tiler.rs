@@ -119,6 +119,16 @@ impl Tiler {
         self
     }
 
+    /// Whether every source sample is an unsigned 8-bit integer.
+    pub fn is_u8(&self) -> AgResult<bool> {
+        let ifd = self.reader.data_ifd(0)?;
+        Ok(ifd.bits_per_sample().iter().all(|&bits| bits == 8)
+            && ifd
+                .sample_format()
+                .iter()
+                .all(|format| *format == async_tiff::tags::SampleFormat::Uint))
+    }
+
     /// Number of renderable bands after an ExtraSamples alpha channel is removed.
     pub fn band_count(&self) -> AgResult<usize> {
         use async_tiff::tags::ExtraSamples;
@@ -399,15 +409,19 @@ impl Tiler {
             }
             return Ok(None);
         };
-        let raster = crate::style::statistics::resolve(
-            style,
-            std::slice::from_ref(&self.reader),
-            false,
-            &self.cpu,
-            &self.work_budget,
-            context,
-        )
-        .await?;
+        let raster = if style.raster.stretch.needs_statistics() {
+            crate::style::statistics::resolve(
+                style,
+                std::slice::from_ref(&self.reader),
+                false,
+                &self.cpu,
+                &self.work_budget,
+                context,
+            )
+            .await?
+        } else {
+            compiled.raster.clone()
+        };
         let bands = u64::from(self.reader.data_ifd(plan.level)?.samples_per_pixel());
         let bytes = tile_work_bytes(plan.w, plan.h, bands, u64::from(style.tilesize))?;
         let context = &context.with_work(self.work_budget.try_reserve(bytes)?);

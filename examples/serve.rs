@@ -348,6 +348,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/leaflet",
             get(|| async { Html(include_str!("leaflet.html")) }),
         );
+    // Compile the SDK's lazy schema and Q2 bindings before accepting requests.
+    let style_query = "version=2.0&type=gray&bidx=1";
+    async_geotiff::style::TileStyle::from_raster_query(style_query)?;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     println!("Listening on: http://{bind_addr}");
     println!("Loopback COG base: {http_base}");
@@ -355,7 +358,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("OpenLayers viewer: {http_base}/openlayers");
     println!("Leaflet viewer: {http_base}/leaflet");
     let tile_base = format!("{http_base}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}");
-    let style_query = "version=2.0&type=gray&bidx=1";
     println!("Tile endpoint: {tile_base}.png?{style_query}");
     #[cfg(feature = "webp")]
     println!("  WebP tiles: {tile_base}.webp?{style_query}&format=webp&lossless=true");

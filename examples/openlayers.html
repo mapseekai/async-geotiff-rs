@@ -217,6 +217,7 @@
       };
 
       const pageParams = new URLSearchParams(window.location.search);
+      let automaticStretch = !pageParams.has("method");
       const requestedDataset = pageParams.get("dataset");
       const requestedFormat = pageParams.get("format") ?? "png";
       let rgbPresetPending = pageParams.getAll("bidx").join(",").replace(/\s/g, "") === "1,2,3";
@@ -266,6 +267,7 @@
       restorePageParams();
 
       function applyNdvi() {
+        automaticStretch = false;
         c.expression.value = "(b5-b4)/(b5+b4)";
         c.bidx.value = "";
         c.stretch.value = "linear";
@@ -360,6 +362,11 @@
           );
           if (!r.ok) return;
           if (c.dataset.value !== ds) return;
+          const defaultStretch = r.headers.get("x-raster-default-stretch");
+          if (automaticStretch && ["none", "minmax"].includes(defaultStretch)) {
+            c.stretch.value = defaultStretch;
+            syncStretchUi();
+          }
           const bands = Number(r.headers.get("x-raster-bands"));
           if (Number.isInteger(bands) && bands > 0) {
             datasetBands = bands;
@@ -399,6 +406,7 @@
         applyStyle();
       });
       c.stretch.addEventListener("change", () => {
+        automaticStretch = false;
         syncStretchUi();
         applyStyle();
       });

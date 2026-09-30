@@ -2,7 +2,7 @@
 use super::raster::normalize;
 use crate::error::{AgError, AgResult};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 #[derive(Debug, Clone)]
 pub(crate) enum Transfer {
@@ -116,21 +116,39 @@ impl Stretch {
         }
     }
 
-    pub(crate) fn resolve(&self, mut values: Vec<f64>) -> AgResult<Transfer> {
+    pub(crate) fn resolve<'a>(&self, values: impl Into<Cow<'a, [f64]>>) -> AgResult<Transfer> {
+        let mut values = values.into();
         if values.is_empty() {
             return Ok(Transfer::Empty);
         }
-        values.sort_unstable_by(f64::total_cmp);
-        let first = values[0];
-        let last = values[values.len() - 1];
+        if matches!(self, Self::Histogram) {
+            values.to_mut().sort_unstable_by(f64::total_cmp);
+        }
+        let (first, last) = values
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
         Ok(match self {
             Self::MinMax => Transfer::Range(first, last),
             Self::Percentile([lo, hi]) => {
-                let quantile = |p: f64| {
+                let mut quantile = |p: f64| {
                     let h = (values.len() - 1) as f64 * (p / 100.);
                     let a = h.floor() as usize;
                     let b = h.ceil() as usize;
-                    lerp(values[a], values[b], h - a as f64)
+                    // Only the adjacent order statistics are needed, not a
+                    // complete sort of the cached sample copy.
+                    let (_, lower, above) =
+                        values.to_mut().select_nth_unstable_by(a, f64::total_cmp);
+                    let upper = if a == b {
+                        *lower
+                    } else {
+                        *above
+                            .iter()
+                            .min_by(|a, b| a.total_cmp(b))
+                            .expect("next quantile sample")
+                    };
+                    lerp(*lower, upper, h - a as f64)
                 };
                 Transfer::Range(quantile(*lo), quantile(*hi))
             }
@@ -248,6 +266,44 @@ impl Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_percentiles_match_full_sort_without_mutating_cached_samples() {
+        for n in [1, 2, 3, 257, 4096] {
+            let mixed: Vec<f64> = (0..n)
+                .map(|i| ((i * 131 + 17) % 101) as f64 - 50.)
+                .collect();
+            for mut values in [mixed, vec![7.; n], (0..n).map(|i| i as f64).collect()] {
+                values.reverse();
+                if n > 2 {
+                    values[0] = -f64::MAX;
+                    values[1] = f64::MAX;
+                    values[2] = -0.;
+                }
+                let original: Vec<_> = values.iter().map(|v| v.to_bits()).collect();
+                let mut sorted = values.clone();
+                sorted.sort_unstable_by(f64::total_cmp);
+                for percentiles in [[0., 100.], [2., 98.], [25., 75.], [33.3, 66.7], [50., 50.]] {
+                    let expected = percentiles.map(|p| {
+                        let h = (n - 1) as f64 * (p / 100.);
+                        let a = h.floor() as usize;
+                        lerp(sorted[a], sorted[h.ceil() as usize], h - a as f64)
+                    });
+                    let Transfer::Range(lo, hi) = Stretch::Percentile(percentiles)
+                        .resolve(values.as_slice())
+                        .unwrap()
+                    else {
+                        panic!("expected percentile range");
+                    };
+                    assert_eq!([lo.to_bits(), hi.to_bits()], expected.map(f64::to_bits));
+                    assert_eq!(
+                        values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        original
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn reference_statistics_curves_and_degenerate_ranges() {
         let samples = vec![0., 0., 10., 20.];

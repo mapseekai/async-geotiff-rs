@@ -57,6 +57,44 @@ pub fn warp(
     dst_h: usize,
     resampling: Resampling,
 ) -> AgResult<ImageData> {
+    warp_impl(src, None, dst_crs, dst_bbox, dst_w, dst_h, resampling)
+}
+
+/// Selected bands share geometry, but retain independent interpolation validity.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn warp_selected(
+    src: &ImageData,
+    selected: &[usize],
+    dst_crs: &Crs,
+    dst_bbox: Bbox,
+    dst_w: usize,
+    dst_h: usize,
+    resampling: Resampling,
+) -> AgResult<ImageData> {
+    if selected.is_empty() || selected.iter().any(|&b| b >= src.pixels.bands()) {
+        return Err(AgError::Warp("invalid selected bands".into()));
+    }
+    warp_impl(
+        src,
+        Some(selected),
+        dst_crs,
+        dst_bbox,
+        dst_w,
+        dst_h,
+        resampling,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn warp_impl(
+    src: &ImageData,
+    selected: Option<&[usize]>,
+    dst_crs: &Crs,
+    dst_bbox: Bbox,
+    dst_w: usize,
+    dst_h: usize,
+    resampling: Resampling,
+) -> AgResult<ImageData> {
     let source_shape = (src.pixels.bands(), src.pixels.height(), src.pixels.width());
     if dst_w == 0
         || dst_h == 0
@@ -106,7 +144,8 @@ pub fn warp(
         && row_axis.1 < origin.1
         && col_axis.1 == origin.1
         && row_axis.0 == origin.0;
-    let can_resize = matches!(src.pixels, PixelData::U8(_) | PixelData::U16(_))
+    let can_resize = selected.is_none()
+        && matches!(src.pixels, PixelData::U8(_) | PixelData::U16(_))
         && matches!(resampling, Resampling::Nearest)
         && src.nodata.is_none();
     if &src.crs == dst_crs && north_up && can_resize {
@@ -177,24 +216,25 @@ pub fn warp(
         }
     }
 
-    // -- Scalar fallback (cross-CRS, not approximable by single rectangle) --
-    // Optimisations vs. the previous nested triple loop:
-    //   1. Per-column (sc, sr, j0/dj) are precomputed once per row, not per
-    //      band — the original layout recomputed grid coords inside the
-    //      band loop and re-took `src_f64.index_axis(b)` on every pixel.
-    //   2. Per-band views (`src_f64.index_axis`) are hoisted outside the
-    //      pixel loop — one view per band per row.
-    //   3. Output rows are independent → `par_chunks_mut` over rayon.
-    //   4. The mask is computed once per pixel (not per band) and read from
-    //      `src.mask` only at the row level.
-    let bands = src.pixels.bands();
-    let src_f64 = src.pixels.as_f64();
+    // Geometry is shared; selected bands are converted and sampled one at a
+    // time to bound source-sized F64 scratch and preserve per-band NoData.
+    let all_bands: Vec<_> = (0..src.pixels.bands()).collect();
+    let selected_bands = selected.unwrap_or(&all_bands);
+    let bands = selected_bands.len();
+    let src_f64 = selected.is_none().then(|| src.pixels.as_f64());
     let fill = src.nodata.unwrap_or(0.0);
-    let src_h = src_f64.shape()[1];
-    let src_w = src_f64.shape()[2];
-
-    // Output: planar (bands, h, w) flat allocation. Slice per band so each
-    // rayon row writes contiguous memory.
+    let (src_h, src_w) = (src.pixels.height(), src.pixels.width());
+    let needs_numeric_mask =
+        src.nodata.is_some() || matches!(src.pixels, PixelData::F32(_) | PixelData::F64(_));
+    let joint_mask = src_f64.as_ref().filter(|_| needs_numeric_mask).map(|a| {
+        Array2::from_shape_fn((src_h, src_w), |(r, c)| {
+            src.mask.as_ref().is_none_or(|m| m[[r, c]])
+                && (0..bands).all(|b| {
+                    let v = a[[b, r, c]];
+                    v.is_finite() && src.nodata.is_none_or(|nd| nd.is_nan() || v != nd)
+                })
+        })
+    });
     let mut out = Array3::<f64>::zeros((bands, dst_h, dst_w));
     let mut mask = Array2::<bool>::from_elem((dst_h, dst_w), true);
 
@@ -212,27 +252,6 @@ pub fn warp(
         })
         .collect();
 
-    // Hoist band views out of the hot loop.
-    let band_views: Vec<ndarray::ArrayView2<f64>> = (0..bands)
-        .map(|b| src_f64.index_axis(ndarray::Axis(0), b))
-        .collect();
-    let needs_numeric_mask =
-        src.nodata.is_some() || matches!(src.pixels, PixelData::F32(_) | PixelData::F64(_));
-    let numeric_mask = needs_numeric_mask.then(|| {
-        Array2::from_shape_fn((src_h, src_w), |(r, c)| {
-            src.mask.as_ref().is_none_or(|m| m[[r, c]])
-                && (0..bands).all(|b| {
-                    let v = src_f64[[b, r, c]];
-                    v.is_finite() && src.nodata.is_none_or(|nd| nd.is_nan() || v != nd)
-                })
-        })
-    });
-    let source_mask = numeric_mask.as_ref().or(src.mask.as_ref());
-    let src_mask_view = source_mask.map(|m| m.view());
-
-    // Process each row in parallel. Output band slices are disjoint along
-    // the row dimension, so we collect per-row (mask_row, [band_row,...])
-    // results and copy into `out`/`mask` after the parallel section.
     use rayon::prelude::*;
     let is_average = matches!(resampling, Resampling::Average);
     let is_mode = matches!(resampling, Resampling::Mode);
@@ -255,104 +274,100 @@ pub fn warp(
     let coord_rows: Vec<Vec<(f64, f64)>> = (0..dst_h)
         .map(|r| row_src_coords(r, dst_h, dst_w, &col_table, &grid_src_pix))
         .collect();
-    let rows: Vec<(usize, Vec<bool>, Vec<Vec<f64>>)> = (0..dst_h)
-        .into_par_iter()
-        .map(|r| {
-            let coords = &coord_rows[r];
-            let mut mask_row = vec![true; dst_w];
-            let mut band_rows: Vec<Vec<f64>> = (0..bands).map(|_| vec![fill; dst_w]).collect();
-
-            if is_average || is_mode {
-                // Differentiate the same bilinear control cell used for the
-                // center coordinate. This works even when either target axis
-                // has a single pixel (there is no neighbor to difference).
+    for (output_band, &source_band) in selected_bands.iter().enumerate() {
+        let converted = if src_f64.is_some() || matches!(src.pixels, PixelData::F64(_)) {
+            None
+        } else {
+            Some(src.pixels.band_to_f64(source_band))
+        };
+        let band_view = if let Some(a) = &src_f64 {
+            a.index_axis(ndarray::Axis(0), source_band)
+        } else if let PixelData::F64(a) = &src.pixels {
+            a.index_axis(ndarray::Axis(0), source_band)
+        } else {
+            converted.as_ref().expect("non-F64 band conversion").view()
+        };
+        let numeric_mask = (selected.is_some() && needs_numeric_mask).then(|| {
+            Array2::from_shape_fn((src_h, src_w), |(r, c)| {
+                let v = band_view[[r, c]];
+                src.mask.as_ref().is_none_or(|m| m[[r, c]])
+                    && v.is_finite()
+                    && src.nodata.is_none_or(|nd| nd.is_nan() || v != nd)
+            })
+        });
+        let source_mask = numeric_mask
+            .as_ref()
+            .or(joint_mask.as_ref())
+            .or(src.mask.as_ref());
+        let src_mask_view = source_mask.map(|m| m.view());
+        let mut dst_band = out.index_axis_mut(ndarray::Axis(0), output_band);
+        dst_band
+            .as_slice_mut()
+            .expect("contiguous output band")
+            .par_chunks_mut(dst_w)
+            .zip(
+                mask.as_slice_mut()
+                    .expect("contiguous output mask")
+                    .par_chunks_mut(dst_w),
+            )
+            .enumerate()
+            .for_each(|(r, (band_row, mask_row))| {
+                let coords = &coord_rows[r];
                 let gi = (r as f64 + 0.5) * WARP_GRID_SIZE as f64 / dst_h as f64;
                 let i0 = (gi.floor() as usize).min(WARP_GRID_SIZE - 1);
                 let di = gi - i0 as f64;
-                for c in 0..dst_w {
-                    let (sc, sr) = coords[c];
-                    let (j0, j1, dj) = col_table[c];
-                    let p00 = grid_src_pix[i0 * (WARP_GRID_SIZE + 1) + j0];
-                    let p01 = grid_src_pix[i0 * (WARP_GRID_SIZE + 1) + j1];
-                    let p10 = grid_src_pix[(i0 + 1) * (WARP_GRID_SIZE + 1) + j0];
-                    let p11 = grid_src_pix[(i0 + 1) * (WARP_GRID_SIZE + 1) + j1];
-                    let sx = WARP_GRID_SIZE as f64 / dst_w as f64;
-                    let sy = WARP_GRID_SIZE as f64 / dst_h as f64;
-                    let dx_col = ((p01.0 - p00.0) * (1.0 - di) + (p11.0 - p10.0) * di) * sx;
-                    let dy_col = ((p01.1 - p00.1) * (1.0 - di) + (p11.1 - p10.1) * di) * sx;
-                    let dx_row = ((p10.0 - p00.0) * (1.0 - dj) + (p11.0 - p01.0) * dj) * sy;
-                    let dy_row = ((p10.1 - p00.1) * (1.0 - dj) + (p11.1 - p01.1) * dj) * sy;
-                    // Axis-aligned envelope of the local pixel parallelogram.
-                    let rx = ((dx_col.abs() + dx_row.abs()) * 0.5).max(1e-6);
-                    let ry = ((dy_col.abs() + dy_row.abs()) * 0.5).max(1e-6);
-                    for (b, band_view) in band_views.iter().enumerate() {
-                        let value = if is_mode {
-                            resampling.sample_mode(
-                                *band_view,
-                                src_mask_view,
-                                sc,
-                                sr,
-                                rx,
-                                ry,
-                                f64::NAN,
-                            )
-                        } else {
-                            let corners = average_corners.as_ref().unwrap();
-                            let top = r * (dst_w + 1) + c;
-                            let bottom = (r + 1) * (dst_w + 1) + c;
-                            resampling.sample_average_polygon(
-                                *band_view,
-                                src_mask_view,
-                                [
-                                    corners[top],
-                                    corners[top + 1],
-                                    corners[bottom + 1],
-                                    corners[bottom],
-                                ],
-                                f64::NAN,
-                            )
-                        };
-                        mask_row[c] &= value.is_finite();
-                        band_rows[b][c] = if value.is_finite() { value } else { fill };
-                    }
-                }
-            } else {
                 for (c, &(sc, sr)) in coords.iter().enumerate() {
-                    for (b, band_view) in band_views.iter().enumerate() {
-                        let value =
-                            resampling.sample_masked(*band_view, src_mask_view, sc, sr, f64::NAN);
-                        mask_row[c] &= value.is_finite();
-                        band_rows[b][c] = if value.is_finite() { value } else { fill };
-                    }
+                    let value = if is_average {
+                        let corners = average_corners.as_ref().expect("average pixel corners");
+                        let top = r * (dst_w + 1) + c;
+                        let bottom = (r + 1) * (dst_w + 1) + c;
+                        resampling.sample_average_polygon(
+                            band_view,
+                            src_mask_view,
+                            [
+                                corners[top],
+                                corners[top + 1],
+                                corners[bottom + 1],
+                                corners[bottom],
+                            ],
+                            f64::NAN,
+                        )
+                    } else if is_mode {
+                        let (j0, j1, dj) = col_table[c];
+                        let p00 = grid_src_pix[i0 * (WARP_GRID_SIZE + 1) + j0];
+                        let p01 = grid_src_pix[i0 * (WARP_GRID_SIZE + 1) + j1];
+                        let p10 = grid_src_pix[(i0 + 1) * (WARP_GRID_SIZE + 1) + j0];
+                        let p11 = grid_src_pix[(i0 + 1) * (WARP_GRID_SIZE + 1) + j1];
+                        let sx = WARP_GRID_SIZE as f64 / dst_w as f64;
+                        let sy = WARP_GRID_SIZE as f64 / dst_h as f64;
+                        let dx_col = ((p01.0 - p00.0) * (1.0 - di) + (p11.0 - p10.0) * di) * sx;
+                        let dy_col = ((p01.1 - p00.1) * (1.0 - di) + (p11.1 - p10.1) * di) * sx;
+                        let dx_row = ((p10.0 - p00.0) * (1.0 - dj) + (p11.0 - p01.0) * dj) * sy;
+                        let dy_row = ((p10.1 - p00.1) * (1.0 - dj) + (p11.1 - p01.1) * dj) * sy;
+                        let rx = ((dx_col.abs() + dx_row.abs()) * 0.5).max(1e-6);
+                        let ry = ((dy_col.abs() + dy_row.abs()) * 0.5).max(1e-6);
+                        resampling.sample_mode(band_view, src_mask_view, sc, sr, rx, ry, f64::NAN)
+                    } else {
+                        resampling.sample_masked(band_view, src_mask_view, sc, sr, f64::NAN)
+                    };
+                    mask_row[c] &= value.is_finite();
+                    band_row[c] = if value.is_finite() { value } else { fill };
                 }
-            }
-            (r, mask_row, band_rows)
-        })
-        .collect();
-
-    // Scatter back into output buffers (cheap; rows already contiguous).
-    for (r, mask_row, band_rows) in rows {
-        for (c, m) in mask_row.into_iter().enumerate() {
-            mask[[r, c]] = m;
-        }
-        for (b, row_vals) in band_rows.into_iter().enumerate() {
-            let mut dst_band = out.index_axis_mut(ndarray::Axis(0), b);
-            let mut dst_row = dst_band.row_mut(r);
-            let dst_slice = dst_row
-                .as_slice_mut()
-                .expect("row_mut of Array3 is contiguous along last axis");
-            dst_slice.copy_from_slice(&row_vals);
-        }
+            });
     }
 
     // Preserve the native display dtype across geometry paths. Otherwise an
     // interpolated U8 RGB image would unexpectedly enter float auto-stretch.
     // Wide integer/F64 sources retain F64 rather than losing bits via F32.
-    let pixels = match src.pixels {
-        PixelData::U8(_) => PixelData::U8(out.mapv(|v| v.round().clamp(0.0, 255.0) as u8)),
-        PixelData::U16(_) => PixelData::U16(out.mapv(|v| v.round().clamp(0.0, 65535.0) as u16)),
-        PixelData::F32(_) => PixelData::F32(out.mapv(|v| v as f32)),
-        _ => PixelData::F64(out),
+    let pixels = if selected.is_some() && resampling != Resampling::Nearest {
+        PixelData::F64(out)
+    } else {
+        match src.pixels {
+            PixelData::U8(_) => PixelData::U8(out.mapv(|v| v.round().clamp(0.0, 255.0) as u8)),
+            PixelData::U16(_) => PixelData::U16(out.mapv(|v| v.round().clamp(0.0, 65535.0) as u16)),
+            PixelData::F32(_) => PixelData::F32(out.mapv(|v| v as f32)),
+            _ => PixelData::F64(out),
+        }
     };
     Ok(ImageData {
         pixels,
@@ -360,7 +375,7 @@ pub fn warp(
         bbox: dst_bbox,
         crs: dst_crs.clone(),
         transform: dst_transform,
-        nodata: src.nodata,
+        nodata: if selected.is_some() { None } else { src.nodata },
     })
 }
 

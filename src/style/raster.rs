@@ -27,6 +27,20 @@ pub(crate) struct RasterPlan {
     colors: Colors,
     gamma: Vec<(String, f64)>,
     opacity: f64,
+    pub(crate) statistics_key: String,
+    pub(crate) stretch_key: String,
+    rgb_luts: Arc<RgbLuts>,
+}
+
+#[derive(Debug, Default)]
+struct RgbLuts {
+    u8: std::sync::OnceLock<[Vec<u8>; 3]>,
+    u16: std::sync::OnceLock<[Vec<u8>; 3]>,
+}
+
+pub(crate) struct StatisticsResult {
+    stretch: Stretch,
+    rgb_luts: Arc<RgbLuts>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +310,22 @@ impl TileStyle {
             }
             Resampling::parse(name).ok_or_else(|| unsupported(&format!("/resampling/{key}")))
         };
+        let (statistics_key, stretch_key) = if transfer.needs_statistics() {
+            let key = serde_json::json!({
+                "bidx": renderer.get("bidx"), "expression": renderer.get("expression"),
+                "language": renderer.get("language"), "resampling": v.get("resampling"),
+                "nodata": v.get("nodata"), "calibration": v.get("calibration"),
+                "mosaic": v.get("mosaic"), "statistics": v.get("statistics")
+            })
+            .to_string();
+            let mut stretch = stretch.clone();
+            if let Some(object) = stretch.as_object_mut() {
+                object.remove("range_policy");
+            }
+            (key, stretch.to_string())
+        } else {
+            (String::new(), String::new())
+        };
         let out = Self {
             nodata: v["nodata"]
                 .as_f64()
@@ -319,6 +349,9 @@ impl TileStyle {
                 colors,
                 gamma,
                 opacity: v["opacity"].as_f64().unwrap_or(1.0),
+                statistics_key,
+                stretch_key,
+                rgb_luts: Arc::default(),
             }),
         };
         if !super::params::ALLOWED_TILE_SIZES.contains(&out.tilesize) {
@@ -345,6 +378,7 @@ fn hex_color(text: &str) -> [u8; 4] {
     })
 }
 
+#[inline]
 fn byte(value: f64) -> u8 {
     let t = 255.0 * value.clamp(0.0, 1.0);
     let half = t.floor() + 0.5;
@@ -363,6 +397,33 @@ pub(crate) fn normalize(x: f64, lo: f64, hi: f64) -> f64 {
         (x - lo) / (hi - lo)
     } else {
         (x / 2.0 - lo / 2.0) / (hi / 2.0 - lo / 2.0)
+    }
+}
+
+/// Multiplication suffices away from byte boundaries. Near a half step use
+/// the original division and quantizer, including its 1e-10 tie tolerance.
+#[inline]
+fn range_byte(value: f64, (lo, hi, span, inverse): (f64, f64, f64, f64)) -> u8 {
+    if lo == hi && value == lo {
+        return 128;
+    }
+    if value <= lo {
+        return 0;
+    }
+    if value >= hi {
+        return 255;
+    }
+    if !span.is_finite() || !inverse.is_finite() {
+        return byte(normalize(value, lo, hi));
+    }
+    let scaled = 255.0 * ((value - lo) * inverse);
+    let rounded = (scaled + 0.5).floor();
+    // Even a subnormal reciprocal has <1e-12 byte error on an interior
+    // sample. The margin also encloses the quantizer's snapping tolerance.
+    if ((scaled - rounded).abs() - 0.5).abs() < 1e-8 {
+        byte((value - lo) / span)
+    } else {
+        rounded as u8
     }
 }
 
@@ -386,43 +447,49 @@ impl RasterPlan {
                 "referenced source band does not exist",
             ));
         }
-        let count = self.dependencies.len().max(1);
-        let mut pixels = Array3::zeros((count, size, size));
-        let mut mask = Array2::from_elem((size, size), true);
-        // ponytail: one existing warp per dependency; batch with per-band masks
-        // if profiling shows many-band expressions need a shared projection grid.
-        let mut output = None;
-        for i in 0..count {
-            let constant = self.dependencies.is_empty();
-            let values = if constant {
-                Array2::zeros((src.pixels.height(), src.pixels.width()))
-            } else {
-                src.pixels.band_to_f64(self.dependencies[i])
-            };
-            let band = ImageData {
-                pixels: PixelData::F64(values.insert_axis(Axis(0))),
-                mask: src.mask.clone(),
-                nodata: if constant { None } else { src.nodata },
-                crs: src.crs.clone(),
-                bbox: src.bbox,
-                transform: src.transform,
-            };
-            let warped = crate::warp::warp(&band, dst_crs, dst_bbox, size, size, resampling)?;
-            pixels
-                .index_axis_mut(Axis(0), i)
-                .assign(&warped.pixels.band_to_f64(0));
-            if let Some(valid) = &warped.mask {
-                ndarray::Zip::from(&mut mask)
-                    .and(valid)
-                    .for_each(|a, b| *a &= *b);
+        if !self.dependencies.is_empty() {
+            // Native nearest-neighbor values stay exact. Select first so unused
+            // bands cannot affect validity; the other kernels retain F64 precision.
+            if src.crs == *dst_crs && src.nodata.is_none() && resampling == Resampling::Nearest {
+                let pixels = match &src.pixels {
+                    PixelData::U8(a) => Some(PixelData::U8(a.select(Axis(0), &self.dependencies))),
+                    PixelData::U16(a) => {
+                        Some(PixelData::U16(a.select(Axis(0), &self.dependencies)))
+                    }
+                    _ => None,
+                };
+                if let Some(pixels) = pixels {
+                    let selected = ImageData {
+                        pixels,
+                        mask: src.mask.clone(),
+                        nodata: None,
+                        crs: src.crs.clone(),
+                        bbox: src.bbox,
+                        transform: src.transform,
+                    };
+                    return crate::warp::warp(&selected, dst_crs, dst_bbox, size, size, resampling);
+                }
             }
-            output = Some(warped);
+            return crate::warp::reproject::warp_selected(
+                src,
+                &self.dependencies,
+                dst_crs,
+                dst_bbox,
+                size,
+                size,
+                resampling,
+            );
         }
-        let mut output = output.expect("at least the coverage band");
-        output.pixels = PixelData::F64(pixels);
-        output.mask = Some(mask);
-        output.nodata = None;
-        Ok(output)
+        // A constant expression still needs the source coverage mask.
+        let coverage = ImageData {
+            pixels: PixelData::F64(Array3::zeros((1, src.pixels.height(), src.pixels.width()))),
+            mask: src.mask.clone(),
+            nodata: None,
+            crs: src.crs.clone(),
+            bbox: src.bbox,
+            transform: src.transform,
+        };
+        crate::warp::warp(&coverage, dst_crs, dst_bbox, size, size, resampling)
     }
 
     pub(crate) fn compact(&self) -> Self {
@@ -466,6 +533,13 @@ impl RasterPlan {
             return image;
         }
         let bound = self.compact();
+        if bound.inputs.len() == image.pixels.bands()
+            && bound.inputs.iter().enumerate().all(
+                |(i, tokens)| matches!(tokens.as_slice(), [expression::Token::Band(b)] if *b == i),
+            )
+        {
+            return image;
+        }
         let src = image.pixels.as_f64();
         let (h, w) = (image.pixels.height(), image.pixels.width());
         let mut pixels = Array3::zeros((bound.inputs.len(), h, w));
@@ -507,11 +581,11 @@ impl RasterPlan {
         bound.render(image, None, format)
     }
 
-    pub(crate) fn resolve_statistics(
+    pub(crate) fn statistics_samples(
         &self,
         image: &ImageData,
         channels_ready: bool,
-    ) -> AgResult<Self> {
+    ) -> Vec<Vec<f64>> {
         let mut bound = self.compact();
         if channels_ready {
             bound.inputs = (0..self.inputs.len())
@@ -519,10 +593,34 @@ impl RasterPlan {
                 .collect();
             bound.dependencies = (0..self.inputs.len()).collect();
         }
-        let src = image.pixels.as_f64();
         let n = image.pixels.width() * image.pixels.height();
         let k = self.statistics.sample_size.unwrap_or(n).min(n);
-        let mut values = vec![Vec::with_capacity(k); self.inputs.len()];
+        let bands: Option<Vec<usize>> = bound
+            .inputs
+            .iter()
+            .map(|tokens| match tokens.as_slice() {
+                [expression::Token::Band(b)] => Some(*b),
+                _ => None,
+            })
+            .collect();
+        if let Some(bands) = bands {
+            let direct = match &image.pixels {
+                PixelData::U8(a) => sample_bands(a, image.mask.as_ref(), &bands, k),
+                PixelData::U16(a) => sample_bands(a, image.mask.as_ref(), &bands, k),
+                PixelData::I16(a) => sample_bands(a, image.mask.as_ref(), &bands, k),
+                PixelData::U32(a) => sample_bands(a, image.mask.as_ref(), &bands, k),
+                PixelData::I32(a) => sample_bands(a, image.mask.as_ref(), &bands, k),
+                PixelData::F32(a) => sample_bands(a, image.mask.as_ref(), &bands, k),
+                PixelData::F64(a) => sample_bands(a, image.mask.as_ref(), &bands, k),
+            };
+            if let Some(values) = direct {
+                return values;
+            }
+        }
+        let src = image.pixels.as_f64();
+        let mut values: Vec<Vec<f64>> = (0..self.inputs.len())
+            .map(|_| Vec::with_capacity(k))
+            .collect();
         let mut samples = vec![0.0; image.pixels.bands()];
         let mut tuple = vec![0.0; self.inputs.len()];
         let mut stack = Vec::new();
@@ -543,7 +641,10 @@ impl RasterPlan {
                 continue;
             }
             for (v, tokens) in tuple.iter_mut().zip(&bound.inputs) {
-                *v = expression::eval_rpn_with(tokens, &samples, &mut stack);
+                *v = match tokens.as_slice() {
+                    [expression::Token::Band(b)] => samples[*b],
+                    _ => expression::eval_rpn_with(tokens, &samples, &mut stack),
+                };
             }
             // RGB statistics consume only complete valid tuples.
             if tuple.iter().any(|v| !v.is_finite()) {
@@ -553,14 +654,165 @@ impl RasterPlan {
                 channel.push(v);
             }
         }
+        values
+    }
+
+    pub(crate) fn resolve_samples(&self, values: &[Vec<f64>]) -> AgResult<StatisticsResult> {
+        use rayon::prelude::*;
+        Ok(StatisticsResult {
+            stretch: Stretch::Resolved(
+                values
+                    .par_iter()
+                    .map(|v| self.stretch.resolve(v.as_slice()))
+                    .collect::<AgResult<Vec<Transfer>>>()?,
+            ),
+            rgb_luts: Arc::default(),
+        })
+    }
+
+    pub(crate) fn with_statistics(&self, result: &StatisticsResult) -> Self {
         let mut resolved = self.clone();
-        resolved.stretch = Stretch::Resolved(
-            values
-                .into_iter()
-                .map(|v| self.stretch.resolve(v))
-                .collect::<AgResult<Vec<Transfer>>>()?,
-        );
-        Ok(resolved)
+        resolved.stretch = result.stretch.clone();
+        resolved.rgb_luts = result.rgb_luts.clone();
+        resolved
+    }
+
+    fn render_rgb_fast(
+        &self,
+        image: &ImageData,
+        nodata: Option<f64>,
+        format: TileFormat,
+    ) -> AgResult<Option<Bytes>> {
+        if !matches!(self.colors, Colors::Rgb) || !self.gamma.is_empty() {
+            return Ok(None);
+        }
+        let transfers = self.stretch.transfers()?;
+        if self.inputs.len() != 3 || !transfers.iter().all(|t| matches!(t, Transfer::Range(..))) {
+            return Ok(None);
+        }
+        let bands: [Option<usize>; 3] = std::array::from_fn(|i| match self.inputs[i].as_slice() {
+            [expression::Token::Band(b)] => Some(*b),
+            _ => None,
+        });
+        let [Some(r), Some(g), Some(b)] = bands else {
+            return Ok(None);
+        };
+        let bands = [r, g, b];
+        let lut = |size| {
+            std::array::from_fn(|b| {
+                (0..size)
+                    .map(|v| byte(transfers[b].apply(v as f64, false).expect("range transfer")))
+                    .collect()
+            })
+        };
+        let rgba = match &image.pixels {
+            PixelData::U8(a) => self.rgb_array(
+                a,
+                image.mask.as_ref(),
+                nodata,
+                &bands,
+                Some(self.rgb_luts.u8.get_or_init(|| lut(256))),
+            ),
+            PixelData::U16(a) => self.rgb_array(
+                a,
+                image.mask.as_ref(),
+                nodata,
+                &bands,
+                Some(self.rgb_luts.u16.get_or_init(|| lut(65536))),
+            ),
+            PixelData::I16(a) => self.rgb_array(a, image.mask.as_ref(), nodata, &bands, None),
+            PixelData::U32(a) => self.rgb_array(a, image.mask.as_ref(), nodata, &bands, None),
+            PixelData::I32(a) => self.rgb_array(a, image.mask.as_ref(), nodata, &bands, None),
+            PixelData::F32(a) => self.rgb_array(a, image.mask.as_ref(), nodata, &bands, None),
+            PixelData::F64(a) => self.rgb_array(a, image.mask.as_ref(), nodata, &bands, None),
+        };
+        rgba.map(|rgba| encode(&rgba, format)).transpose()
+    }
+
+    fn rgb_array<T: Copy + Into<f64> + Sync>(
+        &self,
+        src: &Array3<T>,
+        mask: Option<&Array2<bool>>,
+        nodata: Option<f64>,
+        bands: &[usize],
+        lut: Option<&[Vec<u8>; 3]>,
+    ) -> Option<Array3<u8>> {
+        let views: [_; 3] = std::array::from_fn(|i| src.index_axis(Axis(0), bands[i]));
+        let channels: [&[T]; 3] = [
+            views[0].as_slice()?,
+            views[1].as_slice()?,
+            views[2].as_slice()?,
+        ];
+        let mask = match mask {
+            Some(m) => Some(m.as_slice()?),
+            None => None,
+        };
+        let transfers = self.stretch.transfers().ok()?;
+        let ranges: [_; 3] = std::array::from_fn(|i| match transfers[i] {
+            Transfer::Range(lo, hi) => (lo, hi, hi - lo, 1.0 / (hi - lo)),
+            _ => unreachable!("RGB range fast path"),
+        });
+        let mut rgba = Array3::zeros((src.shape()[1], src.shape()[2], 4));
+        let alpha = byte(self.opacity);
+        if alpha == 0 {
+            return Some(rgba);
+        }
+        const CHUNK_PIXELS: usize = 16 * 1024;
+        let render_chunk = |(chunk, out): (usize, &mut [u8])| {
+            for (offset, pixel) in out.chunks_exact_mut(4).enumerate() {
+                let i = chunk * CHUNK_PIXELS + offset;
+                if mask.is_some_and(|m| !m[i]) {
+                    continue;
+                }
+                let values = [
+                    channels[0][i].into(),
+                    channels[1][i].into(),
+                    channels[2][i].into(),
+                ];
+                if values.iter().any(|&v| !v.is_finite() || nodata == Some(v)) {
+                    continue;
+                }
+                if self.transparent
+                    && values
+                        .iter()
+                        .zip(ranges)
+                        .any(|(&v, (lo, hi, _, _))| v < lo || v > hi)
+                {
+                    continue;
+                }
+                for b in 0..3 {
+                    pixel[b] = if let Some(lut) = lut {
+                        lut[b][values[b] as usize]
+                    } else {
+                        range_byte(values[b], ranges[b])
+                    };
+                }
+                pixel[3] = alpha;
+            }
+        };
+        let out = rgba.as_slice_mut()?;
+        // Small tiles and LUT lookups do not amortize thread scheduling.
+        if lut.is_none() && out.len() >= 256 * 256 * 4 {
+            use rayon::prelude::*;
+            out.par_chunks_mut(CHUNK_PIXELS * 4)
+                .enumerate()
+                .for_each(render_chunk);
+        } else {
+            out.chunks_mut(CHUNK_PIXELS * 4)
+                .enumerate()
+                .for_each(render_chunk);
+        }
+        Some(rgba)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_statistics(
+        &self,
+        image: &ImageData,
+        channels_ready: bool,
+    ) -> AgResult<Self> {
+        let values = self.statistics_samples(image, channels_ready);
+        Ok(self.with_statistics(&self.resolve_samples(&values)?))
     }
 
     pub(crate) fn render(
@@ -569,7 +821,6 @@ impl RasterPlan {
         nodata: Option<f64>,
         format: TileFormat,
     ) -> AgResult<Bytes> {
-        let src = image.pixels.as_f64();
         let transfers = self.stretch.transfers()?;
         let bands = image.pixels.bands();
         if self.dependencies.iter().any(|&b| b >= bands) {
@@ -578,6 +829,10 @@ impl RasterPlan {
                 "referenced source band does not exist",
             ));
         }
+        if let Some(bytes) = self.render_rgb_fast(image, nodata, format)? {
+            return Ok(bytes);
+        }
+        let src = image.pixels.as_f64();
         let (h, w) = (image.pixels.height(), image.pixels.width());
         let mut rgba = Array3::zeros((h, w, 4));
         let mut samples = vec![0.0; bands];
@@ -686,6 +941,45 @@ impl RasterPlan {
     }
 }
 
+/// Preserve deterministic sample positions and complete valid channel tuples
+/// without promoting native arrays or evaluating direct band inputs as RPN.
+fn sample_bands<T: Copy + Into<f64>>(
+    src: &Array3<T>,
+    mask: Option<&Array2<bool>>,
+    bands: &[usize],
+    k: usize,
+) -> Option<Vec<Vec<f64>>> {
+    let views: Vec<_> = bands.iter().map(|&b| src.index_axis(Axis(0), b)).collect();
+    let channels: Vec<_> = views.iter().map(|v| v.as_slice()).collect::<Option<_>>()?;
+    let mask = match mask {
+        Some(m) => Some(m.as_slice()?),
+        None => None,
+    };
+    let n = src.shape()[1] * src.shape()[2];
+    let mut values: Vec<Vec<f64>> = (0..bands.len()).map(|_| Vec::with_capacity(k)).collect();
+    let mut tuple = vec![0.; bands.len()];
+    for i in 0..k {
+        let index = if k == 1 {
+            (n - 1) / 2
+        } else {
+            ((i as u64) * (n as u64 - 1) / (k as u64 - 1)) as usize
+        };
+        if mask.is_some_and(|m| !m[index]) {
+            continue;
+        }
+        for (v, channel) in tuple.iter_mut().zip(&channels) {
+            *v = channel[index].into();
+        }
+        if tuple.iter().any(|v| !v.is_finite()) {
+            continue;
+        }
+        for (channel, &v) in values.iter_mut().zip(&tuple) {
+            channel.push(v);
+        }
+    }
+    Some(values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +987,340 @@ mod tests {
         bounds::{Bbox, GeoTransform},
         crs::Crs,
     };
+
+    #[test]
+    fn reciprocal_rgb_quantization_matches_division_at_rounding_edges() {
+        for (lo, hi) in [
+            (0., 255.),
+            (-10., 10.),
+            (1e100, 2e100),
+            (0., 1e308),
+            (-1e308, 1e308),
+            (0., f64::from_bits(1)),
+            (127., 127.),
+        ] {
+            let range = (lo, hi, hi - lo, 1. / (hi - lo));
+            let transfer = Transfer::Range(lo, hi);
+            let check = |v: f64| {
+                assert_eq!(
+                    range_byte(v, range),
+                    byte(transfer.apply(v, false).unwrap()),
+                    "{lo}..{hi}, {v}"
+                )
+            };
+            for v in [lo, hi, 0., -f64::MAX, f64::MAX] {
+                check(v);
+            }
+            if (hi - lo).is_finite() && hi != lo {
+                for i in 0..255 {
+                    for delta in [
+                        -1e-8, -1.01e-10, -1e-10, -0.99e-10, -1e-14, 0., 1e-14, 1e-10, 1e-8,
+                    ] {
+                        let v = lo + (hi - lo) * ((i as f64 + 0.5 + delta) / 255.);
+                        check(v);
+                        check(v.next_up());
+                        check(v.next_down());
+                    }
+                }
+            }
+            let mut bits = 37u64;
+            for _ in 0..10000 {
+                bits = bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let v = f64::from_bits(bits);
+                if v.is_finite() {
+                    check(v);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_samples_match_expression_fallback_and_float_ranges() {
+        let source = Array3::from_shape_fn((3, 3, 4), |(b, r, c)| {
+            if r == b && c == b {
+                f64::NAN
+            } else {
+                (r * 4 + c + b * 20) as f64
+            }
+        });
+        let plan =
+            TileStyle::from_raster_query("version=2.0&type=rgb&bidx=3&bidx=1&bidx=3&method=minmax")
+                .unwrap();
+        for pixels in [
+            PixelData::U8(source.mapv(|v| v as u8)),
+            PixelData::U16(source.mapv(|v| v as u16)),
+            PixelData::I16(source.mapv(|v| v as i16)),
+            PixelData::U32(source.mapv(|v| v as u32)),
+            PixelData::I32(source.mapv(|v| v as i32)),
+            PixelData::F32(source.mapv(|v| v as f32)),
+            PixelData::F64(source.clone()),
+            PixelData::F64(source.clone().permuted_axes([0, 2, 1])),
+        ] {
+            let mut image = ImageData {
+                pixels,
+                mask: None,
+                nodata: None,
+                crs: Crs::epsg(4326),
+                bbox: Bbox::new(0., 0., 4., 3.),
+                transform: GeoTransform::from_gdal(&[0., 1., 0., 3., 0., -1.]),
+            };
+            for masked in [false, true] {
+                if masked {
+                    image.mask = Some(Array2::from_shape_fn(
+                        (image.pixels.height(), image.pixels.width()),
+                        |(r, c)| (r + c) % 3 != 0,
+                    ));
+                }
+                for k in [0, 1, 5, 12, 100] {
+                    for ready in [false, true] {
+                        let mut direct = (*plan.raster).clone();
+                        direct.statistics.sample_size = Some(k);
+                        if ready {
+                            direct.inputs =
+                                (0..3).map(|b| vec![expression::Token::Band(b)]).collect();
+                            direct.dependencies = (0..3).collect();
+                        }
+                        let mut fallback = direct.clone();
+                        for tokens in &mut fallback.inputs {
+                            tokens.extend([expression::Token::Num(0.), expression::Token::Add]);
+                        }
+                        assert_eq!(
+                            direct.statistics_samples(&image, ready),
+                            fallback.statistics_samples(&image, false)
+                        );
+                    }
+                }
+            }
+        }
+        for (lo, hi) in [
+            (-1e308, 1e308),
+            (0., f64::from_bits(1)),
+            (127., 127.),
+            (-10., 10.),
+        ] {
+            let values = [lo, hi, 0., -1., 1., 127., 127.5, f64::NAN];
+            let image = ImageData {
+                pixels: PixelData::F64(Array3::from_shape_fn((3, 1, values.len()), |(_, _, c)| {
+                    values[c]
+                })),
+                mask: None,
+                nodata: None,
+                crs: Crs::epsg(4326),
+                bbox: Bbox::new(0., 0., 8., 1.),
+                transform: GeoTransform::from_gdal(&[0., 1., 0., 1., 0., -1.]),
+            };
+            let mut direct = (*plan.raster).clone();
+            direct.stretch = Stretch::Resolved(vec![Transfer::Range(lo, hi); 3]);
+            let mut fallback = direct.clone();
+            for tokens in &mut fallback.inputs {
+                tokens.extend([expression::Token::Num(0.), expression::Token::Add]);
+            }
+            let decode = |bytes: Bytes| {
+                image::load_from_memory(&bytes)
+                    .unwrap()
+                    .to_rgba8()
+                    .into_raw()
+            };
+            assert_eq!(
+                decode(direct.render(&image, None, TileFormat::Png).unwrap()),
+                decode(fallback.render(&image, None, TileFormat::Png).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_float_rgb_matches_expression_renderer() {
+        let source =
+            Array3::from_shape_fn((3, 257, 257), |(b, r, c)| match (r * 257 + c + b) % 101 {
+                0 => f64::NAN,
+                1 => f64::INFINITY,
+                2 => f64::NEG_INFINITY,
+                3 => 7.,
+                _ => (r as f64 - c as f64) * 1.25 + b as f64 + 0.5,
+            });
+        let style = TileStyle::from_raster_query(
+            "version=2.0&type=rgb&bidx=3&bidx=1&bidx=3&method=linear&rescale=0,255",
+        )
+        .unwrap();
+        for pixels in [
+            PixelData::F64(source.clone()),
+            PixelData::F32(source.mapv(|v| v as f32)),
+        ] {
+            for transparent in [false, true] {
+                for nodata in [None, Some(7.)] {
+                    let mut plan = (*style.raster).clone();
+                    plan.transparent = transparent;
+                    plan.opacity = 0.5;
+                    let mut generic = plan.clone();
+                    for tokens in &mut generic.inputs {
+                        tokens.extend([expression::Token::Num(0.), expression::Token::Add]);
+                    }
+                    let image = ImageData {
+                        pixels: pixels.clone(),
+                        mask: Some(Array2::from_shape_fn((257, 257), |(r, c)| {
+                            (r + c) % 13 != 0
+                        })),
+                        nodata,
+                        crs: Crs::epsg(3857),
+                        bbox: Bbox::new(0., 0., 257., 257.),
+                        transform: GeoTransform::from_gdal(&[0., 1., 0., 257., 0., -1.]),
+                    };
+                    assert_eq!(
+                        plan.render(&image, nodata, TileFormat::Png).unwrap(),
+                        generic.render(&image, nodata, TileFormat::Png).unwrap(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rgb_fast_path_matches_expression_renderer_for_types_masks_and_ranges() {
+        let source = Array3::from_shape_fn((3, 3, 3), |(b, r, c)| {
+            [0., 1., 2., 127., 128., 200., 255., 65535., f64::NAN][r * 3 + c] + b as f64
+        });
+        let pixels = [
+            PixelData::U8(source.mapv(|v| v as u8)),
+            PixelData::U16(source.mapv(|v| v as u16)),
+            PixelData::I16(source.mapv(|v| v as i16)),
+            PixelData::U32(source.mapv(|v| v as u32)),
+            PixelData::I32(source.mapv(|v| v as i32)),
+            PixelData::F32(source.mapv(|v| v as f32)),
+            PixelData::F64(source.clone()),
+            PixelData::F64(source.permuted_axes([0, 2, 1])),
+        ];
+        for pixels in pixels {
+            for (range, transparent, opacity) in [
+                ("0,255", false, 1.),
+                ("2,200", true, 0.5),
+                ("127,127", false, 1.),
+                ("0,255", true, 0.),
+            ] {
+                let valid_range = if range == "127,127" { "0,255" } else { range };
+                let mut plan = (*TileStyle::from_raster_query(&format!(
+                    "version=2.0&type=rgb&bidx=3&bidx=1&bidx=3&method=linear&rescale={valid_range}"
+                ))
+                .unwrap()
+                .raster)
+                    .clone();
+                if range == "127,127" {
+                    plan.stretch = Stretch::Resolved(vec![Transfer::Range(127., 127.); 3]);
+                }
+                plan.transparent = transparent;
+                plan.opacity = opacity;
+                let mut generic = plan.clone();
+                for tokens in &mut generic.inputs {
+                    tokens.extend([expression::Token::Num(0.), expression::Token::Add]);
+                }
+                for nodata in [None, Some(128.), Some(128.5)] {
+                    for strided_mask in [false, true] {
+                        let mut mask = Array2::from_elem((3, 3), true);
+                        mask[[0, 1]] = false;
+                        if strided_mask {
+                            mask = mask.reversed_axes();
+                        }
+                        let image = ImageData {
+                            pixels: pixels.clone(),
+                            mask: Some(mask),
+                            nodata,
+                            crs: Crs::epsg(4326),
+                            bbox: Bbox::new(0., 0., 3., 3.),
+                            transform: GeoTransform::from_gdal(&[0., 1., 0., 3., 0., -1.]),
+                        };
+                        let decode = |bytes: Bytes| {
+                            image::load_from_memory(&bytes)
+                                .unwrap()
+                                .to_rgba8()
+                                .into_raw()
+                        };
+                        assert_eq!(decode(plan.render(&image, nodata, TileFormat::Png).unwrap()),
+                            decode(generic.render(&image, nodata, TileFormat::Png).unwrap()),
+                            "range={range}, transparent={transparent}, opacity={opacity}, nodata={nodata:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_warp_matches_independent_f64_bands_without_joint_nodata() {
+        let source = Array3::from_shape_fn((4, 8, 8), |(b, r, c)| {
+            if b == 1 || (r == b && c == b) {
+                0.
+            } else if b == 2 && r == 5 && c == 5 {
+                f64::NAN
+            } else {
+                (b * 30 + r * 8 + c + 1) as f64
+            }
+        });
+        let plan = TileStyle::from_raster_query("version=2.0&type=rgb&bidx=3&bidx=1&bidx=3")
+            .unwrap()
+            .raster;
+        for pixels in [
+            PixelData::F64(source.clone()),
+            PixelData::U8(source.mapv(|v| v as u8)),
+            PixelData::U16(source.mapv(|v| v as u16)),
+        ] {
+            for nodata in [None, Some(0.)] {
+                let mut mask = Array2::from_elem((8, 8), true);
+                mask[[6, 6]] = false;
+                let src = ImageData {
+                    pixels: pixels.clone(),
+                    mask: Some(mask),
+                    nodata,
+                    crs: Crs::epsg(4326),
+                    bbox: Bbox::new(-2., -2., 2., 2.),
+                    transform: GeoTransform::from_gdal(&[-2., 0.5, 0., 2., 0., -0.5]),
+                };
+                for (crs, bbox) in [
+                    (src.crs.clone(), src.bbox),
+                    (src.crs.clone(), Bbox::new(-3., -3., 3., 3.)),
+                    (
+                        Crs::epsg(3857),
+                        Bbox::new(-333958., -334111., 333958., 334111.),
+                    ),
+                ] {
+                    for kernel in [
+                        Resampling::Nearest,
+                        Resampling::Bilinear,
+                        Resampling::Cubic,
+                        Resampling::Lanczos,
+                        Resampling::Average,
+                        Resampling::Mode,
+                    ] {
+                        let actual = plan.warp_dependencies(&src, &crs, bbox, 9, kernel).unwrap();
+                        let mut expected_mask = Array2::from_elem((9, 9), true);
+                        for (i, &b) in plan.dependencies.iter().enumerate() {
+                            let band = ImageData {
+                                pixels: PixelData::F64(
+                                    src.pixels.band_to_f64(b).insert_axis(Axis(0)),
+                                ),
+                                ..src.clone()
+                            };
+                            let expected =
+                                crate::warp::warp(&band, &crs, bbox, 9, 9, kernel).unwrap();
+                            ndarray::Zip::from(&mut expected_mask)
+                                .and(expected.mask.as_ref().unwrap())
+                                .for_each(|a, b| *a &= *b);
+                            let actual_values = actual.pixels.band_to_f64(i);
+                            let expected_values = expected.pixels.band_to_f64(0);
+                            for ((r, c), &valid) in expected.mask.as_ref().unwrap().indexed_iter() {
+                                if valid {
+                                    assert_eq!(
+                                        actual_values[[r, c]],
+                                        expected_values[[r, c]],
+                                        "{kernel:?}, band={b}, nodata={nodata:?}"
+                                    );
+                                }
+                            }
+                        }
+                        assert_eq!(actual.mask.as_ref().unwrap(), &expected_mask);
+                        assert_eq!(actual.nodata, None);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn statistics_apply_expressions_valid_tuples_and_sampling_before_stretch() {
