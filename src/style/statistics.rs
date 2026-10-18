@@ -316,7 +316,7 @@ mod tests {
                 .unwrap(),
         );
         let cpu = CpuLimiter::new(1);
-        let mut input = json!({"version":"2.0","renderer":{"type":"gray","bidx":[2]},
+        let mut input = json!({"version":"3.0","renderer":{"type":"gray","bidx":[2]},
             "stretch":{"method":"minmax"},"statistics":{"scope":"dataset","accuracy":"sample","sample_size":1024}});
         let mut original_key = String::new();
         let mut original_transfer_key = String::new();
@@ -448,9 +448,9 @@ mod tests {
         );
         let baseline = budget.used_bytes();
         let cpu = CpuLimiter::new(1);
-        let mut queries = vec!["version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&method=minmax"];
+        let mut queries = vec!["version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&method=minmax"];
         if cfg!(feature = "mosaic") {
-            queries.push("version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&method=minmax&pixel_selection=mean&stage=before_channels");
+            queries.push("version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&method=minmax&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22before_channels%22%7D%7D");
         }
         for query in queries {
             let style = TileStyle::from_raster_query(query).unwrap();
@@ -505,7 +505,7 @@ mod tests {
         let cpu = CpuLimiter::new(1);
         let _held = cpu.acquire().await.unwrap();
         let style =
-            TileStyle::from_raster_query("version=2.0&type=gray&bidx=2&method=minmax").unwrap();
+            TileStyle::from_raster_query("version=3.0&type=gray&bidx=2&method=minmax").unwrap();
         let result = RequestLimiter::new(1)
             .run(
                 Duration::from_millis(30),

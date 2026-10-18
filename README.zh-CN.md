@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文 | [文档站源码](website/)
 
-一个纯 Rust 异步库，用于读取云端托管的 Cloud-Optimized GeoTIFF（COG），并以 XYZ 地图瓦片形式提供数据，支持 Raster Style 2.0 输入。
+一个纯 Rust 异步库，用于读取云端托管的 Cloud-Optimized GeoTIFF（COG），并以 XYZ 地图瓦片形式提供数据，支持 Raster Style 3.0 输入。
 
 **不依赖 GDAL。** 栅格 IO 使用 [`async-tiff`] 与 [`object_store`]；重投影使用可通过 feature 控制、依赖系统 `libproj` 的 [`proj`]；仿射计算使用 [`raffine`]；色带使用 [`colorous`]；重采样使用 [`fast_image_resize`]；PNG 编码使用 [`image`]。
 
@@ -35,15 +35,15 @@ ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 请求瓦片：
 
 ```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=pseudocolor&bidx=1&method=linear&rescale=0,3000&colormap_name=viridis'
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=pseudocolor&bidx=1&method=linear&rescale=0,3000&colormap_name=viridis'
 ```
 
-## Raster Style 2.0 输入
+## Raster Style 3.0 输入
 
-采用 `raster-style = "=0.3.0"`，Rust API 支持 `TileStyle::from_json`、
-`from_raster_query` 和 `from_raster_style`。三个查看器默认生成 Q2。
-新格式必须声明 `version=2.0&type=...`，省略拉伸使用固定 `[0,255]`。
-HTTP 只接受完整 Q2；不支持的规范能力明确报错。
+采用 `raster-style = "=0.4.0"`，Rust API 支持 `TileStyle::from_json`、
+`from_raster_query` 和 `from_raster_style`。三个查看器默认生成 Q3。
+新格式必须声明 `version=3.0&type=...`，省略拉伸使用固定 `[0,255]`。
+HTTP 只接受完整 Q3；不支持的规范能力明确报错。
 详见[迁移指南与能力范围](website/content/docs/guides/styling.zh.md)。
 
 ## 波段计算
@@ -53,7 +53,7 @@ gray/pseudocolor 使用一个表达式，RGB 使用三个以分号分隔的表�
 表达式与 `bidx` 互斥；引用波段的 NoData 和非有限计算结果输出透明像元。
 
 ```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=gray&expression=(b5-b4)%2F(b5%2Bb4)&method=linear&rescale=-1,1'
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=gray&expression=(b5-b4)%2F(b5%2Bb4)&method=linear&rescale=-1,1'
 ```
 
 ## 作为库使用
@@ -77,18 +77,18 @@ cargo run --example serve --features stac
 
 ## 样式与迁移
 
-样式统一使用 Raster Style 2.0 JSON/Q2：
+样式统一使用 Raster Style 3.0 JSON/Q3：
 
 ```rust
 let style = async_geotiff::style::TileStyle::from_json(r#"{
-  "version": "2.0",
+  "version": "3.0",
   "renderer": {"type": "rgb", "bidx": [1, 2, 3]},
   "stretch": {"method": "linear", "rescale": [[0, 3000]]}
 }"#)?;
 let bytes = tiler.tile(coord, &style).await?;
 ```
 
-Mosaic 在同一个文档中增加 `mosaic` 配置，调用 `mosaic.tile(coord, &style)`。
+Mosaic 在同一个文档中声明 Mosaic 1.0.0 Schema，并增加 `raster:mosaic` 配置，调用 `mosaic.tile(coord, &style)`。
 支持五种选择方法、两个合并阶段和排序通道。资产列表由 MosaicJSON/STAC 提供。
 
 这是破坏性迁移：移除 `from_query`、`from_pairs`、公开可变样式字段、旧 `Stretch`/
@@ -155,7 +155,7 @@ src/
     window.rs         源瓦片范围和拼接辅助函数
   warp/               Projector + Resampling + 粗网格重投影
   render/             colormap、expression、encode、pipeline
-  style/              Raster Style JSON/Q2 校验与渲染计划
+  style/              Raster Style JSON/Q3 校验与渲染计划
   tiler.rs            编排器
 examples/
   serve.rs            Demo 入口和 viewer wiring

@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 pub const ALLOWED_TILE_SIZES: [u32; 5] = [64, 128, 256, 512, 1024];
 
-/// Validated Raster Style 2.0. Change the JSON/Q2 document and parse again to edit.
+/// Validated Raster Style 3.0. Change the JSON/Q3 document and parse again to edit.
 ///
 /// ```compile_fail
 /// let mut style = async_geotiff::style::TileStyle::default();
@@ -30,7 +30,7 @@ pub struct TileStyle {
 impl Default for TileStyle {
     /// Gray, source band 1, stretch none (0–255), PNG, 256 pixels.
     fn default() -> Self {
-        Self::from_json(r#"{"version":"2.0","renderer":{"type":"gray","bidx":[1]}}"#)
+        Self::from_json(r#"{"version":"3.0","renderer":{"type":"gray","bidx":[1]}}"#)
             .expect("built-in Raster Style is supported")
     }
 }

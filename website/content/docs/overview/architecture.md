@@ -33,7 +33,7 @@ flowchart LR
 | `CogReader` | Open a COG, read metadata and overviews, select and stitch native blocks, and sample points or windows. |
 | `BlockCache` | Share decoded native blocks across readers under one byte budget; coalesce concurrent cold fetches. |
 | `Tiler` | Plan a tile, choose an overview, read the source window, warp when required, and render encoded bytes. |
-| `TileStyle` | Validate Raster Style JSON/Q2 and bind supported rendering capabilities. |
+| `TileStyle` | Validate Raster Style JSON/Q3 and bind supported rendering capabilities. |
 | `MosaicTiler` | Find assets, open readers through a pool, warp each asset, reduce overlapping pixels, and render once. |
 | `CpuLimiter` | Bound CPU-heavy blocking work across readers and tilers. |
 

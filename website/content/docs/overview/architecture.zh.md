@@ -33,7 +33,7 @@ flowchart LR
 | `CogReader` | 打开 COG，读取元数据和概览层，选择并拼接原生块，以及采样点或窗口。 |
 | `BlockCache` | 在统一字节预算下跨 reader 共享解码块，并合并并发冷读取。 |
 | `Tiler` | 规划瓦片、选择概览层、读取源窗口、按需重投影并输出编码字节。 |
-| `TileStyle` | 校验 Raster Style JSON/Q2，并绑定已支持的渲染能力。 |
+| `TileStyle` | 校验 Raster Style JSON/Q3，并绑定已支持的渲染能力。 |
 | `MosaicTiler` | 查找资产、通过池打开 reader、重投影各资产、合并重叠像元并统一渲染。 |
 | `CpuLimiter` | 限制跨 reader 与 tiler 的 CPU 密集型阻塞任务。 |
 

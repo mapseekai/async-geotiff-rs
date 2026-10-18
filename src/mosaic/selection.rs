@@ -167,7 +167,7 @@ impl<State> Reducer<State> {
         }
         if self.rank >= shape.0 {
             return Err(AgError::query(
-                "/mosaic/rank_channel",
+                "/raster:mosaic/rank_channel",
                 "outside the input tuple",
             ));
         }

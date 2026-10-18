@@ -77,9 +77,9 @@ async fn main() -> AgResult<()> {
     let mosaic = MosaicTiler::new(source);
     let style = TileStyle::from_json(
         r#"{
-        "version": "2.0",
+        "version": "3.0","extensions":["https://mapseekai.github.io/raster-style/extensions/raster/mosaic/v1.0.0/schema.json"],
         "renderer": {"type": "rgb", "bidx": [1, 2, 3]},
-        "mosaic": {"pixel_selection": "first", "stage": "before_channels"}
+        "raster:mosaic": {"pixel_selection": "first", "stage": "before_channels"}
     }"#,
     )?;
 

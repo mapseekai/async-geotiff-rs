@@ -34,14 +34,15 @@ ASYNC_GEOTIFF_MOSAIC=/path/to/mosaic.json \
 
 Tiles are then available under `/mosaic/tiles/...`.
 
-## Raster Style 2.0
+## Raster Style 3.0
 
 ```rust
 let style = TileStyle::from_json(r#"{
-  "version": "2.0",
+  "version": "3.0",
+  "extensions": ["https://mapseekai.github.io/raster-style/extensions/raster/mosaic/v1.0.0/schema.json"],
   "renderer": {"type": "rgb", "bidx": [3, 2, 1]},
   "stretch": {"method": "linear", "rescale": [[0, 3000]]},
-  "mosaic": {"pixel_selection": "highest", "stage": "before_channels", "rank_channel": 1}
+  "raster:mosaic": {"pixel_selection": "highest", "stage": "before_channels", "rank_channel": 1}
 }"#)?;
 let tile = mosaic.tile(coord, &style).await?;
 ```
@@ -53,14 +54,14 @@ after_channels would compare the first output, source band 3. Ties preserve the
 first source's complete tuple. Mean/median use the same complete valid tuples
 for every channel and avoid intermediate overflow for extreme finite values.
 
-Q2 example:
+Q3 example:
 
 ```text
-/mosaic/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=rgb&bidx=3&bidx=2&bidx=1&method=linear&rescale=0,3000&pixel_selection=mean&stage=after_channels
+/mosaic/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=rgb&bidx=3&bidx=2&bidx=1&method=linear&rescale=0,3000&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22after_channels%22%7D%7D
 ```
 
 In MapLibre, select mosaic under Source to configure stage and ranking.
-Asset locations remain server-bound; JSON/Q2 does not contain the asset list.
+Asset locations remain server-bound; JSON/Q3 does not contain the asset list.
 Protocol mosaics require explicit configuration. Source Alpha bands remain
 unsupported and return a capability error. See the [styling guide](../styling/).
 

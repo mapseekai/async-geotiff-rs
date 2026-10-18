@@ -1,6 +1,6 @@
 //! async-geotiff: pure-Rust async COG → XYZ tile renderer.
 //!
-//! Style inputs use Raster Style 2.0 JSON/Q2; see [`style::TileStyle`].
+//! Style inputs use Raster Style 3.0 JSON/Q3; see [`style::TileStyle`].
 
 mod blocking;
 pub use blocking::CpuLimiter;

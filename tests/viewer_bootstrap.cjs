@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
 
-async function check(viewer, method = null, defaultStretch = "none") {
+async function check(viewer, method = null, defaultStretch = "none", invalidFields = null) {
   const html = fs.readFileSync(`examples/${viewer}.html`, "utf8");
   const requests = [], pending = [], maps = [], elements = new Map();
   class Element {
@@ -51,7 +51,7 @@ async function check(viewer, method = null, defaultStretch = "none") {
   class Layer { setSource() {} setOpacity() {} }
   const context = {
     console, URLSearchParams, Number, Boolean,
-    window:{location:{search:"?dataset=single.tif&version=2.0&type=rgb&bidx=1&bidx=2&bidx=3" + (method === null ? "" : `&method=${method}`), protocol:"http:", origin:"http://test"}, history:{replaceState() {}}},
+    window:{location:{search:"?dataset=single.tif&version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&extensions=" + encodeURIComponent(JSON.stringify(["https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json"])) + "&extension_fields=" + encodeURIComponent(JSON.stringify({"raster:tile":{format:"png",tilesize:64}})) + (method === null ? "" : `&method=${method}`), protocol:"http:", origin:"http://test"}, history:{replaceState() {}}},
     document:{getElementById:id => elements.get(id), createElement:() => new Element()},
     Option: function(label, value) { this.value = value; this.textContent = label; },
     fetch:url => new Promise(resolve => pending.push({url,resolve})),
@@ -59,8 +59,24 @@ async function check(viewer, method = null, defaultStretch = "none") {
     L:{map:() => new FakeMap(),tileLayer:url => { record(url); return {addTo(){return this;},bringToBack(){},setOpacity(){}}; }},
     ol:{source:{XYZ:class {constructor({url}) {record(url);}},OSM:class {}},layer:{Tile:Layer},Map:FakeMap,View:class {},proj:{transformExtent:b=>b}},
   };
+  if (invalidFields !== null) {
+    const search = new URLSearchParams(context.window.location.search);
+    search.set("extension_fields", invalidFields);
+    context.window.location.search = `?${search}`;
+  }
   vm.createContext(context);
-  for (const match of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1], context);
+  const run = () => {
+    for (const match of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)) vm.runInContext(match[1], context);
+  };
+  if (invalidFields !== null) {
+    assert.throws(run);
+    const alert = elements.get("style-error");
+    assert.equal(alert.hidden, false);
+    assert.match(alert.textContent, /^Invalid extension_fields:/);
+    assert.equal(requests.length, 0);
+    return;
+  }
+  run();
   const flush = async () => { for (let i=0;i<10;i++) await Promise.resolve(); };
   const reply = (part, data, bands) => {
     const call = pending.find(p=>p.url.includes(part)); assert.ok(call, `${viewer}: missing ${part}`);
@@ -79,8 +95,14 @@ async function check(viewer, method = null, defaultStretch = "none") {
     const params = new URL(url).searchParams;
     assert.equal(params.get("dataset"),"single.tif");
     assert.deepEqual(params.getAll("bidx"),["1"],`${viewer}: expected explicit single-band selection`);
-    assert.equal(params.get("version"),"2.0");
+    assert.equal(params.get("version"),"3.0");
     assert.equal(params.get("type"),"gray");
+    const extensions = JSON.parse(params.get("extensions"));
+    assert.ok(extensions.includes("https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json"));
+    const tile = JSON.parse(params.get("extension_fields"))["raster:tile"];
+    assert.equal(tile.format, "png");
+    assert.equal(tile.tilesize, 64);
+    for (const legacy of ["format", "tilesize", "lossless", "pixel_selection", "stage", "rank_channel"]) assert.equal(params.has(legacy), false);
     assert.equal(params.get("method"),method ?? defaultStretch);
     assert.equal(params.has("stretch"),false);
   }
@@ -119,13 +141,14 @@ async function check(viewer, method = null, defaultStretch = "none") {
     generated = vm.runInContext("tileUrl()", context);
     params = new URL(generated).searchParams;
     assert.ok(new URL(generated).pathname.startsWith("/mosaic/tiles/"));
-    assert.equal(params.get("stage"), "after_channels");
-    assert.equal(params.get("rank_channel"), "2");
-    assert.equal(params.get("pixel_selection"), "highest");
-    assert.equal(params.get("version"), "2.0");
+    const mosaic = JSON.parse(params.get("extension_fields"))["raster:mosaic"];
+    assert.equal(mosaic.stage, "after_channels");
+    assert.equal(mosaic.rank_channel, 2);
+    assert.equal(mosaic.pixel_selection, "highest");
+    assert.equal(params.get("version"), "3.0");
     assert.equal(params.has("dataset"), false);
     vm.runInContext('controls.pixelSelection.value = "first"; syncSourceUi()', context);
-    assert.equal(new URL(vm.runInContext("tileUrl()", context)).searchParams.has("rank_channel"), false);
+    assert.equal("rank_channel" in JSON.parse(new URL(vm.runInContext("tileUrl()", context)).searchParams.get("extension_fields"))["raster:mosaic"], false);
     assert.equal(elements.get("rank_channel").disabled, true);
     // A source refresh makes isStyleLoaded() false without another map load.
     // Applying again must immediately use the latest controls.
@@ -136,8 +159,9 @@ async function check(viewer, method = null, defaultStretch = "none") {
     const latest = new URL(requests.at(-1)).searchParams;
     assert.equal(latest.get("expression"), "b1+10");
     assert.equal(latest.get("rescale"), "0,10000");
-    assert.equal(latest.get("pixel_selection"), "highest");
-    assert.equal(latest.get("stage"), "after_channels");
+    const latestMosaic = JSON.parse(latest.get("extension_fields"))["raster:mosaic"];
+    assert.equal(latestMosaic.pixel_selection, "highest");
+    assert.equal(latestMosaic.stage, "after_channels");
   }
   console.log(`${viewer}: delayed metadata, default ${defaultStretch}, explicit ${method ?? "auto"} passed`);
 }
@@ -145,4 +169,7 @@ async function check(viewer, method = null, defaultStretch = "none") {
   await check(viewer);
   await check(viewer, null, "minmax");
   await check(viewer, "none", "minmax");
+  for (const invalid of ["{", "null", "[]", "1", '{"raster:tile":null}', '{"raster:mosaic":[]}']) {
+    await check(viewer, null, "none", invalid);
+  }
 }})().catch(error=>{console.error(error);process.exitCode=1;});

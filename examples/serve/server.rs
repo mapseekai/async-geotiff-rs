@@ -200,8 +200,8 @@ impl AppState {
         http_base: impl Into<String>,
         block_cache: Arc<BlockCache>,
     ) -> Self {
-        // Compile the SDK schema and Q2 bindings before accepting requests.
-        TileStyle::from_raster_query("version=2.0&type=gray&bidx=1")
+        // Compile the SDK schema and Q3 bindings before accepting requests.
+        TileStyle::from_raster_query("version=3.0&type=gray&bidx=1")
             .expect("built-in Raster Style is supported");
         Self {
             default_tiler,
@@ -456,10 +456,10 @@ pub async fn tile_handler(
     .await
 }
 
-/// `GET /mosaic/tiles/{tms}/{z}/{x}/{y}.{ext}?pixel_selection=first&...`
-/// Serves the startup-loaded MosaicJSON mosaic. Styling query params are
-/// the same as `/tiles`. Q2 requires `pixel_selection` and `stage`;
-/// both are validated by the Raster Style SDK.
+/// `GET /mosaic/tiles/{tms}/{z}/{x}/{y}.{ext}` with a Q3 style.
+/// Serves the startup-loaded MosaicJSON mosaic. Declare Mosaic 1.0.0 in
+/// `extensions` and pass `raster:mosaic` in `extension_fields`, including
+/// `pixel_selection` and `stage`; the SDK validates both fields.
 pub async fn mosaic_tile_handler(
     State(state): State<AppState>,
     Path((tms, z, x, ye)): Path<(String, u8, u32, String)>,
@@ -579,7 +579,7 @@ fn tile_format_from_extension(ext: &str) -> AgResult<TileFormat> {
     Ok(format)
 }
 
-/// Keep Q2 bytes intact: context parameters are separated before SDK decoding.
+/// Keep Q3 bytes intact: context parameters are separated before SDK decoding.
 fn style_from_tile_query(raw: &str, format: TileFormat) -> AgResult<TileStyle> {
     let mut context_keys = std::collections::HashSet::new();
     let mut fragments = Vec::new();
@@ -599,7 +599,7 @@ fn style_from_tile_query(raw: &str, format: TileFormat) -> AgResult<TileStyle> {
     let style = TileStyle::from_raster_query(&fragments.join("&"))?;
     if style.format() != format {
         return Err(AgError::query(
-            "/image/format",
+            "/raster:tile/format",
             "must match the tile path extension",
         ));
     }
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[cfg(feature = "proj")]
     #[tokio::test]
-    async fn raster_mosaic_q2_over_http_matches_single_source_pixels() {
+    async fn raster_mosaic_q3_over_http_matches_single_source_pixels() {
         use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
         let store = Arc::new(InMemory::new());
         for key in ["a", "b"] {
@@ -1090,7 +1090,7 @@ mod tests {
             axum::serve(listener, router(state)).await.unwrap();
         });
         let client = reqwest::Client::new();
-        let q = "version=2.0&type=gray&expression=b1%2Bb2&method=linear&rescale=0,510&opacity=0.5";
+        let q = "version=3.0&type=gray&expression=b1%2Bb2&method=linear&rescale=0,510&opacity=0.5";
         let path = format!("tiles/WebMercatorQuad/{z}/{x}/{y}.png");
         let response = client
             .get(format!("{base}/{path}?{q}"))
@@ -1103,10 +1103,14 @@ mod tests {
             .to_rgba8();
         assert!(expected.pixels().any(|p| p[3] > 0));
         for stage in ["before_channels", "after_channels"] {
+            let mut document = raster_style::decode_query(q).unwrap().into_value();
+            document["extensions"] = serde_json::json!([raster_style::MOSAIC_SCHEMA_URL]);
+            document["raster:mosaic"] = serde_json::json!({"pixel_selection":"mean","stage":stage});
+            let query =
+                raster_style::encode_query(&raster_style::Style::from_value(document).unwrap())
+                    .unwrap();
             let response = client
-                .get(format!(
-                    "{base}/mosaic/{path}?{q}&pixel_selection=mean&stage={stage}"
-                ))
+                .get(format!("{base}/mosaic/{path}?{query}"))
                 .send()
                 .await
                 .unwrap();
@@ -1134,7 +1138,7 @@ mod tests {
                 "",
                 "bidx=1",
                 "stretch=stddev",
-                "version=2.0&type=gray&bidx=1&unscale=true",
+                "version=3.0&type=gray&bidx=1&unscale=true",
             ] {
                 let response = client
                     .get(format!("{base}/{prefix}{path}?{query}"))
@@ -1314,32 +1318,32 @@ mod tests {
 
     #[test]
     fn png_extension_keeps_default_format() {
-        let style = style_from_tile_query("version=2.0&type=gray&bidx=1", TileFormat::Png).unwrap();
+        let style = style_from_tile_query("version=3.0&type=gray&bidx=1", TileFormat::Png).unwrap();
         assert_eq!(style.format(), TileFormat::Png);
     }
 
     #[test]
-    fn q2_transport_preserves_encoding_and_rejects_mixed_parameters() {
+    fn q3_transport_preserves_encoding_and_rejects_mixed_parameters() {
         let parse = |raw: &str| style_from_tile_query(raw, TileFormat::Png);
-        let valid = "version=2.0&type=gray&expression=b1%2Bb1&dataset=a%26b.tif&_v=1";
-        assert!(parse(valid).unwrap().raster_style_json().contains("2.0"));
+        let valid = "version=3.0&type=gray&expression=b1%2Bb1&dataset=a%26b.tif&_v=1";
+        assert!(parse(valid).unwrap().raster_style_json().contains("3.0"));
         assert!(
-            parse("version=2.0&type=gray&bidx=1&pixel_selection=mean&stage=after_channels").is_ok()
+            parse("version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22after_channels%22%7D%7D").is_ok()
         );
-        assert!(parse("version=2.0&type=gray&bidx=1&pixel_selection=first").is_err());
-        assert!(parse("version=2.0&type=gray&bidx=1&pixel_selection=first&stage=before_channels&stage=after_channels").is_err());
+        assert!(parse("version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22first%22%7D%7D").is_err());
+        assert!(parse("version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22first%22%2C%22stage%22%3A%22before_channels%22%2C%22stage%22%3A%22after_channels%22%7D%7D").is_err());
         for query in [
             "",
             "bidx=1",
             "stretch=stddev",
             "rescale=0,255",
             "dataset=a",
-            "version=2.0&type=gray&expression=b1+b1",
-            "version=2.0&type=gray&bidx=1&stretch=stddev",
-            "version=2.0&type=gray&bidx=1&dataset=a&dataset=b",
-            "version=2.0&type=gray&type=gray&bidx=1",
+            "version=3.0&type=gray&expression=b1+b1",
+            "version=3.0&type=gray&bidx=1&stretch=stddev",
+            "version=3.0&type=gray&bidx=1&dataset=a&dataset=b",
+            "version=3.0&type=gray&type=gray&bidx=1",
             "type=gray&bidx=1",
-            "version=2.0&type=gray&bidx=1&method=percentile&percentiles=98,2",
+            "version=3.0&type=gray&bidx=1&method=percentile&percentiles=98,2",
         ] {
             assert!(parse(query).is_err(), "{query}");
         }
@@ -1353,7 +1357,7 @@ mod tests {
             TileFormat::Webp
         );
         let style = style_from_tile_query(
-            "version=2.0&type=gray&bidx=1&format=webp&lossless=true",
+            "version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22format%22%3A%22webp%22%2C%22lossless%22%3Atrue%7D%7D",
             TileFormat::Webp,
         )
         .unwrap();
@@ -1369,7 +1373,7 @@ mod tests {
             TileFormat::Jpeg
         );
         assert!(style_from_tile_query(
-            "version=2.0&type=gray&bidx=1&format=jpeg",
+            "version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22format%22%3A%22jpeg%22%7D%7D",
             TileFormat::Jpeg
         )
         .is_err());
@@ -1393,7 +1397,7 @@ mod tests {
     #[test]
     fn query_format_must_match_path_extension() {
         let err = style_from_tile_query(
-            "version=2.0&type=gray&bidx=1&format=webp&lossless=true",
+            "version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22format%22%3A%22webp%22%2C%22lossless%22%3Atrue%7D%7D",
             TileFormat::Png,
         )
         .unwrap_err();

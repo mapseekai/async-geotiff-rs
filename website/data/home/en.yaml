@@ -21,7 +21,7 @@ cards:
       icon: fa-solid fa-cloud-arrow-down
       url: docs/get-started/library-usage/
     - title: Render and style
-      desc: Use Raster Style JSON/Q2 to produce PNG or lossless WebP tiles with rescaling, colormaps, resampling, and band math.
+      desc: Use Raster Style JSON/Q3 to produce PNG or lossless WebP tiles with rescaling, colormaps, resampling, and band math.
       icon: fa-solid fa-palette
       url: docs/guides/styling/
     - title: Build mosaics

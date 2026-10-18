@@ -348,8 +348,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/leaflet",
             get(|| async { Html(include_str!("leaflet.html")) }),
         );
-    // Compile the SDK's lazy schema and Q2 bindings before accepting requests.
-    let style_query = "version=2.0&type=gray&bidx=1";
+    // Compile the SDK's lazy schema and Q3 bindings before accepting requests.
+    let style_query = "version=3.0&type=gray&bidx=1";
     async_geotiff::style::TileStyle::from_raster_query(style_query)?;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     println!("Listening on: http://{bind_addr}");
@@ -360,11 +360,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tile_base = format!("{http_base}/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}");
     println!("Tile endpoint: {tile_base}.png?{style_query}");
     #[cfg(feature = "webp")]
-    println!("  WebP tiles: {tile_base}.webp?{style_query}&format=webp&lossless=true");
+    {
+        let style = raster_style::Style::from_value(serde_json::json!({
+            "version":"3.0", "renderer":{"type":"gray","bidx":[1]},
+            "extensions":[raster_style::TILE_SCHEMA_URL],
+            "raster:tile":{"format":"webp","lossless":true}
+        }))?;
+        println!(
+            "  WebP tiles: {tile_base}.webp?{}",
+            raster_style::encode_query(&style)?
+        );
+    }
     println!("Formats endpoint: {http_base}/formats");
     if mosaic_loaded {
+        let style = raster_style::Style::from_value(serde_json::json!({
+            "version":"3.0", "renderer":{"type":"gray","bidx":[1]},
+            "extensions":[raster_style::MOSAIC_SCHEMA_URL],
+            "raster:mosaic":{"pixel_selection":"first","stage":"before_channels"}
+        }))?;
         println!(
-            "Mosaic endpoint: {http_base}/mosaic/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?{style_query}&pixel_selection=first&stage=before_channels"
+            "Mosaic endpoint: {http_base}/mosaic/tiles/WebMercatorQuad/{{z}}/{{x}}/{{y}}.png?{}",
+            raster_style::encode_query(&style)?
         );
     } else {
         println!("Mosaic endpoint: disabled (set ASYNC_GEOTIFF_MOSAIC=<mosaic.json> to enable)");
@@ -684,8 +700,8 @@ mod tests {
         )
         .with_stac_mosaic(Arc::new(mosaic));
         for query in [
-            "version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&pixel_selection=first&stage=before_channels",
-            "version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&pixel_selection=mean&stage=after_channels",
+            "version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22first%22%2C%22stage%22%3A%22before_channels%22%7D%7D",
+            "version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22after_channels%22%7D%7D",
         ] {
             let response = server::mosaic_tile_handler(
                 axum::extract::State(demo_state.clone()),
@@ -747,7 +763,7 @@ mod tests {
         let mut visible = false;
         for ty in y - 1..=y + 1 {
             for tx in x - 1..=x + 1 {
-                let response = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{tx}/{ty}.png?version=2.0&type=gray&bidx=1&method=linear&rescale=0,65535&resampling=bilinear&reproject=bilinear")).send().await.unwrap();
+                let response = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{tx}/{ty}.png?version=3.0&type=gray&bidx=1&method=linear&rescale=0,65535&resampling=bilinear&reproject=bilinear")).send().await.unwrap();
                 assert!(
                     response.status() == reqwest::StatusCode::OK
                         || response.status() == reqwest::StatusCode::NO_CONTENT,
@@ -767,7 +783,7 @@ mod tests {
             visible,
             "single-band viewport must retain visible source pixels"
         );
-        let invalid = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{x}/{y}.png?version=2.0&type=rgb&bidx=1&bidx=2&bidx=3")).send().await.unwrap();
+        let invalid = client.get(format!("{base}/tiles/WebMercatorQuad/{zoom}/{x}/{y}.png?version=3.0&type=rgb&bidx=1&bidx=2&bidx=3")).send().await.unwrap();
         assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
         task.abort();
     }

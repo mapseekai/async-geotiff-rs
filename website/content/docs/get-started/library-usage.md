@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?,
     );
     let tiler = Tiler::new(reader);
-    let style = TileStyle::from_raster_query("version=2.0&type=pseudocolor&bidx=1&colormap_name=viridis&method=linear&rescale=0,3000")?;
+    let style = TileStyle::from_raster_query("version=3.0&type=pseudocolor&bidx=1&colormap_name=viridis&method=linear&rescale=0,3000")?;
     let coord = TileCoord {
         tms: TileMatrixSet::WebMercatorQuad,
         z: 0,

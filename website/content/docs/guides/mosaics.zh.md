@@ -30,14 +30,15 @@ ASYNC_GEOTIFF_MOSAIC=/path/to/mosaic.json \
 
 镶嵌瓦片随后可通过 `/mosaic/tiles/...` 获取。
 
-## Raster Style 2.0
+## Raster Style 3.0
 
 ```rust
 let style = TileStyle::from_json(r#"{
-  "version": "2.0",
+  "version": "3.0",
+  "extensions": ["https://mapseekai.github.io/raster-style/extensions/raster/mosaic/v1.0.0/schema.json"],
   "renderer": {"type": "rgb", "bidx": [3, 2, 1]},
   "stretch": {"method": "linear", "rescale": [[0, 3000]]},
-  "mosaic": {"pixel_selection": "highest", "stage": "before_channels", "rank_channel": 1}
+  "raster:mosaic": {"pixel_selection": "highest", "stage": "before_channels", "rank_channel": 1}
 }"#)?;
 let tile = mosaic.tile(coord, &style).await?;
 ```
@@ -47,14 +48,14 @@ let tile = mosaic.tile(coord, &style).await?;
 改为 after_channels 后比较第一个输出，即源波段 3。并列保留源顺序靠前的完整元组。
 mean/median 只对同一组完整有效元组逐通道求值，避免极值相加溢出。
 
-Q2 请求示例：
+Q3 请求示例：
 
 ```text
-/mosaic/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=rgb&bidx=3&bidx=2&bidx=1&method=linear&rescale=0,3000&pixel_selection=mean&stage=after_channels
+/mosaic/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=rgb&bidx=3&bidx=2&bidx=1&method=linear&rescale=0,3000&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22after_channels%22%7D%7D
 ```
 
 MapLibre 的 Source 选择 mosaic 后可以配置阶段和排序通道。资产地址仍由服务端固定，
-JSON/Q2 不携带资产列表。新格式要求显式 mosaic 配置；源 Alpha 波段暂不支持，返回能力错误。
+JSON/Q3 不携带资产列表。新格式要求显式 mosaic 配置；源 Alpha 波段暂不支持，返回能力错误。
 完整支持范围见[样式指南](../styling/)。
 
 ## 像元选择 {#selection}

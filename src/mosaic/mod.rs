@@ -305,7 +305,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
     ) -> AgResult<Option<Bytes>> {
         let mosaic = style.raster.mosaic.as_ref().ok_or_else(|| {
             AgError::query(
-                "/mosaic",
+                "/raster:mosaic",
                 "multi-source requests require pixel_selection and stage",
             )
         })?;
@@ -538,7 +538,16 @@ mod tests {
     fn mosaic_style(selection: PixelSelection, style: &TileStyle) -> TileStyle {
         let mut document: serde_json::Value =
             serde_json::from_str(style.raster_style_json()).unwrap();
-        document["mosaic"] = serde_json::json!({"pixel_selection": format!("{selection:?}").to_lowercase(), "stage": "after_channels"});
+        document["raster:mosaic"] = serde_json::json!({"pixel_selection": format!("{selection:?}").to_lowercase(), "stage": "after_channels"});
+        let declarations = document
+            .as_object_mut()
+            .unwrap()
+            .entry("extensions")
+            .or_insert_with(|| serde_json::json!([]));
+        declarations
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(raster_style::MOSAIC_SCHEMA_URL));
         TileStyle::from_json(&document.to_string()).unwrap()
     }
 
@@ -610,11 +619,11 @@ mod tests {
                 y,
             };
             for query in [
-                "version=2.0&type=gray&bidx=1",
-                "version=2.0&type=gray&bidx=1&method=linear&rescale=0,1000",
-                "version=2.0&type=gray&expression=b1*2",
-                "version=2.0&type=pseudocolor&bidx=1&rescale=0,200&colormap_name=viridis&method=linear",
-                "version=2.0&type=gray&nodata=100&reproject=bilinear&bidx=1",
+                "version=3.0&type=gray&bidx=1",
+                "version=3.0&type=gray&bidx=1&method=linear&rescale=0,1000",
+                "version=3.0&type=gray&expression=b1*2",
+                "version=3.0&type=pseudocolor&bidx=1&rescale=0,200&colormap_name=viridis&method=linear",
+                "version=3.0&type=gray&nodata=100&reproject=bilinear&bidx=1",
             ] {
                 let style = TileStyle::from_raster_query(query).unwrap();
                 let expected = single
@@ -814,7 +823,7 @@ mod tests {
     async fn mosaic_with_no_assets_returns_none() {
         // No asset covers the tile → "no tile", not a synthesised blank one.
         let m = MosaicTiler::new(NoAssets);
-        let style = TileStyle::from_raster_query("version=2.0&type=gray&bidx=1").unwrap();
+        let style = TileStyle::from_raster_query("version=3.0&type=gray&bidx=1").unwrap();
         let out = m
             .tile(
                 TileCoord {

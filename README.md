@@ -3,7 +3,7 @@
 [中文文档](README.zh-CN.md) | English | [Documentation site source](website/)
 
 Pure-Rust async crate that reads cloud-hosted Cloud-Optimized GeoTIFFs (COGs)
-and serves them as XYZ map tiles with Raster Style 2.0 inputs.
+and serves them as XYZ map tiles with Raster Style 3.0 inputs.
 
 **No GDAL.** All raster IO goes through [`async-tiff`] + [`object_store`].
 Reprojection through [`proj`] (libproj system dep, feature-gated). Affine math
@@ -24,7 +24,7 @@ cargo run --release --example serve
 # http://127.0.0.1:8080/openlayers
 # http://127.0.0.1:8080/leaflet
 
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=pseudocolor&bidx=1&method=linear&rescale=0,3000&colormap_name=viridis'
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=pseudocolor&bidx=1&method=linear&rescale=0,3000&colormap_name=viridis'
 ```
 
 The example server binds to `127.0.0.1:8080` by default. To expose it on a
@@ -34,12 +34,12 @@ network interface, set `ASYNC_GEOTIFF_BIND`, for example:
 ASYNC_GEOTIFF_BIND=0.0.0.0:8080 cargo run --release --example serve
 ```
 
-## Raster Style 2.0 inputs
+## Raster Style 3.0 inputs
 
-Uses `raster-style = "=0.3.0"`. Rust entrypoints are `TileStyle::from_json`,
-`from_raster_query`, and `from_raster_style`; all three viewers default to Q2.
-New inputs declare `version=2.0&type=...`; omitted stretch uses fixed `[0,255]`.
-HTTP accepts complete Q2 documents only. Unsupported protocol capabilities fail explicitly.
+Uses `raster-style = "=0.4.0"`. Rust entrypoints are `TileStyle::from_json`,
+`from_raster_query`, and `from_raster_style`; all three viewers default to Q3.
+New inputs declare `version=3.0&type=...`; omitted stretch uses fixed `[0,255]`.
+HTTP accepts complete Q3 documents only. Unsupported protocol capabilities fail explicitly.
 See the [migration guide and supported subset](website/content/docs/guides/styling.md).
 
 ## Band math expressions
@@ -50,7 +50,7 @@ RGB accepts three semicolon-separated expressions. Expressions and `bidx` are
 mutually exclusive. Referenced NoData and non-finite results become transparent.
 
 ```bash
-curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=gray&expression=(b5-b4)%2F(b5%2Bb4)&method=linear&rescale=-1,1'
+curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=gray&expression=(b5-b4)%2F(b5%2Bb4)&method=linear&rescale=-1,1'
 ```
 
 ## Library usage
@@ -100,18 +100,18 @@ is never silently discarded.
 
 ## Styles and migration
 
-All styles use Raster Style 2.0 JSON/Q2:
+All styles use Raster Style 3.0 JSON/Q3:
 
 ```rust
 let style = async_geotiff::style::TileStyle::from_json(r#"{
-  "version": "2.0",
+  "version": "3.0",
   "renderer": {"type": "rgb", "bidx": [1, 2, 3]},
   "stretch": {"method": "linear", "rescale": [[0, 3000]]}
 }"#)?;
 let bytes = tiler.tile(coord, &style).await?;
 ```
 
-For mosaics, add `mosaic` to the same document and call `mosaic.tile(coord, &style)`.
+For mosaics, declare the Mosaic 1.0.0 schema in `extensions` and add `raster:mosaic` to the same document and call `mosaic.tile(coord, &style)`.
 Five selection methods, both merge stages, and rank channels are supported.
 MosaicJSON/STAC supplies assets separately.
 
@@ -181,7 +181,7 @@ src/
     window.rs         source tile-range and stitch helpers
   warp/               Projector + Resampling + coarse-grid warp
   render/             colormap, expression, encode, pipeline
-  style/              Raster Style JSON/Q2 validation and render plans
+  style/              Raster Style JSON/Q3 validation and render plans
   tiler.rs            orchestrator
 examples/
   serve.rs            demo entrypoint and viewer wiring

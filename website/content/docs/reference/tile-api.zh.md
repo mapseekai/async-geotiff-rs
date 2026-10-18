@@ -21,28 +21,33 @@ HTTP API 属于 `examples/serve.rs`，不会进入库本身的依赖表面。
 支持的 TMS 名称是 `WebMercatorQuad` 和 `WorldCRS84Quad`。扩展名支持 `png`，
 以及 feature 控制的无损 `webp`。
 
-## Raster Style Q2 {#parameters}
+## Raster Style Q3 {#parameters}
 
-两条瓦片路由只接受完整 Q2：`version=2.0&type=...`。未知字段、旧格式和未实现能力报错。
+两条瓦片路由只接受完整 Q3：`version=3.0&type=...`。未知字段、旧格式和未实现能力报错。
 `dataset`、`mode`、`_v` 是独立请求上下文，不能重复；资产地址不属于样式。
 
 | 参数 | 是否可重复 | 含义 |
 | --- | --- | --- |
-| `version` / `type` | 否 | `2.0` 与 gray/rgb/pseudocolor/categorized/single_color。 |
+| `version` / `type` | 否 | `3.0` 与 gray/rgb/pseudocolor/categorized/single_color。 |
 | `bidx` | 是 | 从 1 开始的源波段索引，RGB 恰好三个。 |
 | `expression` | 否 | 灰度一个表达式；RGB 三个分号分隔的表达式；与 bidx 互斥。 |
 | `method` / `rescale` | 范围可重复 | none、linear、minmax、percentile、stddev、histogram_equalization、curve；参数与共享统计网格见样式指南。 |
 | `colormap_name` / `colormap` | 否 | 伪彩色色表；原生色表是精确值或半开区间。 |
 | `nodata` | 否 | 有限数值或 nan。 |
-| `color_formula` | 是 | 已支持 Gamma 操作，按顺序应用。 |
+| `color_formula` | 否 | 已支持 Gamma 操作，按顺序应用。 |
 | `opacity` | 否 | 0–1，默认 1。 |
 | `resampling` / `reproject` | 否 | nearest、bilinear、cubic、cubic_spline、lanczos、average。 |
-| `tilesize` | 否 | 64、128、256（默认）、512、1024。 |
-| `format` / `lossless` | 否 | png（默认）或 webp&lossless=true；format 必须与路径一致。 |
-| `pixel_selection` / `stage` | 否 | mosaic 必填；first/highest/lowest/mean/median 与 before_channels/after_channels。 |
-| `rank_channel` | 否 | highest/lowest 的排序通道位置，从 1 开始。 |
+| `extensions` | 否 | 精确版本 Schema URL 的 JSON 数组，需百分号编码。 |
+| `extension_fields` | 否 | 包含 `raster:tile`、`raster:mosaic` 的 JSON 对象，需百分号编码。 |
 
-原始 Q2 中 `+` 必须编码为 `%2B`；不能先解码后直接拼接。样式语义与限制见[样式指南](../../guides/styling/)。
+`raster:tile` 支持 `tilesize`（64、128、256、512、1024）、`format`（`png`，
+或带 `lossless: true` 的 `webp`）；格式必须与路径一致。`raster:mosaic` 必须提供
+`pixel_selection`、`stage`，highest/lowest 还可提供 `rank_channel`。
+在 `extensions` 声明对应的 [Tile 1.0.0](https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json)
+或 [Mosaic 1.0.0](https://mapseekai.github.io/raster-style/extensions/raster/mosaic/v1.0.0/schema.json)
+Schema URL。旧的瓦片与镶嵌短参数一律拒绝。
+
+原始 Q3 中 `+` 必须编码为 `%2B`；不能先解码后直接拼接。样式语义与限制见[样式指南](../../guides/styling/)。
 
 ## 响应 {#responses}
 

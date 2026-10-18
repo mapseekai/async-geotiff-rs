@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 description = "Async COG → XYZ tile renderer (pure Rust, no GDAL)"
 
 [dependencies]
-raster-style     = "=0.3.0"
+raster-style     = "=0.4.0"
 async-tiff        = "0.4.0"
 async-trait       = "0.1"
 object_store      = { version = "0.14", features = ["http", "aws"] }

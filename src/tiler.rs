@@ -255,7 +255,7 @@ impl Tiler {
     /// `None` when the tile is fully outside the COG or outside the
     /// projection's valid domain — [`Tiler::tile`] turns that into "no tile"
     /// (HTTP 204). Returns sorted, unique source dependencies; with
-    /// mosaic.stage=after_channels it returns expression outputs instead.
+    /// raster:mosaic.stage=after_channels it returns expression outputs instead.
     /// NoData is consumed into the mask. This is the per-asset mosaic primitive.
     pub async fn warp_tile(
         &self,
@@ -694,7 +694,7 @@ mod tests {
             .await
             .unwrap();
         let tiler = Tiler::new(Arc::new(reader));
-        let style = TileStyle::from_raster_query("version=2.0&type=gray&bidx=1").unwrap();
+        let style = TileStyle::from_raster_query("version=3.0&type=gray&bidx=1").unwrap();
         let [w, s, e, n] = tiler.wgs84_bounds().unwrap();
 
         // A tile over the dataset centre must render actual bytes.
@@ -765,7 +765,7 @@ mod tests {
             .unwrap();
         let tiler = Tiler::new(Arc::new(reader));
         let style = TileStyle::from_raster_query(
-            "version=2.0&type=gray&bidx=1&resampling=bilinear&reproject=bilinear&tilesize=256",
+            "version=3.0&type=gray&bidx=1&resampling=bilinear&reproject=bilinear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A256%7D%7D",
         )
         .unwrap();
         let png = tiler
@@ -948,7 +948,7 @@ mod tests {
             .plan_tile(
                 coord,
                 &crate::style::TileStyle::from_raster_query(
-                    "version=2.0&type=gray&reproject=lanczos&bidx=1",
+                    "version=3.0&type=gray&reproject=lanczos&bidx=1",
                 )
                 .unwrap(),
             )
@@ -978,7 +978,7 @@ mod tests {
             y,
         };
         let style = crate::style::TileStyle::from_raster_query(
-            "version=2.0&type=gray&nodata=100&reproject=bilinear&bidx=1",
+            "version=3.0&type=gray&nodata=100&reproject=bilinear&bidx=1",
         )
         .unwrap();
         let plan = tiler.plan_tile(coord, &style).unwrap().unwrap();

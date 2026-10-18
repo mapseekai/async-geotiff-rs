@@ -22,29 +22,34 @@ dependency surface.
 Supported TMS names are `WebMercatorQuad` and `WorldCRS84Quad`. Supported
 style extensions are `png` and feature-gated lossless `webp`.
 
-## Raster Style Q2 {#parameters}
+## Raster Style Q3 {#parameters}
 
-Both tile routes require complete Q2: `version=2.0&type=...`. Unknown fields,
+Both tile routes require complete Q3: `version=3.0&type=...`. Unknown fields,
 old parameters, and unimplemented capabilities fail explicitly. `dataset`,
 `mode`, and `_v` are separate singleton context keys; asset URLs are not styles.
 
 | Parameter | Repeat | Meaning |
 | --- | --- | --- |
-| `version` / `type` | no | `2.0` and gray/rgb/pseudocolor/categorized/single_color. |
+| `version` / `type` | no | `3.0` and gray/rgb/pseudocolor/categorized/single_color. |
 | `bidx` | yes | One-based source bands; RGB requires exactly three. |
 | `expression` | no | One expression for gray, three separated by semicolons for RGB; excludes bidx. |
 | `method` / `rescale` | ranges only | none, linear, minmax, percentile, stddev, histogram_equalization, curve; see the styling guide for parameters and the shared statistics grid. |
 | `colormap_name` / `colormap` | no | Pseudocolor maps; native tables use exact values or half-open intervals. |
 | `nodata` | no | Finite number or nan. |
-| `color_formula` | yes | Supported Gamma operations, applied in order. |
+| `color_formula` | no | Supported Gamma operations, applied in order. |
 | `opacity` | no | 0–1; default 1. |
 | `resampling` / `reproject` | no | nearest, bilinear, cubic, cubic_spline, lanczos, average. |
-| `tilesize` | no | 64, 128, 256 (default), 512, 1024. |
-| `format` / `lossless` | no | png (default) or webp with lossless=true; must match the path extension. |
-| `pixel_selection` / `stage` | no | Required for mosaics: first/highest/lowest/mean/median and before_channels/after_channels. |
-| `rank_channel` | no | One-based tuple position for highest/lowest. |
+| `extensions` | no | JSON array of exact versioned Schema URLs; percent-encode the value. |
+| `extension_fields` | no | JSON object containing `raster:tile` and/or `raster:mosaic`; percent-encode the value. |
 
-Encode literal `+` as `%2B` in raw Q2. Do not decode before concatenating query
+`raster:tile` supports `tilesize` (64, 128, 256, 512, 1024), `format` (`png`,
+or `webp` with `lossless: true`); the format must match the path. `raster:mosaic`
+requires `pixel_selection` and `stage`, with optional `rank_channel` for highest/lowest.
+Declare the [Tile 1.0.0](https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json)
+and/or [Mosaic 1.0.0](https://mapseekai.github.io/raster-style/extensions/raster/mosaic/v1.0.0/schema.json)
+Schema URLs. The former tile/mosaic short parameters are rejected.
+
+Encode literal `+` as `%2B` in raw Q3. Do not decode before concatenating query
 fragments. See the [styling guide](../../guides/styling/) for semantics and limits.
 
 ## Responses {#responses}

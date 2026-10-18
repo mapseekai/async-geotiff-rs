@@ -131,6 +131,7 @@
     </style>
   </head>
   <body>
+    <div id="style-error" role="alert" hidden style="position:fixed;top:50%;left:1rem;right:1rem;z-index:1000;padding:1rem;background:#fff;color:#991b1b"></div>
     <div id="map"></div>
     <form class="toolbar" id="style-form">
       <div class="field wide">
@@ -275,7 +276,7 @@
         return controls.mode && controls.mode.value === "mosaic";
       }
 
-      // Path extension and Raster Style image.format must agree.
+      // Path extension and Raster Style raster:tile.format must agree.
       function currentExt() {
         return (controls.format && controls.format.value) || "png";
       }
@@ -287,6 +288,25 @@
       const SERVER_DEFAULT_ZOOM = "__ASYNC_GEOTIFF_DEFAULT_ZOOM__";
       const SERVER_DEFAULT_MODE = "__ASYNC_GEOTIFF_DEFAULT_MODE__";
       const pageParams = new URLSearchParams(window.location.search);
+      function parseExtensionFields() {
+        try {
+          const fields = JSON.parse(pageParams.get("extension_fields") ?? "{}");
+          const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+          if (!isObject(fields)) throw new Error("expected an object");
+          for (const key of ["raster:tile", "raster:mosaic"]) {
+            if (key in fields && !isObject(fields[key])) throw new Error(`${key} must be an object`);
+          }
+          return fields;
+        } catch (error) {
+          const alert = document.getElementById("style-error");
+          alert.textContent = `Invalid extension_fields: ${error.message}`;
+          alert.hidden = false;
+          throw error;
+        }
+      }
+      const extensionFields = parseExtensionFields();
+      const tileOptions = extensionFields["raster:tile"] ?? {};
+      const mosaicOptions = extensionFields["raster:mosaic"] ?? {};
       let automaticStretch = !pageParams.has("method");
 
       const controls = {
@@ -313,9 +333,9 @@
       };
 
       controls.mode.value = pageParams.get("mode") ?? SERVER_DEFAULT_MODE;
-      controls.pixelSelection.value = pageParams.get("pixel_selection") ?? "first";
-      controls.stage.value = pageParams.get("stage") ?? "before_channels";
-      controls.rankChannel.value = pageParams.get("rank_channel") ?? "1";
+      controls.pixelSelection.value = mosaicOptions.pixel_selection ?? "first";
+      controls.stage.value = mosaicOptions.stage ?? "before_channels";
+      controls.rankChannel.value = mosaicOptions.rank_channel ?? "1";
       controls.colormap.value = pageParams.get("colormap_name") ?? "";
       controls.stretch.value = pageParams.get("method") ?? "none";
       controls.rescale.value = pageParams.getAll("rescale").join(";") || "0,255;0,255;0,255";
@@ -327,7 +347,7 @@
       let rgbPresetPending = pageParams.get("mode") !== "mosaic" && controls.bidx.value.replace(/\s/g, "") === "1,2,3";
       controls.expression.value = pageParams.get("expression") ?? "";
       controls.resampling.value = pageParams.get("resampling") ?? "bilinear";
-      controls.tilesize.value = pageParams.get("tilesize") ?? "256";
+      controls.tilesize.value = (tileOptions.tilesize === undefined ? null : String(tileOptions.tilesize)) ?? "256";
       controls.opacity.value = pageParams.get("opacity") ?? "0.85";
 
       function tileOrigin() {
@@ -376,11 +396,7 @@
 
       let datasetBands = 1;
       function protocolParams(params) {
-        params.set("version", "2.0");
-        if (isMosaic()) {
-          params.set("stage", controls.stage.value);
-          if (["highest", "lowest"].includes(controls.pixelSelection.value)) params.set("rank_channel", controls.rankChannel.value || "1");
-        }
+        params.set("version", "3.0");
         const expression = params.get("expression");
         if (!expression && !params.has("bidx")) {
           const bands = controls.colormap.value || datasetBands < 3 ? [1] : [1,2,3];
@@ -394,8 +410,22 @@
         if (count === 1 && params.getAll("rescale").length > 1) {
           const first = params.get("rescale"); params.delete("rescale"); params.append("rescale", first);
         }
-        params.set("format", controls.format.value || "png");
-        if (controls.format.value === "webp") params.set("lossless", "true");
+        const tile = {format: controls.format.value || "png"};
+        if (tile.format === "webp") tile.lossless = true;
+        tile.tilesize = Number(controls.tilesize.value || "256");
+        const fields = {};
+        const declarations = [];
+        if (isMosaic()) {
+          const mosaic = {pixel_selection: controls.pixelSelection.value};
+          if (["highest", "lowest"].includes(mosaic.pixel_selection)) mosaic.rank_channel = Number(controls.rankChannel.value || "1");
+          mosaic.stage = controls.stage.value;
+          fields["raster:mosaic"] = mosaic;
+          declarations.push("https://mapseekai.github.io/raster-style/extensions/raster/mosaic/v1.0.0/schema.json");
+        }
+        fields["raster:tile"] = tile;
+        declarations.push("https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json");
+        params.set("extensions", JSON.stringify(declarations));
+        params.set("extension_fields", JSON.stringify(fields));
         params.sort();
         return params;
       }
@@ -403,11 +433,7 @@
       function tileParams() {
         const params = new URLSearchParams();
         params.set("mode", isMosaic() ? "mosaic" : "single");
-        if (isMosaic()) {
-          // Mosaic ignores ?dataset=; it uses the server's startup-loaded
-          // MosaicJSON. Pixel-selection picks the reducer.
-          params.set("pixel_selection", controls.pixelSelection.value);
-        } else if (controls.dataset && controls.dataset.value) {
+        if (!isMosaic() && controls.dataset && controls.dataset.value) {
           params.set("dataset", controls.dataset.value);
         }
         const expression = controls.expression.value.trim();
@@ -429,7 +455,6 @@
         }
         params.set("resampling", controls.resampling.value);
         params.set("reproject", controls.resampling.value);
-        params.set("tilesize", controls.tilesize.value || "256");
         return protocolParams(params);
       }
 
@@ -553,7 +578,7 @@
 
       // The server advertises supported Raster Style output formats.
       (async function loadFormats() {
-        const wanted = pageParams.get("format") ?? "png";
+        const wanted = tileOptions.format ?? "png";
         try {
           const resp = await fetch(`${tileOrigin()}/formats`);
           if (!resp.ok) return;

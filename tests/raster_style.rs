@@ -27,24 +27,28 @@ fn pixels(style: Value, values: &[f64]) -> Vec<u8> {
 }
 
 #[test]
-fn json_and_q2_share_validation_broadcast_and_pixel_results() {
-    let document = json!({"version":"2.0","renderer":{"type":"rgb","bidx":[3,2,1]},"stretch":{"method":"linear","rescale":[[0,100]]}});
+fn json_and_q3_share_validation_broadcast_and_pixel_results() {
+    let document = json!({"version":"3.0","renderer":{"type":"rgb","bidx":[3,2,1]},"stretch":{"method":"linear","rescale":[[0,100]]}});
     let sdk = RasterStyle::from_json(&document.to_string()).unwrap();
     let query = raster_style::encode_query(&sdk).unwrap();
     let json = TileStyle::from_raster_style(&sdk).unwrap();
-    let q2 = TileStyle::from_raster_query(&query).unwrap();
-    assert_eq!(q2.raster_style_json(), json.raster_style_json());
+    assert_eq!(
+        TileStyle::from_raster_query(&query)
+            .unwrap()
+            .raster_style_json(),
+        json.raster_style_json()
+    );
     assert_eq!(pixels(document, &[0., 50., 100.]), [255, 128, 0, 255]);
-    // Integer-valued JSON floats and Q2 numbers are legal in the SDK.
+    // Integer-valued JSON floats and Q3 numbers are legal in the SDK.
     assert!(
-        TileStyle::from_json(r#"{"version":"2.0","renderer":{"type":"gray","bidx":[1.0]}}"#)
+        TileStyle::from_json(r#"{"version":"3.0","renderer":{"type":"gray","bidx":[1.0]}}"#)
             .is_ok()
     );
 }
 
 #[test]
 fn defaults_gamma_nodata_and_alpha_are_explicit() {
-    let mut style = json!({"version":"2.0","renderer":{"type":"gray","bidx":[1]}});
+    let mut style = json!({"version":"3.0","renderer":{"type":"gray","bidx":[1]}});
     assert_eq!(pixels(style.clone(), &[1.]), [1, 1, 1, 255]);
     style["stretch"] = json!({"method":"linear","rescale":[[0,1]]});
     style["effects"] = json!({"color_formula":[{"op":"gamma","value":2}]});
@@ -57,17 +61,17 @@ fn defaults_gamma_nodata_and_alpha_are_explicit() {
 
 #[test]
 fn intervals_are_half_open_and_exact_values_are_not_rounded() {
-    let intervals = json!({"version":"2.0","renderer":{"type":"pseudocolor","bidx":[1],"colormap":[[[0,1],[255,0,0,255]],[[1,2],[0,255,0,255]]]}});
+    let intervals = json!({"version":"3.0","renderer":{"type":"pseudocolor","bidx":[1],"colormap":[[[0,1],[255,0,0,255]],[[1,2],[0,255,0,255]]]}});
     assert_eq!(pixels(intervals.clone(), &[1.]), [0, 255, 0, 255]);
     assert_eq!(pixels(intervals, &[2.]), [0, 0, 0, 0]);
-    let exact = json!({"version":"2.0","renderer":{"type":"categorized","bidx":[1],"colormap":{"1":[255,0,0,255]}}});
+    let exact = json!({"version":"3.0","renderer":{"type":"categorized","bidx":[1],"colormap":{"1":[255,0,0,255]}}});
     assert_eq!(pixels(exact.clone(), &[1.]), [255, 0, 0, 255]);
     assert_eq!(pixels(exact, &[1.5]), [0, 0, 0, 0]);
 }
 
 #[test]
 fn colormap_lookup_preserves_numeric_order_signed_zero_and_interval_gaps() {
-    let exact = json!({"version":"2.0","renderer":{"type":"categorized","bidx":[1],
+    let exact = json!({"version":"3.0","renderer":{"type":"categorized","bidx":[1],
         "colormap":{"-10":[10,0,0,255],"-2":[20,0,0,255],"0":[30,0,0,255],
                     "2":[40,0,0,255],"10":[50,0,0,255]}}});
     for (value, red) in [
@@ -83,7 +87,7 @@ fn colormap_lookup_preserves_numeric_order_signed_zero_and_interval_gaps() {
     for value in [-11., -2.5, 1.5, 11.] {
         assert_eq!(pixels(exact.clone(), &[value]), [0; 4]);
     }
-    let intervals = json!({"version":"2.0","renderer":{"type":"pseudocolor","bidx":[1],
+    let intervals = json!({"version":"3.0","renderer":{"type":"pseudocolor","bidx":[1],
         "colormap":[[[-10,-2],[10,0,0,255]],[[0,2],[20,0,0,255]],[[2,10],[30,0,0,255]]]}});
     for (value, red) in [
         (-10., 10),
@@ -102,7 +106,7 @@ fn colormap_lookup_preserves_numeric_order_signed_zero_and_interval_gaps() {
 
 #[test]
 fn expression_and_transparent_range_keep_invalid_pixels_transparent() {
-    let style = json!({"version":"2.0","renderer":{"type":"gray","expression":"(b2-b1)/(b2+b1)"},"stretch":{"method":"linear","rescale":[[-1,1]],"range_policy":"transparent"}});
+    let style = json!({"version":"3.0","renderer":{"type":"gray","expression":"(b2-b1)/(b2+b1)"},"stretch":{"method":"linear","rescale":[[-1,1]],"range_policy":"transparent"}});
     assert_eq!(pixels(style.clone(), &[1., 3.]), [191, 191, 191, 255]);
     assert_eq!(pixels(style.clone(), &[-1., 1.]), [0, 0, 0, 0]);
     assert_eq!(pixels(style, &[-1., 3.]), [0, 0, 0, 0]);
@@ -114,26 +118,29 @@ fn unsupported_fields_and_ambiguous_transport_fail_closed() {
         json!({"statistics":{"scope":"viewport","accuracy":"exact"}}),
         json!({"statistics":{"scope":"dataset","accuracy":"exact","ref":"unbound"}}),
         json!({"effects":{"post_color_formula":[{"op":"invert"}]}}),
-        json!({"image":{"format":"jpeg"}}),
+        json!({"extensions":[raster_style::TILE_SCHEMA_URL],"raster:tile":{"format":"jpeg"}}),
         json!({"calibration":{"mode":"metadata"}}),
     ] {
-        let mut v = json!({"version":"2.0","renderer":{"type":"gray","bidx":[1]}});
+        let mut v = json!({"version":"3.0","renderer":{"type":"gray","bidx":[1]}});
         v.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
-        assert!(TileStyle::from_json(&v.to_string()).is_err(), "{v}");
+        let error = TileStyle::from_json(&v.to_string()).unwrap_err();
+        if v.get("raster:tile").is_some() {
+            assert!(error.to_string().contains("/raster:tile/format"), "{error}");
+        }
     }
     for query in [
-        "version=2.0&type=gray&type=gray&bidx=1",
-        "version=2.0&type=gray&bidx=1&typo=1",
-        "version=2.0&type=gray&expression=b1+b1",
-        "version=2.0&type=gray&expression=b1%252Bb1",
+        "version=3.0&type=gray&type=gray&bidx=1",
+        "version=3.0&type=gray&bidx=1&typo=1",
+        "version=3.0&type=gray&expression=b1+b1",
+        "version=3.0&type=gray&expression=b1%252Bb1",
     ] {
         assert!(TileStyle::from_raster_query(query).is_err(), "{query}");
     }
-    assert!(TileStyle::from_raster_query("version=2.0&type=gray&expression=b1%2Bb1").is_ok());
+    assert!(TileStyle::from_raster_query("version=3.0&type=gray&expression=b1%2Bb1").is_ok());
     assert!(TileStyle::from_json(
-        r#"{"version":"2.0","version":"2.0","renderer":{"type":"gray","bidx":[1]}}"#
+        r#"{"version":"3.0","version":"3.0","renderer":{"type":"gray","bidx":[1]}}"#
     )
     .is_err());
 }
@@ -141,9 +148,9 @@ fn unsupported_fields_and_ambiguous_transport_fail_closed() {
 #[tokio::test]
 async fn compile_cache_separates_protocol_options() {
     let a =
-        TileStyle::from_json(r#"{"version":"2.0","renderer":{"type":"gray","bidx":[1]}}"#).unwrap();
+        TileStyle::from_json(r#"{"version":"3.0","renderer":{"type":"gray","bidx":[1]}}"#).unwrap();
     let b = TileStyle::from_json(
-        r#"{"version":"2.0","renderer":{"type":"gray","bidx":[1]},"opacity":0.5}"#,
+        r#"{"version":"3.0","renderer":{"type":"gray","bidx":[1]},"opacity":0.5}"#,
     )
     .unwrap();
     let x = async_geotiff::style::params::compile_cached(&a)
@@ -163,28 +170,28 @@ async fn compile_cache_separates_protocol_options() {
 fn rgb_expression_solid_invert_and_extreme_ranges() {
     assert_eq!(
         pixels(
-            json!({"version":"2.0","renderer":{"type":"rgb","expression":"b3;b2;b1"}}),
+            json!({"version":"3.0","renderer":{"type":"rgb","expression":"b3;b2;b1"}}),
             &[10., 20., 30.]
         ),
         [30, 20, 10, 255]
     );
     assert_eq!(
         pixels(
-            json!({"version":"2.0","renderer":{"type":"single_color","bidx":[1],"color":"#ff000080"},"opacity":0.5}),
+            json!({"version":"3.0","renderer":{"type":"single_color","bidx":[1],"color":"#ff000080"},"opacity":0.5}),
             &[0.]
         ),
         [255, 0, 0, 64]
     );
     assert_eq!(
         pixels(
-            json!({"version":"2.0","renderer":{"type":"gray","bidx":[1],"renderer_invert":true}}),
+            json!({"version":"3.0","renderer":{"type":"gray","bidx":[1],"renderer_invert":true}}),
             &[0.]
         ),
         [255, 255, 255, 255]
     );
     assert_eq!(
         pixels(
-            json!({"version":"2.0","renderer":{"type":"gray","bidx":[1]},"stretch":{"method":"linear","rescale":[[-1e308,1e308]]}}),
+            json!({"version":"3.0","renderer":{"type":"gray","bidx":[1]},"stretch":{"method":"linear","rescale":[[-1e308,1e308]]}}),
             &[0.]
         ),
         [128, 128, 128, 255]
@@ -200,7 +207,7 @@ fn defaults_and_tile_sizes_use_the_protocol_contract() {
     assert_eq!(style.format(), async_geotiff::style::TileFormat::Png);
     for size in [64, 128, 256, 512, 1024] {
         assert_eq!(
-            TileStyle::from_raster_query(&format!("version=2.0&type=gray&bidx=1&tilesize={size}"))
+            TileStyle::from_raster_query(&format!("version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A{size}%7D%7D"))
                 .unwrap()
                 .tilesize(),
             size
@@ -208,7 +215,7 @@ fn defaults_and_tile_sizes_use_the_protocol_contract() {
     }
     for size in [0, 96, 2048, 4096] {
         assert!(TileStyle::from_raster_query(&format!(
-            "version=2.0&type=gray&bidx=1&tilesize={size}"
+            "version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A{size}%7D%7D"
         ))
         .is_err());
     }
@@ -216,7 +223,7 @@ fn defaults_and_tile_sizes_use_the_protocol_contract() {
         "",
         "bidx=1",
         "stretch=stddev",
-        "version=2.0&type=gray&bidx=1&unscale=true",
+        "version=3.0&type=gray&bidx=1&unscale=true",
     ] {
         assert!(TileStyle::from_raster_query(query).is_err());
     }
@@ -233,7 +240,7 @@ fn all_stretch_methods_round_trip_and_curve_renders_in_display_space() {
         json!({"method":"histogram_equalization"}),
         json!({"method":"curve","curves":[[[0,0.2],[20,0.8]]]}),
     ] {
-        let doc = json!({"version":"2.0","renderer":{"type":"gray","bidx":[1]},"stretch":stretch});
+        let doc = json!({"version":"3.0","renderer":{"type":"gray","bidx":[1]},"stretch":stretch});
         let sdk = RasterStyle::from_json(&doc.to_string()).unwrap();
         let query = raster_style::encode_query(&sdk).unwrap();
         assert_eq!(
@@ -245,9 +252,56 @@ fn all_stretch_methods_round_trip_and_curve_renders_in_display_space() {
                 .raster_style_json()
         );
     }
-    let curve = json!({"version":"2.0","renderer":{"type":"rgb","bidx":[1,2,3]},"stretch":{"method":"curve","curves":[[[0,0.2],[20,0.8]]]}});
+    let curve = json!({"version":"3.0","renderer":{"type":"rgb","bidx":[1,2,3]},"stretch":{"method":"curve","curves":[[[0,0.2],[20,0.8]]]}});
     assert_eq!(pixels(curve.clone(), &[-1., 10., 21.]), [51, 128, 204, 255]);
     let mut transparent = curve;
     transparent["stretch"]["range_policy"] = json!("transparent");
     assert_eq!(pixels(transparent, &[-1., 10., 21.]), [0; 4]);
+}
+
+#[test]
+fn extensions_require_complete_validation_and_exact_executor_support() {
+    use raster_style::{SchemaRegistry, MOSAIC_SCHEMA_URL, TILE_SCHEMA_URL};
+
+    let core = json!({"version":"3.0","renderer":{"type":"gray","bidx":[1]}});
+    let mut tile = core.clone();
+    tile["extensions"] = json!([TILE_SCHEMA_URL]);
+    tile["raster:tile"] = json!({"format":"png","tilesize":64});
+    let sdk = RasterStyle::from_value(tile.clone()).unwrap();
+    let query = raster_style::encode_query(&sdk).unwrap();
+    assert_eq!(TileStyle::from_raster_query(&query).unwrap().tilesize(), 64);
+    tile.as_object_mut().unwrap().remove("extensions");
+    assert!(TileStyle::from_json(&tile.to_string()).is_err());
+
+    let mut mosaic = core.clone();
+    mosaic["extensions"] = json!([MOSAIC_SCHEMA_URL]);
+    mosaic["raster:mosaic"] = json!({"pixel_selection":"first","stage":"before_channels"});
+    assert_eq!(
+        TileStyle::from_json(&mosaic.to_string()).is_ok(),
+        cfg!(feature = "mosaic")
+    );
+
+    let url = "https://example.test/vendor/v1.0.0/schema.json";
+    let mut vendor = core;
+    vendor["extensions"] = json!([url]);
+    vendor["vendor:gain"] = json!(2);
+    let unresolved = RasterStyle::from_value(vendor.clone()).unwrap();
+    assert!(!unresolved.validation().complete);
+    assert!(TileStyle::from_raster_style(&unresolved).is_err());
+    let mut registry = SchemaRegistry::new().unwrap();
+    registry
+        .register(json!({"$id":url,"type":"object","properties":{"vendor:gain":{"type":"number"}}}))
+        .unwrap();
+    let validated = registry.parse_json(&vendor.to_string()).unwrap();
+    assert!(validated.validation().complete);
+    assert!(TileStyle::from_raster_style(&validated).is_err());
+
+    for legacy in [
+        "version=2.0&type=gray&bidx=1",
+        "version=3.0&type=gray&bidx=1&tilesize=64",
+        "version=3.0&type=gray&bidx=1&format=png",
+        "version=3.0&type=gray&bidx=1&pixel_selection=first&stage=before_channels",
+    ] {
+        assert!(TileStyle::from_raster_query(legacy).is_err(), "{legacy}");
+    }
 }

@@ -243,7 +243,7 @@ mod workload {
                 Renderer::create(base, mosaic, cache.clone()).await.unwrap(),
             ))
         };
-        let style = TileStyle::from_raster_query("version=2.0&type=gray&tilesize=64&rescale=0,255&resampling=bilinear&reproject=bilinear&bidx=1&method=linear&pixel_selection=mean&stage=after_channels")
+        let style = TileStyle::from_raster_query("version=3.0&type=gray&rescale=0,255&resampling=bilinear&reproject=bilinear&bidx=1&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22after_channels%22%7D%7D")
         .unwrap();
         if let Some(renderer) = &warm {
             renderer.tile(coord(), &style).await.unwrap();
@@ -311,7 +311,7 @@ mod workload {
         let mut jobs = JoinSet::new();
         for _ in 0..concurrency {
             let renderer = renderer.clone();
-            jobs.spawn(async move { renderer.tile(coord(), &TileStyle::from_raster_query("version=2.0&type=gray&bidx=1&pixel_selection=mean&stage=after_channels").unwrap()).await });
+            jobs.spawn(async move { renderer.tile(coord(), &TileStyle::from_raster_query("version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22after_channels%22%7D%7D").unwrap()).await });
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         jobs.abort_all();
@@ -371,7 +371,7 @@ mod workload {
             jobs.spawn(async move {
                 let started = Instant::now();
                 let result = renderer
-                    .tile_with_options(coord(), &TileStyle::from_raster_query("version=2.0&type=gray&bidx=1&pixel_selection=mean&stage=after_channels").unwrap(), &options)
+                    .tile_with_options(coord(), &TileStyle::from_raster_query("version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22after_channels%22%7D%7D").unwrap(), &options)
                     .await;
                 let outcome = match result {
                     Err(async_geotiff::error::AgError::Overloaded) => "overloaded",
@@ -423,7 +423,7 @@ mod workload {
         for _ in 0..8 {
             let renderer = renderer.clone();
             jobs.spawn(async move {
-                let style = TileStyle::from_raster_query("version=2.0&type=gray&tilesize=1024&rescale=0,255&bidx=1&method=linear&pixel_selection=mean&stage=after_channels").unwrap();
+                let style = TileStyle::from_raster_query("version=3.0&type=gray&rescale=0,255&bidx=1&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A1024%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22after_channels%22%7D%7D").unwrap();
                 assert!(matches!(
                     renderer.tile(coord(), &style).await,
                     Err(async_geotiff::error::AgError::ResourceLimit(_))

@@ -11,6 +11,11 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+- Upgrade to Raster Style SDK 0.4.0 and core 3.0/Q3. Tile and mosaic settings
+  require exact versioned extension declarations and use `raster:tile` /
+  `raster:mosaic`; Q3 carries them in `extension_fields`. Reject incomplete
+  validation, unsupported extension versions, and all legacy tile/mosaic keys.
+
 - Add minmax, percentile, stddev, histogram equalization and curve stretch to
   Raster Style and all three viewers. Statistical methods share a fixed full-footprint
   grid across tiles; fixed MosaicJSON collections support both merge stages.
@@ -19,11 +24,11 @@ can land in any release** and are called out explicitly under a
 
 ### ⚠️ BREAKING
 
-- Require Rust 1.92 and adopt `raster-style` 0.3.0 (protocol 2.0) for style
+- Require Rust 1.92 and adopt `raster-style` 0.4.0 (protocol 3.0/Q3) for style
   input. Use `TileStyle::from_json`, `from_raster_query` or `from_raster_style`.
   Remove the legacy query parser, mutable style fields, `Stretch`,
   `ColourDefinition`, `Colour`, `lut_from_stops` and `compile_validated` APIs.
-- HTTP tile requests require Q2 `version=2.0&type=...`. Old and unknown
+- HTTP tile requests require Q3 `version=3.0&type=...`. Old and unknown
   parameters fail validation. The default is gray band 1 with a fixed 0–255
   range; there is no implicit statistics-based stretch or metadata unscale.
 - Mosaic selection now belongs to the style document. Call
@@ -35,7 +40,7 @@ can land in any release** and are called out explicitly under a
   external statistics snapshots, nontrivial calibration, terrain rendering, advanced
   expressions/effects, JPEG and lossy WebP. The low-level JPEG encoder remains
   available separately. Align HTTP, viewers, Rust examples and documentation
-  with the supported JSON/Q2 contract.
+  with the supported JSON/Q3 contract.
 
 ### Fixed
 

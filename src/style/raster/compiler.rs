@@ -41,19 +41,30 @@ fn only(value: &Value, allowed: &[&str], path: &str) -> AgResult<()> {
 }
 
 impl TileStyle {
-    /// Parse grouped Raster Style JSON (SDK 0.3.0, protocol 2.0).
+    /// Parse Raster Style 3.0 JSON with versioned Mosaic and Tile extensions.
     /// Unsupported renderer capabilities fail before any raster is opened.
     pub fn from_json(json: &str) -> AgResult<Self> {
         Self::from_raster_style(&RasterStyle::from_json(json).map_err(sdk_error)?)
     }
 
-    /// Parse an original, percent-encoded Q2 query. Do not URL-decode it first.
+    /// Parse an original, percent-encoded Q3 query. Do not URL-decode it first.
     pub fn from_raster_query(query: &str) -> AgResult<Self> {
         Self::from_raster_style(&raster_style::decode_query(query).map_err(sdk_error)?)
     }
 
     /// Adapt an SDK-validated document to the supported renderer.
     pub fn from_raster_style(style: &RasterStyle) -> AgResult<Self> {
+        let supported: &[&str] = if cfg!(feature = "mosaic") {
+            &[
+                raster_style::TILE_SCHEMA_URL,
+                raster_style::MOSAIC_SCHEMA_URL,
+            ]
+        } else {
+            &[raster_style::TILE_SCHEMA_URL]
+        };
+        style
+            .require_extension_support(supported)
+            .map_err(sdk_error)?;
         let v = style.as_value();
         only(
             v,
@@ -65,9 +76,10 @@ impl TileStyle {
                 "nodata",
                 "effects",
                 "opacity",
-                "image",
+                "extensions",
+                "raster:tile",
                 "calibration",
-                "mosaic",
+                "raster:mosaic",
                 "statistics",
             ],
             "",
@@ -111,9 +123,9 @@ impl TileStyle {
         dependencies.sort_unstable();
         dependencies.dedup();
 
-        let mosaic = if let Some(mosaic) = v.get("mosaic") {
+        let mosaic = if let Some(mosaic) = v.get("raster:mosaic") {
             if !cfg!(feature = "mosaic") {
-                return Err(unsupported("/mosaic (enable the mosaic feature)"));
+                return Err(unsupported("/raster:mosaic (enable the mosaic feature)"));
             }
             let selection = mosaic["pixel_selection"]
                 .as_str()
@@ -128,7 +140,7 @@ impl TileStyle {
             };
             if matches!(selection.as_str(), "highest" | "lowest") && rank >= channels {
                 return Err(AgError::query(
-                    "/mosaic/rank_channel",
+                    "/raster:mosaic/rank_channel",
                     "outside the compiled channel dependencies",
                 ));
             }
@@ -169,15 +181,25 @@ impl TileStyle {
         }
         let data_domain = method == "none" && gamma.is_empty();
         let colors = compile_colors(renderer, kind, data_domain)?;
-        only(&v["image"], &["format", "tilesize", "lossless"], "/image")?;
+        only(
+            &v["raster:tile"],
+            &["format", "tilesize", "lossless"],
+            "/raster:tile",
+        )?;
         let format = match v
-            .pointer("/image/format")
+            .pointer("/raster:tile/format")
             .and_then(Value::as_str)
             .unwrap_or("png")
         {
             "png" => TileFormat::Png,
-            "webp" if v.pointer("/image/lossless") == Some(&Value::Bool(true)) => TileFormat::Webp,
-            _ => return Err(unsupported("/image/format (use png or lossless webp)")),
+            "webp" if v.pointer("/raster:tile/lossless") == Some(&Value::Bool(true)) => {
+                TileFormat::Webp
+            }
+            _ => {
+                return Err(unsupported(
+                    "/raster:tile/format (use png or lossless webp)",
+                ))
+            }
         };
         format.ensure_available()?;
         let resampler = |key: &str| -> AgResult<Resampling> {
@@ -192,7 +214,7 @@ impl TileStyle {
                 "bidx": renderer.get("bidx"), "expression": renderer.get("expression"),
                 "language": renderer.get("language"), "resampling": v.get("resampling"),
                 "nodata": v.get("nodata"), "calibration": v.get("calibration"),
-                "mosaic": v.get("mosaic"), "statistics": v.get("statistics")
+                "raster:mosaic": v.get("raster:mosaic"), "statistics": v.get("statistics")
             })
             .to_string();
             let mut stretch = stretch.clone();
@@ -210,7 +232,7 @@ impl TileStyle {
             resampling: resampler("read")?,
             reproject: resampler("reproject")?,
             tilesize: v
-                .pointer("/image/tilesize")
+                .pointer("/raster:tile/tilesize")
                 .and_then(Value::as_f64)
                 .unwrap_or(256.0) as u32,
             format,
@@ -233,7 +255,7 @@ impl TileStyle {
         };
         if !crate::style::params::ALLOWED_TILE_SIZES.contains(&out.tilesize) {
             return Err(unsupported(
-                "/image/tilesize (use 64, 128, 256, 512 or 1024)",
+                "/raster:tile/tilesize (use 64, 128, 256, 512 or 1024)",
             ));
         }
         Ok(out)

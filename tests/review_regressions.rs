@@ -43,13 +43,13 @@ fn fractional_nodata_does_not_mask_integer_rgb() {
         None,
     );
     for query in [
-        "version=2.0&type=rgb&nodata=1.5&bidx=1&bidx=2&bidx=3",
-        "version=2.0&type=rgb&nodata=1.5&bidx=1&bidx=2&bidx=3&color_formula=gamma%20rgb%201",
+        "version=3.0&type=rgb&nodata=1.5&bidx=1&bidx=2&bidx=3",
+        "version=3.0&type=rgb&nodata=1.5&bidx=1&bidx=2&bidx=3&color_formula=gamma%20rgb%201",
     ] {
         assert_eq!(alphas(&img, query), vec![255], "{query}");
     }
     assert_eq!(
-        alphas(&img, "version=2.0&type=rgb&nodata=1&bidx=1&bidx=2&bidx=3"),
+        alphas(&img, "version=3.0&type=rgb&nodata=1&bidx=1&bidx=2&bidx=3"),
         vec![0]
     );
 }
@@ -69,7 +69,7 @@ fn rgb_render_honors_strided_masks() {
             assert_eq!(
                 alphas(
                     &image(pixels, Some(mask.clone())),
-                    "version=2.0&type=rgb&bidx=1&bidx=2&bidx=3"
+                    "version=3.0&type=rgb&bidx=1&bidx=2&bidx=3"
                 ),
                 expected
             );
@@ -80,9 +80,9 @@ fn rgb_render_honors_strided_masks() {
 #[test]
 fn generic_render_masks_infinite_nodata() {
     for (sentinel, query) in [
-        (f32::INFINITY, "version=2.0&type=gray&bidx=1"),
-        (f32::NEG_INFINITY, "version=2.0&type=gray&bidx=1"),
-        (f32::NAN, "version=2.0&type=gray&nodata=nan&bidx=1"),
+        (f32::INFINITY, "version=3.0&type=gray&bidx=1"),
+        (f32::NEG_INFINITY, "version=3.0&type=gray&bidx=1"),
+        (f32::NAN, "version=3.0&type=gray&nodata=nan&bidx=1"),
     ] {
         let img = image(
             PixelData::F32(Array3::from_shape_vec((1, 1, 2), vec![sentinel, 10.0]).unwrap()),
@@ -175,7 +175,7 @@ async fn passthrough_uses_the_destination_grid() {
     let image = Tiler::new(reader)
         .warp_tile(
             coord(),
-            &TileStyle::from_raster_query("version=2.0&type=gray&tilesize=64&bidx=1").unwrap(),
+            &TileStyle::from_raster_query("version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D").unwrap(),
         )
         .await
         .unwrap()
@@ -192,7 +192,16 @@ mod mosaic {
     fn mosaic_style(selection: PixelSelection, style: &TileStyle) -> TileStyle {
         let mut document: serde_json::Value =
             serde_json::from_str(style.raster_style_json()).unwrap();
-        document["mosaic"] = serde_json::json!({"pixel_selection": format!("{selection:?}").to_lowercase(), "stage": "after_channels"});
+        document["raster:mosaic"] = serde_json::json!({"pixel_selection": format!("{selection:?}").to_lowercase(), "stage": "after_channels"});
+        let declarations = document
+            .as_object_mut()
+            .unwrap()
+            .entry("extensions")
+            .or_insert_with(|| serde_json::json!([]));
+        declarations
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(raster_style::MOSAIC_SCHEMA_URL));
         TileStyle::from_json(&document.to_string()).unwrap()
     }
 
@@ -251,7 +260,7 @@ mod mosaic {
         let mosaic = mosaic_with_nodata(0.0, false).await;
         for stage in ["before_channels", "after_channels"] {
             for selection in ["first", "mean", "median"] {
-                let style=TileStyle::from_raster_query(&format!("version=2.0&type=rgb&bidx=2&bidx=3&bidx=1&method=minmax&pixel_selection={selection}&stage={stage}&tilesize=64")).unwrap();
+                let style=TileStyle::from_raster_query(&format!("version=3.0&type=rgb&bidx=2&bidx=3&bidx=1&method=minmax&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22{selection}%22%2C%22stage%22%3A%22{stage}%22%7D%7D")).unwrap();
                 let bytes = mosaic.tile(coord(), &style).await.unwrap().unwrap();
                 assert!(
                     image::load_from_memory(&bytes)
@@ -290,14 +299,14 @@ mod mosaic {
                 ("mean", [150, 35, 15, 128]),
                 ("median", [150, 35, 15, 128]),
             ] {
-                let style = TileStyle::from_raster_query(&format!("version=2.0&type=rgb&bidx=2&bidx=3&bidx=1&tilesize=64&opacity=0.5&pixel_selection={method}&stage={stage}")).unwrap();
+                let style = TileStyle::from_raster_query(&format!("version=3.0&type=rgb&bidx=2&bidx=3&bidx=1&opacity=0.5&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22{method}%22%2C%22stage%22%3A%22{stage}%22%7D%7D")).unwrap();
                 let bytes = mosaic.tile(coord(), &style).await.unwrap().unwrap();
                 let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
                 assert!(image.pixels().all(|p| p.0 == expected), "{stage} {method}");
             }
         }
         let style = TileStyle::from_raster_query(
-            "version=2.0&type=gray&bidx=2&tilesize=64&pixel_selection=mean&stage=before_channels",
+            "version=3.0&type=gray&bidx=2&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22before_channels%22%7D%7D",
         )
         .unwrap();
         let mosaic = mosaic_with_nodata(0.0, true).await;
@@ -335,7 +344,7 @@ mod mosaic {
             .work_budget(budget.clone())
             .build();
         for stage in ["before_channels", "after_channels"] {
-            let style = TileStyle::from_raster_query(&format!("version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&tilesize=64&pixel_selection=first&stage={stage}")).unwrap();
+            let style = TileStyle::from_raster_query(&format!("version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22first%22%2C%22stage%22%3A%22{stage}%22%7D%7D")).unwrap();
             let bytes = mosaic.tile(coord(), &style).await.unwrap().unwrap();
             assert!(image::load_from_memory(&bytes)
                 .unwrap()
@@ -344,7 +353,7 @@ mod mosaic {
                 .all(|p| p.0 == [10, 200, 30, 255]));
 
             let required = TileStyle::from_raster_query(&format!(
-                "version=2.0&type=gray&bidx=1&tilesize=64&pixel_selection=mean&stage={stage}"
+                "version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22mean%22%2C%22stage%22%3A%22{stage}%22%7D%7D"
             ))
             .unwrap();
             assert!(mosaic.tile(coord(), &required).await.is_err());
@@ -369,15 +378,14 @@ mod mosaic {
                 ..Default::default()
             })
             .build();
-        let missing = TileStyle::from_raster_query("version=2.0&type=gray&bidx=1").unwrap();
-        assert!(capped
-            .tile(coord(), &missing)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("require"));
+        let missing = TileStyle::from_raster_query("version=3.0&type=gray&bidx=1").unwrap();
+        let error = capped.tile(coord(), &missing).await.unwrap_err();
+        assert!(
+            matches!(&error, async_geotiff::error::AgError::Query { name, .. } if name == "/raster:mosaic")
+        );
+        assert!(error.to_string().contains("require"));
         let style = TileStyle::from_raster_query(
-            "version=2.0&type=gray&bidx=1&pixel_selection=first&stage=before_channels",
+            "version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22first%22%2C%22stage%22%3A%22before_channels%22%7D%7D",
         )
         .unwrap();
         assert!(capped
@@ -401,7 +409,7 @@ mod mosaic {
                 .unwrap();
         }
         let style = TileStyle::from_raster_query(
-            "version=2.0&type=rgb&tilesize=64&bidx=1&bidx=2&bidx=3&rescale=0,255&method=linear",
+            "version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&rescale=0,255&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D",
         )
         .unwrap();
         for keys in [vec!["full", "missing"], vec!["empty", "full", "missing"]] {
@@ -460,7 +468,7 @@ mod mosaic {
                 &mosaic_style(
                     PixelSelection::First,
                     &TileStyle::from_raster_query(
-                        "version=2.0&type=gray&tilesize=64&rescale=0,255&bidx=1&method=linear"
+                        "version=3.0&type=gray&rescale=0,255&bidx=1&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D"
                     )
                     .unwrap()
                 )
@@ -506,10 +514,10 @@ mod mosaic {
         ] {
             for (query, expected) in [
                 (
-                    "version=2.0&type=rgb&tilesize=64&bidx=2&bidx=3&bidx=1&rescale=0,255&rescale=0,255&rescale=0,255&method=linear",
+                    "version=3.0&type=rgb&bidx=2&bidx=3&bidx=1&rescale=0,255&rescale=0,255&rescale=0,255&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D",
                     expected_rgb,
                 ),
-                ("version=2.0&type=gray&tilesize=64&bidx=2&rescale=0,255&method=linear", expected_grey),
+                ("version=3.0&type=gray&bidx=2&rescale=0,255&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D", expected_grey),
             ] {
                 let output = mosaic
                     .tile(coord(), &mosaic_style(selection, &TileStyle::from_raster_query(query).unwrap()))
@@ -534,8 +542,8 @@ mod mosaic {
         for shift in [0.0, 0.01] {
             let mosaic = mosaic_with_nodata(shift, true).await;
             for query in [
-                "version=2.0&type=gray&tilesize=64&bidx=2&rescale=0,255&method=linear",
-                "version=2.0&type=gray&tilesize=64&bidx=2&rescale=0,255&method=linear",
+                "version=3.0&type=gray&bidx=2&rescale=0,255&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D",
+                "version=3.0&type=gray&bidx=2&rescale=0,255&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D",
             ] {
                 let output = mosaic
                     .tile(
@@ -565,7 +573,7 @@ mod mosaic {
     async fn mosaic_accepts_nearly_aligned_assets() {
         let output = mosaic_with_nodata(1e-7, false)
             .await
-            .tile(coord(), &mosaic_style(PixelSelection::Mean, &TileStyle::from_raster_query("version=2.0&type=rgb&tilesize=64&bidx=1&bidx=2&bidx=3&rescale=0,255&rescale=0,255&rescale=0,255&method=linear")
+            .tile(coord(), &mosaic_style(PixelSelection::Mean, &TileStyle::from_raster_query("version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&rescale=0,255&rescale=0,255&rescale=0,255&method=linear&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D")
                 .unwrap()))
             .await
             .unwrap()
@@ -667,7 +675,7 @@ fn cancelled_decode_keeps_admission_until_job_exits() {
                 tiler
                     .tile_with_options(
                         coord(),
-                        &TileStyle::from_raster_query("version=2.0&type=gray&tilesize=64&bidx=1")
+                        &TileStyle::from_raster_query("version=3.0&type=gray&bidx=1&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D")
                             .unwrap(),
                         &options,
                     )
@@ -731,7 +739,7 @@ fn composite_get_masks_infinite_nodata() {
         assert_eq!(
             alphas(
                 &img,
-                "version=2.0&type=pseudocolor&bidx=1&colormap_name=viridis"
+                "version=3.0&type=pseudocolor&bidx=1&colormap_name=viridis"
             ),
             vec![0]
         );
@@ -816,7 +824,7 @@ async fn incompatible_statistics_scope_errors_even_outside_coverage() {
         .await
         .unwrap();
     let reader = Arc::new(CogReader::open_object_store(store, "scope").await.unwrap());
-    let style = TileStyle::from_json(r#"{"version":"2.0","renderer":{"type":"gray","bidx":[1]},"stretch":{"method":"minmax"},"statistics":{"scope":"mosaic","accuracy":"exact"}}"#).unwrap();
+    let style = TileStyle::from_json(r#"{"version":"3.0","renderer":{"type":"gray","bidx":[1]},"stretch":{"method":"minmax"},"statistics":{"scope":"mosaic","accuracy":"exact"}}"#).unwrap();
     let outside = TileCoord { x: 1, ..coord() };
     let error = Tiler::new(reader).tile(outside, &style).await.unwrap_err();
     assert!(
@@ -844,7 +852,7 @@ async fn statistical_stretch_is_shared_across_dataset_tiles() {
         "histogram_equalization",
     ] {
         let style = TileStyle::from_raster_query(&format!(
-            "version=2.0&type=gray&bidx=2&method={method}&tilesize=64"
+            "version=3.0&type=gray&bidx=2&method={method}&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D"
         ))
         .unwrap();
         for coord in [
@@ -893,7 +901,7 @@ async fn statistics_respects_tiler_work_budget() {
     let tile_budget = WorkBudget::new(32 * 1024 * 1024);
     let tiler = Tiler::new(reader).with_work_budget(tile_budget.clone());
     let style =
-        TileStyle::from_raster_query("version=2.0&type=gray&bidx=2&method=minmax&tilesize=64")
+        TileStyle::from_raster_query("version=3.0&type=gray&bidx=2&method=minmax&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D")
             .unwrap();
     let result = tiler.tile(coord(), &style).await;
     assert!(
@@ -906,7 +914,7 @@ async fn statistics_respects_tiler_work_budget() {
 async fn statistics_cache_isolates_private_readers() {
     use async_tiff::reader::ObjectReader;
     let style =
-        TileStyle::from_raster_query("version=2.0&type=gray&bidx=2&method=minmax&tilesize=64")
+        TileStyle::from_raster_query("version=3.0&type=gray&bidx=2&method=minmax&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%7D")
             .unwrap();
     let mut outputs = Vec::new();
     for value in [20, 100] {
@@ -957,10 +965,10 @@ async fn sample_size_integer_valued_float_is_not_ignored() {
     );
     let tiler = Tiler::new(reader);
     let mut outputs = Vec::new();
-    for sample in ["1", "1.0", "q2"] {
-        let query_input = sample == "q2";
+    for sample in ["1", "1.0", "q3"] {
+        let query_input = sample == "q3";
         let sample = if query_input { "1" } else { sample };
-        let style=TileStyle::from_json(&format!(r#"{{"version":"2.0","renderer":{{"type":"gray","bidx":[2]}},"stretch":{{"method":"minmax"}},"statistics":{{"scope":"dataset","accuracy":"sample","sample_size":{sample}}},"image":{{"tilesize":64}}}}"#)).unwrap();
+        let style=TileStyle::from_json(&format!(r#"{{"version":"3.0","extensions":["https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json"],"renderer":{{"type":"gray","bidx":[2]}},"stretch":{{"method":"minmax"}},"statistics":{{"scope":"dataset","accuracy":"sample","sample_size":{sample}}},"raster:tile":{{"tilesize":64}}}}"#)).unwrap();
         let style = if query_input {
             let sdk =
                 async_geotiff::style::RasterStyle::from_json(style.raster_style_json()).unwrap();
@@ -1010,7 +1018,7 @@ async fn statistical_mosaic_preserves_index_coverage() {
         y: 1,
     };
     for method in ["none", "minmax"] {
-        let style=TileStyle::from_raster_query(&format!("version=2.0&type=gray&bidx=2&method={method}&pixel_selection=first&stage=before_channels&tilesize=64")).unwrap();
+        let style=TileStyle::from_raster_query(&format!("version=3.0&type=gray&bidx=2&method={method}&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22first%22%2C%22stage%22%3A%22before_channels%22%7D%7D")).unwrap();
         let output = tiler.tile(coord, &style).await.unwrap();
         assert!(
             output.is_none(),
@@ -1031,7 +1039,7 @@ async fn statistical_mosaic_rejects_partitioned_collection() {
         )
         .await
         .unwrap();
-    let style = TileStyle::from_raster_query("version=2.0&type=gray&bidx=2&method=minmax&pixel_selection=first&stage=before_channels&tilesize=64").unwrap();
+    let style = TileStyle::from_raster_query("version=3.0&type=gray&bidx=2&method=minmax&extensions=%5B%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Ftile%2Fv1.0.0%2Fschema.json%22%2C%22https%3A%2F%2Fmapseekai.github.io%2Fraster-style%2Fextensions%2Fraster%2Fmosaic%2Fv1.0.0%2Fschema.json%22%5D&extension_fields=%7B%22raster%3Atile%22%3A%7B%22tilesize%22%3A64%7D%2C%22raster%3Amosaic%22%3A%7B%22pixel_selection%22%3A%22first%22%2C%22stage%22%3A%22before_channels%22%7D%7D").unwrap();
     let coord = TileCoord {
         tms: TileMatrixSet::WebMercatorQuad,
         z: 1,

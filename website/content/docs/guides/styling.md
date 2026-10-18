@@ -1,10 +1,10 @@
 ---
 title: Styling and band math
-description: Configure raster styles with Raster Style 2.0 JSON and Q2 inputs.
+description: Configure raster styles with Raster Style 3.0 JSON and Q3 inputs.
 weight: 10
 ---
 
-Inputs use SDK `raster-style = "=0.3.0"`, protocol `2.0`, and Rust 1.92.
+Inputs use SDK `raster-style = "=0.4.0"`, protocol `3.0`, and Rust 1.92.
 The SDK validates structure and semantics; the adapter rejects unsupported
 capabilities. Unknown fields and duplicate singleton parameters are errors.
 The subset below targets `Tiler::tile` and `MosaicTiler::tile`, not full backend certification.
@@ -15,38 +15,45 @@ The subset below targets `Tiler::tile` and `MosaicTiler::tile`, not full backend
 use async_geotiff::style::TileStyle;
 
 let style = TileStyle::from_json(r#"{
-  "version": "2.0",
+  "version": "3.0",
+  "extensions": ["https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json"],
   "renderer": {"type": "pseudocolor", "bidx": [1], "colormap_name": "viridis"},
   "stretch": {"method": "linear", "rescale": [[0, 3000]]},
-  "image": {"format": "png", "tilesize": 256}
+  "raster:tile": {"format": "png", "tilesize": 256}
 }"#)?;
 ```
 
-Use `TileStyle::from_raster_query` for an original Q2 string, or
+Use `TileStyle::from_raster_query` for an original Q3 string, or
 `TileStyle::from_raster_style(&RasterStyle)` for an SDK-validated document.
 `RasterStyle` is re-exported from `async_geotiff::style`.
 `style.raster_style_json()` returns normalized JSON. Reparse the document to
 change a style. The parsed style is immutable; format() and tilesize() expose read-only output settings.
 
-## HTTP Q2
+Tile and Mosaic are versioned extensions: list their exact Schema URLs in
+`extensions`, and place settings in `raster:tile` / `raster:mosaic`.
+Q3 carries the URL array in `extensions` and the fields object in `extension_fields`.
+Use `raster_style::encode_query` to encode a validated SDK document.
+Incomplete validation and third-party extension declarations are rejected before execution.
+
+## HTTP Q3
 
 Single-band pseudocolor:
 
 ```text
-/tiles/WebMercatorQuad/0/0/0.png?version=2.0&type=pseudocolor&bidx=1&method=linear&rescale=0,3000&colormap_name=viridis
+/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=pseudocolor&bidx=1&method=linear&rescale=0,3000&colormap_name=viridis
 ```
 
 RGB with one range broadcast to all three outputs:
 
 ```text
-version=2.0&type=rgb&bidx=1&bidx=2&bidx=3&method=linear&rescale=0,3000
+version=3.0&type=rgb&bidx=1&bidx=2&bidx=3&method=linear&rescale=0,3000
 ```
 
 `dataset`, `mode`, and `_v` belong to the example server, not the style document.
 TMS and tile coordinates remain in the path. The SDK decodes raw query fragments
-once: encode `+` as `%2B` and spaces as `%20`. Never pre-decode Q2.
-JSON is a Rust API entrypoint; the example HTTP service uses Q2 GET requests.
-PNG is the default. WebP requires the `webp` feature, `format=webp&lossless=true`,
+once: encode `+` as `%2B` and spaces as `%20`. Never pre-decode Q3.
+JSON is a Rust API entrypoint; the example HTTP service uses Q3 GET requests.
+PNG is the default. WebP requires the `webp` feature, a declared Tile 1.0.0 extension with `raster:tile: {format: "webp", lossless: true}`,
 and a `.webp` path. The path extension must match the style format.
 
 ## Stretch and color {#stretch}
@@ -85,7 +92,7 @@ method=curve&curves=[[[0,0],[128,0.5],[255,1]]]
 Percentiles use linear interpolation of sorted samples; standard deviation is
 population deviation. Histogram equalization uses the empirical CDF, without bins.
 Curve points are `[data value, normalized output]`; provide one broadcast curve
-or three RGB curves. Percent-encode the JSON in an actual Q2 URL.
+or three RGB curves. Percent-encode the JSON in an actual Q3 URL.
 
 `Tiler` and `MosaicTiler` bind a fixed **1024 × 1024 EPSG:4326 grid** over the
 complete source footprint or union of the fixed mosaic collection. The grid has
@@ -120,7 +127,7 @@ Decimal literals, parentheses, unary minus, and arithmetic `+ - * /` are support
 Band numbers are one-based; RGB expressions separate three outputs with `;`.
 
 ```text
-version=2.0&type=gray&expression=(b5-b4)%2F(b5%2Bb4)&method=linear&rescale=-1,1
+version=3.0&type=gray&expression=(b5-b4)%2F(b5%2Bb4)&method=linear&rescale=-1,1
 ```
 
 This NDVI example requires band 5 to be near-infrared and band 4 red; check the
@@ -131,25 +138,25 @@ are unsupported. Both the SDK and existing arithmetic parser bound input size.
 
 ## Color formulas {#color-formulas}
 
-`effects.color_formula` supports Gamma, evaluated in array order. Q2 example:
+`effects.color_formula` supports Gamma, evaluated in array order. Q3 example:
 
 ```text
-version=2.0&type=gray&bidx=1&color_formula=gamma%20rgb%202
+version=3.0&type=gray&bidx=1&color_formula=gamma%20rgb%202
 ```
 
 Unsupported requests fail explicitly: external statistics snapshots, calibration
 other than none, index, color_mapping, source palettes, mode resampling, terrain,
-extensions, other color operations, JPEG, and lossy WebP.
+third-party extensions, other color operations, JPEG, and lossy WebP.
 
 ## Mosaic
 
 With the default `mosaic` feature enabled, declare this JSON member:
 
 ```json
-"mosaic": {"pixel_selection": "highest", "stage": "after_channels", "rank_channel": 1}
+"raster:mosaic": {"pixel_selection": "highest", "stage": "after_channels", "rank_channel": 1}
 ```
 
-Q2 uses `pixel_selection=highest&stage=after_channels&rank_channel=1`.
+Declare the official Mosaic 1.0.0 schema URL in `extensions`. Q3 encodes the declaration array in `extensions` and the object containing `raster:mosaic` in `extension_fields`. The old mosaic short parameters are rejected.
 All five methods (first, highest, lowest, mean, median) support before_channels
 and after_channels. Call `mosaic.tile(coord, &style).await?` to take the
 selection from the document. `tile_with_options(coord, &style, &options)` adds request cancellation and deadlines.
@@ -170,13 +177,13 @@ Removed: `from_query` / `from_pairs`, `ValidatedTileStyle`, `compile_validated`,
 mutable style fields, `Stretch` / `ColourDefinition` / `Colour` / `lut_from_stops`, and the separate mosaic
 selection argument. Use `from_json` / `from_raster_query` / `from_raster_style`.
 `TileStyle::default()` is a protocol gray-band-1 style with fixed 0–255 mapping.
-HTTP requires `version=2.0&type=...`; old parameters and unknown fields fail.
-All viewers emit Q2 only. Opacity is applied once by the server; MapLibre offers
+HTTP requires `version=3.0&type=...`; old parameters and unknown fields fail.
+All viewers emit Q3 only. Opacity is applied once by the server; MapLibre offers
 mosaic stage and rank-channel controls.
 
 | Legacy input | Raster Style input |
 | --- | --- |
-| `bidx=1&colormap_name=viridis&rescale=0,3000` | Add `version=2.0&type=pseudocolor&method=linear` |
+| `bidx=1&colormap_name=viridis&rescale=0,3000` | Add `version=3.0&type=pseudocolor&method=linear` |
 | Three identical RGB ranges | One broadcast range; explicitly set `type=rgb` and three `bidx` values |
 | Omitted stretch auto-selects stddev for non-U8 | Fixed `[0,255]`; explicitly supply a range when needed |
 | Continuous stops in `colormap` | Do not reuse: native arrays are interval tables; continuous color_mapping is not yet implemented |

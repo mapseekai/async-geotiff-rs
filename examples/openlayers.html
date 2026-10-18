@@ -78,6 +78,7 @@
     </style>
   </head>
   <body>
+    <div id="style-error" role="alert" hidden style="position:fixed;top:50%;left:1rem;right:1rem;z-index:1000;padding:1rem;background:#fff;color:#991b1b"></div>
     <div id="map"></div>
     <form class="toolbar" id="style-form">
       <div class="field wide">
@@ -194,7 +195,7 @@
     <script src="https://cdn.jsdelivr.net/npm/ol@9.2.4/dist/ol.js"></script>
     <script>
       const ORIGIN = window.location.origin;
-      // Path extension and Raster Style image.format must agree.
+      // Path extension and Raster Style raster:tile.format must agree.
       const TILE_BASE = "/tiles/WebMercatorQuad/{z}/{x}/{y}";
       let styleVersion = 0;
       let rasterReady = false;
@@ -217,9 +218,27 @@
       };
 
       const pageParams = new URLSearchParams(window.location.search);
+      function parseExtensionFields() {
+        try {
+          const fields = JSON.parse(pageParams.get("extension_fields") ?? "{}");
+          const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+          if (!isObject(fields)) throw new Error("expected an object");
+          for (const key of ["raster:tile", "raster:mosaic"]) {
+            if (key in fields && !isObject(fields[key])) throw new Error(`${key} must be an object`);
+          }
+          return fields;
+        } catch (error) {
+          const alert = document.getElementById("style-error");
+          alert.textContent = `Invalid extension_fields: ${error.message}`;
+          alert.hidden = false;
+          throw error;
+        }
+      }
+      const extensionFields = parseExtensionFields();
+      const tileOptions = extensionFields["raster:tile"] ?? {};
       let automaticStretch = !pageParams.has("method");
       const requestedDataset = pageParams.get("dataset");
-      const requestedFormat = pageParams.get("format") ?? "png";
+      const requestedFormat = tileOptions.format ?? "png";
       let rgbPresetPending = pageParams.getAll("bidx").join(",").replace(/\s/g, "") === "1,2,3";
 
       function isExpressionMode() {
@@ -254,7 +273,7 @@
       }
         c.opacity.value = pageParams.get("opacity") ?? "1";
         for (const control of [c.resampling, c.tilesize]) {
-          const value = pageParams.get(control.name);
+          const value = control === c.tilesize ? (tileOptions.tilesize === undefined ? null : String(tileOptions.tilesize)) : pageParams.get(control.name);
           if (value !== null && [...control.options].some((option) => option.value === value)) {
             control.value = value;
           }
@@ -287,7 +306,7 @@
       }
       let datasetBands = 1;
       function protocolParams(params) {
-        params.set("version", "2.0");
+        params.set("version", "3.0");
         const expression = params.get("expression");
         if (!expression && !params.has("bidx")) {
           const bands = c.colormap.value || datasetBands < 3 ? [1] : [1,2,3];
@@ -301,8 +320,15 @@
         if (count === 1 && params.getAll("rescale").length > 1) {
           const first = params.get("rescale"); params.delete("rescale"); params.append("rescale", first);
         }
-        params.set("format", c.format.value || "png");
-        if (c.format.value === "webp") params.set("lossless", "true");
+        const tile = {format: c.format.value || "png"};
+        if (tile.format === "webp") tile.lossless = true;
+        tile.tilesize = Number(c.tilesize.value || "256");
+        const fields = {};
+        const declarations = [];
+        fields["raster:tile"] = tile;
+        declarations.push("https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json");
+        params.set("extensions", JSON.stringify(declarations));
+        params.set("extension_fields", JSON.stringify(fields));
         params.sort();
         return params;
       }
@@ -322,7 +348,6 @@
         if (c.colormap.value) p.set("colormap_name", c.colormap.value);
         p.set("resampling", c.resampling.value);
         p.set("reproject", c.resampling.value);
-        p.set("tilesize", c.tilesize.value || "256");
         p.set("_v", String(styleVersion));
         // Match the path extension to the Raster Style format parameter.
         const ext = (c.format.value || "png");
