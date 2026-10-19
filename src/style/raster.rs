@@ -735,7 +735,6 @@ mod tests {
         bounds::{Bbox, GeoTransform},
         crs::Crs,
     };
-    use serde_json::Value;
 
     #[test]
     fn public_render_checks_shapes_and_preserves_strided_masks() {
@@ -1301,7 +1300,7 @@ mod tests {
             crs::Crs,
             mosaic::selection::Reducer,
         };
-        use serde_json::json;
+        use serde_json::{json, Value};
 
         fn render_sources(style: Value, sources: &[&[f64]]) -> Vec<u8> {
             let style = TileStyle::from_json(&style.to_string()).unwrap();
