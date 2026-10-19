@@ -134,8 +134,9 @@ loopback, link-local, and cloud-metadata destinations. Use
 and also blocks private address ranges. `permissive()` should be reserved for
 operator-controlled asset lists.
 
-The example server uses the default policy and does not expose an environment
-override. A service that accepts untrusted mosaic or STAC documents should
+The example server explicitly allows its own HTTP hostname so configured mosaics
+can read its `/data` assets. Other hosts use the default policy; there is no
+environment override. A service that accepts untrusted mosaic or STAC documents should
 construct `MosaicTiler` itself and pass `strict()` through the builder as shown
 above.
 

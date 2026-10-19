@@ -1,0 +1,22 @@
+{
+  "base_commit": "a820f1268f8d58e96fca893353d23334faf3ce02",
+  "performance_source_manifest": "source-manifest.json",
+  "performance_patch": "procedure/performance-source.patch",
+  "final_patch": "procedure/final-source.patch",
+  "final_patch_sha256": "5f772297fa134679bd64ab60ada73033d57a9d3e45910e390ce872e98f15314b",
+  "final_binary_sha256": "7c7dccdcacf58135ac6488b2d6e96710974b64f272e130fc6e032cfe10b6edbc",
+  "measured_binary_sha256": "67ae12b3adfca8c22a5a178569d3eb460bdf2ae54db33ee1a4365035c4813785",
+  "source_files_sha256": {
+    "examples/serve.rs": "2b82aaca54a8764784cce810895de42582277165407607d788becab76642075c",
+    "examples/leaflet.html": "c6a93a5a48ae08c5ef8910b66f9357ceb0a9da41b8fef408428524b3a609c39f",
+    "examples/openlayers.html": "1188bf2ed90ac7294b6f0ddfe03df077ec937af4bd42eac79c2d3df7066e072e",
+    "examples/maplibre.html": "4d81da298a669db247b6b0efce9b1d5d7cea5bff3a7d93d80118e9d75c40152f",
+    "tests/viewer_bootstrap.cjs": "d93f8c42110b02c680079dbfa07c636e2c92a6f2b1321752e23bc17800c5dbb3",
+    "website/content/docs/guides/mosaics.md": "16b4e8ce9ee242aebccc3b23b00bd8b3b0dcd3e4e96aef3f2fde3810b423792f",
+    "website/content/docs/guides/mosaics.zh.md": "943ece8d0b1d5aa8c56ab0ca0d71281df64d612e347f45b66aa34d57a6d01cd8"
+  },
+  "rust_serve_matches_measured_source": true,
+  "library_and_cargo_files_unchanged_since_upgraded_commit": true,
+  "only_html_css_changed_after_full_performance_run": true,
+  "post_layout_parity": "post-layout-parity.json"
+}

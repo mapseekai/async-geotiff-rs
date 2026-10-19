@@ -1,0 +1,130 @@
+{
+  "dataset": 1,
+  "scenario": "burst32_4096",
+  "blocks": [
+    {
+      "block": 0,
+      "order": [
+        "current",
+        "baseline",
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "wall_ms": 3583.319395314902,
+        "server_cpu_seconds": 10.95,
+        "client_cpu_seconds": 0.892923
+      },
+      "current": {
+        "wall_ms": 3759.553520474583,
+        "server_cpu_seconds": 11.215,
+        "client_cpu_seconds": 0.8916895000000001
+      }
+    },
+    {
+      "block": 1,
+      "order": [
+        "baseline",
+        "current",
+        "current",
+        "baseline"
+      ],
+      "baseline": {
+        "wall_ms": 3647.7752700448036,
+        "server_cpu_seconds": 10.920000000000002,
+        "client_cpu_seconds": 0.8616870000000012
+      },
+      "current": {
+        "wall_ms": 3670.9474991075695,
+        "server_cpu_seconds": 11.014999999999999,
+        "client_cpu_seconds": 0.914959500000001
+      }
+    },
+    {
+      "block": 2,
+      "order": [
+        "current",
+        "baseline",
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "wall_ms": 3786.608625203371,
+        "server_cpu_seconds": 10.940000000000001,
+        "client_cpu_seconds": 0.8983629999999998
+      },
+      "current": {
+        "wall_ms": 3693.8651045784354,
+        "server_cpu_seconds": 11.129999999999999,
+        "client_cpu_seconds": 0.9088115000000005
+      }
+    },
+    {
+      "block": 3,
+      "order": [
+        "baseline",
+        "current",
+        "current",
+        "baseline"
+      ],
+      "baseline": {
+        "wall_ms": 3693.649020511657,
+        "server_cpu_seconds": 11.0,
+        "client_cpu_seconds": 0.9015085000000003
+      },
+      "current": {
+        "wall_ms": 3744.7924995794892,
+        "server_cpu_seconds": 10.965,
+        "client_cpu_seconds": 0.9087945000000017
+      }
+    },
+    {
+      "block": 4,
+      "order": [
+        "baseline",
+        "current",
+        "current",
+        "baseline"
+      ],
+      "baseline": {
+        "wall_ms": 3679.655584041029,
+        "server_cpu_seconds": 11.330000000000002,
+        "client_cpu_seconds": 0.8580909999999999
+      },
+      "current": {
+        "wall_ms": 3738.1189996376634,
+        "server_cpu_seconds": 11.215,
+        "client_cpu_seconds": 0.9028805000000002
+      }
+    },
+    {
+      "block": 5,
+      "order": [
+        "current",
+        "baseline",
+        "baseline",
+        "current"
+      ],
+      "baseline": {
+        "wall_ms": 3566.7675212025642,
+        "server_cpu_seconds": 11.55,
+        "client_cpu_seconds": 0.8499194999999986
+      },
+      "current": {
+        "wall_ms": 3528.4307091496885,
+        "server_cpu_seconds": 11.625,
+        "client_cpu_seconds": 0.8750025000000008
+      }
+    }
+  ],
+  "paired_change_percent": 1.009937833892871,
+  "paired_bootstrap_95_percent": [
+    -1.7620418652993353,
+    3.2535046173347126
+  ],
+  "requests": 98304,
+  "baseline_mean_server_cpu": 11.115,
+  "current_mean_server_cpu": 11.194166666666666,
+  "baseline_mean_client_cpu": 0.8770819999999999,
+  "current_mean_client_cpu": 0.9003563333333341
+}

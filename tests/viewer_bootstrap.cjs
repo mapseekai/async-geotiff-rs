@@ -113,6 +113,20 @@ async function check(viewer, method = null, defaultStretch = "none", invalidFiel
   const bounds = vm.runInContext("flyToDataset()", context);
   reply("/bounds", [0,0,1,1], "1"); await bounds;
   assert.equal(new URL(vm.runInContext("tileUrl()", context)).searchParams.get("method"), "none");
+  if (viewer === "leaflet") {
+    const fits = [];
+    maps[0].fitBounds = value => fits.push(value);
+    for (const fn of maps[0].events.zoomstart) fn();
+    const previous = vm.runInContext("flyToDataset()", context);
+    reply("/bounds", [0,0,1,1], "1"); await flush();
+    assert.equal(fits.length, 0, "Leaflet must wait for the active zoom");
+    elements.get("dataset").value = "latest.tif";
+    const latest = vm.runInContext("flyToDataset()", context);
+    reply("/bounds", [20,30,21,31], "1"); await flush();
+    for (const fn of maps[0].events.zoomend) fn();
+    await Promise.all([previous, latest]);
+    assert.equal(JSON.stringify(fits), "[[[30,20],[31,21]]]", "only the latest dataset may reposition the map");
+  }
   vm.runInContext(`${fields}.expression.value = "b1+b1;b1;b1"; ${fields}.stretch.value = "linear"; ${fields}.rescale.value = "0,100;0,200;0,300"`, context);
   let generated = vm.runInContext("tileUrl()", context);
   let params = new URL(generated).searchParams;

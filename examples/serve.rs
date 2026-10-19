@@ -18,7 +18,7 @@ use async_geotiff::crs::Crs;
 use async_geotiff::io::{BlockCache, CacheConfig, CogReader, ReaderConfig};
 #[cfg(feature = "stac")]
 use async_geotiff::mosaic::StacSource;
-use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler};
+use async_geotiff::mosaic::{HttpAccessPolicy, MosaicJsonSource, MosaicTiler};
 use async_geotiff::tiler::{Tiler, TilerConfig};
 use async_geotiff::warp::Projector;
 use axum::{response::Html, routing::get};
@@ -298,6 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // whole server (single datasets + mosaic) runs under a single budget.
         let mosaic = MosaicTiler::builder(source)
             .block_cache(Arc::clone(&block_cache))
+            .http_policy(demo_http_policy(&http_base))
             .build();
         state = state.with_mosaic(Arc::new(mosaic));
         mosaic_loaded = true;
@@ -313,6 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let source = StacSource::new(&stac.api_url, vec![stac.collection], stac.asset_key)?;
         let mosaic = MosaicTiler::builder(source)
             .block_cache(Arc::clone(&block_cache))
+            .http_policy(demo_http_policy(&http_base))
             .build();
         state = state.with_stac_mosaic(Arc::new(mosaic));
         mosaic_loaded = true;
@@ -450,6 +452,12 @@ fn default_view(reader: &CogReader) -> Result<DefaultView, Box<dyn std::error::E
     })
 }
 
+fn demo_http_policy(http_base: &str) -> HttpAccessPolicy {
+    // The operator-configured example may read its own /data assets.
+    let origin = url::Url::parse(http_base).expect("local_http_base produces a valid URL");
+    HttpAccessPolicy::default().allow_host(origin.host_str().expect("local HTTP origin has a host"))
+}
+
 fn bind_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
     Ok(std::env::var("ASYNC_GEOTIFF_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -460,7 +468,7 @@ fn bind_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     #[cfg(feature = "stac")]
-    use async_geotiff::mosaic::{HttpAccessPolicy, MosaicSource, StacSource};
+    use async_geotiff::mosaic::{MosaicSource, StacSource};
     #[cfg(feature = "stac")]
     use async_geotiff::tms::{TileCoord, TileMatrixSet};
     #[cfg(feature = "stac")]
@@ -689,7 +697,7 @@ mod tests {
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].url, fixture.asset_url);
         let mosaic = MosaicTiler::builder(source)
-            .http_policy(HttpAccessPolicy::permissive())
+            .http_policy(demo_http_policy(&data_base))
             .build();
         let demo_state = server::AppState::new(
             None,

@@ -1,0 +1,420 @@
+{
+  "summary": {
+    "changed_count": 36,
+    "affected_count": 13,
+    "changed_files": 30,
+    "risk_level": "high"
+  },
+  "changed_symbols": [
+    {
+      "id": "Section:AGENTS.md:L48:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L54:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L64:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L71:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L80:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L2:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L8:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L18:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L25:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L34:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L1:async-geotiff-rs 与 TiTiler 大型 COG 性能对比",
+      "name": "async-geotiff-rs 与 TiTiler 大型 COG 性能对比",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L7:1. 测试环境",
+      "name": "1. 测试环境",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L48:3. 测试口径",
+      "name": "3. 测试口径",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L62:4. 单瓦片请求结果",
+      "name": "4. 单瓦片请求结果",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L72:5. 浏览器视口加载结果",
+      "name": "5. 浏览器视口加载结果",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L74:5.1 概览级别",
+      "name": "5.1 概览级别",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L84:5.2 详细级别",
+      "name": "5.2 详细级别",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L96:6. 32 并发批次结果",
+      "name": "6. 32 并发批次结果",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L108:7. 成功率与图像校验",
+      "name": "7. 成功率与图像校验",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L143:9. 结果范围",
+      "name": "9. 结果范围",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L153:10. Raster Style 是否实质改变对比",
+      "name": "10. Raster Style 是否实质改变对比",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/performance-comparison-titiler.md:L191:附录：请求参数与原始结果",
+      "name": "附录：请求参数与原始结果",
+      "type": "Section",
+      "filePath": "docs/performance-comparison-titiler.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/raster-style-v3-acceptance.md:L1:Raster Style 0.4.0 / Q3 浏览器验收与性能回归检查",
+      "name": "Raster Style 0.4.0 / Q3 浏览器验收与性能回归检查",
+      "type": "Section",
+      "filePath": "docs/raster-style-v3-acceptance.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/raster-style-v3-acceptance.md:L7:对照与运行条件",
+      "name": "对照与运行条件",
+      "type": "Section",
+      "filePath": "docs/raster-style-v3-acceptance.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/raster-style-v3-acceptance.md:L24:真实浏览器",
+      "name": "真实浏览器",
+      "type": "Section",
+      "filePath": "docs/raster-style-v3-acceptance.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/raster-style-v3-acceptance.md:L42:配对负载与结果",
+      "name": "配对负载与结果",
+      "type": "Section",
+      "filePath": "docs/raster-style-v3-acceptance.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/raster-style-v3-acceptance.md:L74:局部偏慢信号与复核",
+      "name": "局部偏慢信号与复核",
+      "type": "Section",
+      "filePath": "docs/raster-style-v3-acceptance.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/raster-style-v3-acceptance.md:L97:资源回归与最终检查",
+      "name": "资源回归与最终检查",
+      "type": "Section",
+      "filePath": "docs/raster-style-v3-acceptance.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:docs/raster-style-v3-acceptance.md:L110:证据与复现",
+      "name": "证据与复现",
+      "type": "Section",
+      "filePath": "docs/raster-style-v3-acceptance.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:examples/serve.rs:main",
+      "name": "main",
+      "type": "Function",
+      "filePath": "examples/serve.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:examples/serve.rs:demo_http_policy",
+      "name": "demo_http_policy",
+      "type": "Function",
+      "filePath": "examples/serve.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:examples/serve.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "examples/serve.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:examples/serve.rs:tests.stac_demo_queries_a_local_asset_and_renders_a_tile",
+      "name": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+      "type": "Function",
+      "filePath": "examples/serve.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:tests/viewer_bootstrap.cjs:check",
+      "name": "check",
+      "type": "Function",
+      "filePath": "tests/viewer_bootstrap.cjs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:website/content/docs/guides/mosaics.md:L129:HTTP asset policy {#http-policy}",
+      "name": "HTTP asset policy {#http-policy}",
+      "type": "Section",
+      "filePath": "website/content/docs/guides/mosaics.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:website/content/docs/guides/mosaics.zh.md:L118:HTTP 资产策略 {#http-policy}",
+      "name": "HTTP 资产策略 {#http-policy}",
+      "type": "Section",
+      "filePath": "website/content/docs/guides/mosaics.zh.md",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": [
+    {
+      "id": "proc_22_stac_demo_queries_a_",
+      "name": "Stac_demo_queries_a_local_asset_and_renders_a_tile → AssetRef",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_29_main",
+      "name": "Main → Required",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "main",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_37_main",
+      "name": "Main → Env_filter",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "main",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_38_main",
+      "name": "Main → Tokio_console_enabled",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "main",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_61_stac_demo_queries_a_",
+      "name": "Stac_demo_queries_a_local_asset_and_renders_a_tile → Query",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_75_stac_demo_queries_a_",
+      "name": "Stac_demo_queries_a_local_asset_and_renders_a_tile → CogReaderBuilder",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_96_stac_demo_queries_a_",
+      "name": "Stac_demo_queries_a_local_asset_and_renders_a_tile → Needs_statistics",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_138_stac_demo_queries_a_",
+      "name": "Stac_demo_queries_a_local_asset_and_renders_a_tile → Current",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_142_main",
+      "name": "Main → Default_blocking_permits",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "main",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_160_main",
+      "name": "Main → CogReaderBuilder",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "main",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_166_stac_demo_queries_a_",
+      "name": "Stac_demo_queries_a_local_asset_and_renders_a_tile → Lease",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_195_stac_demo_queries_a_",
+      "name": "Stac_demo_queries_a_local_asset_and_renders_a_tile → Is_cancelled",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_199_stac_demo_queries_a_",
+      "name": "Stac_demo_queries_a_local_asset_and_renders_a_tile → State",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "stac_demo_queries_a_local_asset_and_renders_a_tile",
+          "step": 1
+        }
+      ]
+    }
+  ]
+}

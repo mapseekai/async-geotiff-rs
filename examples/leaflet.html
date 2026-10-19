@@ -41,6 +41,8 @@
         display: flex;
         flex-direction: column;
         gap: 3px;
+        min-width: 0;
+        max-width: 100%;
       }
       .field label {
         font-weight: 600;
@@ -53,6 +55,8 @@
       }
       input,
       select {
+        box-sizing: border-box;
+        max-width: 100%;
         padding: 5px 6px;
         border: 1px solid #ccc;
         border-radius: 5px;
@@ -355,6 +359,9 @@
       }
 
       const map = L.map("map", { center: [0, 0], zoom: 2 });
+      let zooming = false;
+      map.on("zoomstart", () => { zooming = true; });
+      map.on("zoomend", () => { zooming = false; });
       let baseLayer = null;
       function applyBasemap() {
         if (baseLayer) {
@@ -393,6 +400,9 @@
             `${ORIGIN}/bounds${ds ? `?dataset=${encodeURIComponent(ds)}` : ""}`,
           );
           if (!r.ok) return;
+          const b = await r.json();
+          // Leaflet ignores fitBounds while a previous zoom is animating.
+          if (zooming) await new Promise((resolve) => map.once("zoomend", resolve));
           if (c.dataset.value !== ds) return;
           const defaultStretch = r.headers.get("x-raster-default-stretch");
           if (automaticStretch && ["none", "minmax"].includes(defaultStretch)) {
@@ -410,7 +420,6 @@
             }
             rgbPresetPending = false;
           }
-          const b = await r.json();
           if (Array.isArray(b) && b.length === 4 && b.every(Number.isFinite)) {
             rasterReady = true;
             map.fitBounds(

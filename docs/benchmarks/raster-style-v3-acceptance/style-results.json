@@ -1,0 +1,110 @@
+[
+  {
+    "dataset": 0,
+    "profile": "minmax",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 13.32804188132286,
+    "current_ms": 13.9701459556818,
+    "paired_change_percent": 2.3664449041204794
+  },
+  {
+    "dataset": 0,
+    "profile": "percentile",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 11.712833307683468,
+    "current_ms": 11.2337083555758,
+    "paired_change_percent": -6.951254891939329
+  },
+  {
+    "dataset": 0,
+    "profile": "stddev",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 10.446416679769754,
+    "current_ms": 10.720666963607073,
+    "paired_change_percent": 2.8069391179648573
+  },
+  {
+    "dataset": 0,
+    "profile": "histogram_equalization",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 34.743187483400106,
+    "current_ms": 34.057228825986385,
+    "paired_change_percent": 4.487154785596337
+  },
+  {
+    "dataset": 0,
+    "profile": "expression-plus",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 16.43381267786026,
+    "current_ms": 16.71681273728609,
+    "paired_change_percent": -1.6095194157029091
+  },
+  {
+    "dataset": 0,
+    "profile": "webp-512",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 30.048062093555927,
+    "current_ms": 27.685916982591152,
+    "paired_change_percent": -4.405576452432447
+  },
+  {
+    "dataset": 2,
+    "profile": "minmax",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 7.08935409784317,
+    "current_ms": 7.772041950374842,
+    "paired_change_percent": 10.924992041289983
+  },
+  {
+    "dataset": 2,
+    "profile": "percentile",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 7.488583214581013,
+    "current_ms": 8.34241695702076,
+    "paired_change_percent": 3.732177903173728
+  },
+  {
+    "dataset": 2,
+    "profile": "stddev",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 6.861812900751829,
+    "current_ms": 7.0115202106535435,
+    "paired_change_percent": -1.9371430496198716
+  },
+  {
+    "dataset": 2,
+    "profile": "histogram_equalization",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 22.865333128720522,
+    "current_ms": 22.60585455223918,
+    "paired_change_percent": 0.6913155459547626
+  },
+  {
+    "dataset": 2,
+    "profile": "expression-plus",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 11.99306221678853,
+    "current_ms": 11.774749960750341,
+    "paired_change_percent": -3.4204046135802635
+  },
+  {
+    "dataset": 2,
+    "profile": "webp-512",
+    "pairs": 6,
+    "requests_per_pair_per_variant": 25,
+    "baseline_ms": 10.83933375775814,
+    "current_ms": 11.117478832602501,
+    "paired_change_percent": 1.1038177718084796
+  }
+]
