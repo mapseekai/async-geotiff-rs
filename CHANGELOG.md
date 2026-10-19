@@ -11,6 +11,8 @@ can land in any release** and are called out explicitly under a
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-19
+
 - Upgrade to Raster Style SDK 0.4.0 and core 3.0/Q3. Tile and mosaic settings
   require exact versioned extension declarations and use `raster:tile` /
   `raster:mosaic`; Q3 carries them in `extension_fields`. Reject incomplete
@@ -44,6 +46,13 @@ can land in any release** and are called out explicitly under a
 
 ### Fixed
 
+- Allow the demo's MosaicJSON and STAC sources to read assets from its own
+  configured HTTP host while preserving the default policy for other hosts.
+- Wait for an active Leaflet zoom to finish before fitting a newly selected
+  dataset. Keep controls and status panels within narrow viewports across all
+  three viewers, and reserve space for MapLibre navigation controls.
+- Scope Mosaic-only test imports to their feature so strict Clippy also passes
+  with default features disabled.
 - Recover tile/warp/mosaic requests from transient working-memory contention:
   unwind the failed attempt, queue behind active requests, and retry once with
   exclusive admission under the original deadline. Keep the 512 MiB working
@@ -486,7 +495,9 @@ can land in any release** and are called out explicitly under a
 - PNG output; example axum server with MapLibre / OpenLayers / Leaflet
   viewers and a local `data/*.tif` dataset picker.
 
-[Unreleased]: https://github.com/mapseekai/async-geotiff-rs/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/mapseekai/async-geotiff-rs/compare/v0.12.0...HEAD
+
+[0.12.0]: https://github.com/mapseekai/async-geotiff-rs/releases/tag/v0.12.0
 
 [0.11.0]: https://github.com/mapseekai/async-geotiff-rs/releases/tag/v0.11.0
 
