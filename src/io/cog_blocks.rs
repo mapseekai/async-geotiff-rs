@@ -528,7 +528,13 @@ impl CogReader {
             Err(_) => return, // slot decrements via drop
         }
         if let Some(Some(idx)) = self.mask_ifds.get(level) {
-            targets.push((BlockKind::Mask, *idx));
+            let data = &self.tiff.ifds()[targets[0].1];
+            let mask = &self.tiff.ifds()[*idx];
+            // The speculative ring is expressed in data block coordinates.
+            // Different mask grids are fetched by the foreground window path.
+            if data.tile_width() == mask.tile_width() && data.tile_height() == mask.tile_height() {
+                targets.push((BlockKind::Mask, *idx));
+            }
         }
         let tiff = Arc::clone(&self.tiff);
         let reader = self.reader.clone();

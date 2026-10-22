@@ -791,29 +791,40 @@ impl CogReader {
         }
 
         let ifd = self.data_ifd(level)?;
-        let ((tx0, tx1), (ty0, ty1)) = tile_range_for_window(ifd, col_off, row_off, width, height)
-            .ok_or_else(|| AgError::Tiff("ifd lacks tile dims".into()))?;
-        let tile_cols = (tx1 - tx0 + 1) as usize;
-        let tile_rows = (ty1 - ty0 + 1) as usize;
-        let block_count = tile_cols
-            .checked_mul(tile_rows)
-            .ok_or_else(|| AgError::Tiff("window block count overflow".into()))?;
-        if block_count > self.max_window_blocks {
-            return Err(AgError::Tiff("source window exceeds block limit".into()));
-        }
-        let mut coords = Vec::with_capacity(block_count);
-        for x in tx0..=tx1 {
-            for y in ty0..=ty1 {
-                coords.push((x as usize, y as usize));
+        let block_coords = |ifd: &ImageFileDirectory| -> AgResult<_> {
+            let ((tx0, tx1), (ty0, ty1)) =
+                tile_range_for_window(ifd, col_off, row_off, width, height)
+                    .ok_or_else(|| AgError::Tiff("ifd lacks tile dims".into()))?;
+            let block_count = ((tx1 - tx0 + 1) as usize)
+                .checked_mul((ty1 - ty0 + 1) as usize)
+                .ok_or_else(|| AgError::Tiff("window block count overflow".into()))?;
+            if block_count > self.max_window_blocks {
+                return Err(AgError::Tiff("source window exceeds block limit".into()));
             }
-        }
+            let mut coords = Vec::with_capacity(block_count);
+            for x in tx0..=tx1 {
+                for y in ty0..=ty1 {
+                    coords.push((x as usize, y as usize));
+                }
+            }
+            Ok((coords, (tx0, tx1), (ty0, ty1)))
+        };
+        let (coords, tx_range, ty_range) = block_coords(ifd)?;
         let data_info = IfdInfo::from(ifd).validate()?;
 
         let mask_ifd = self.mask_ifd(level)?;
+        // A mask shares the image extent, not necessarily the data block grid.
+        let mask_coords = mask_ifd
+            .map(|mask| block_coords(mask).map(|(coords, _, _)| coords))
+            .transpose()?;
         let mut work_bytes = block_work_bytes(ifd, &coords, self.max_window_bytes)?;
-        if let Some(mask_ifd) = mask_ifd {
+        if let Some((mask_ifd, mask_coords)) = mask_ifd.zip(mask_coords.as_deref()) {
             work_bytes = work_bytes
-                .checked_add(block_work_bytes(mask_ifd, &coords, self.max_window_bytes)?)
+                .checked_add(block_work_bytes(
+                    mask_ifd,
+                    mask_coords,
+                    self.max_window_bytes,
+                )?)
                 .ok_or_else(|| AgError::ResourceLimit("read work estimate overflow".into()))?;
         }
         let output_bytes = bytes.unwrap(); // checked against window limits above
@@ -823,23 +834,25 @@ impl CogReader {
         let work = self.work_budget.try_reserve(work_bytes)?;
         #[cfg(feature = "perf-tracing")]
         let plan_done = started.elapsed();
-        let (data_blocks, mask_blocks) = if let Some(mask_ifd) = mask_ifd {
-            let mask_info = IfdInfo::from(mask_ifd).validate()?;
-            let data_blocks = self.blocks_for(level, BlockKind::Data, ifd, &coords, &work);
-            let mask_blocks = self.blocks_for(level, BlockKind::Mask, mask_ifd, &coords, &work);
-            let (data_blocks, mask_blocks) = tokio::try_join!(data_blocks, mask_blocks)?;
-            (data_blocks, Some((mask_blocks, mask_info)))
-        } else {
-            (
-                self.blocks_for(level, BlockKind::Data, ifd, &coords, &work)
-                    .await?,
-                None,
-            )
-        };
+        let (data_blocks, mask_blocks) =
+            if let Some((mask_ifd, mask_coords)) = mask_ifd.zip(mask_coords) {
+                let mask_info = IfdInfo::from(mask_ifd).validate()?;
+                let data_blocks = self.blocks_for(level, BlockKind::Data, ifd, &coords, &work);
+                let mask_blocks =
+                    self.blocks_for(level, BlockKind::Mask, mask_ifd, &mask_coords, &work);
+                let (data_blocks, mask_blocks) = tokio::try_join!(data_blocks, mask_blocks)?;
+                (data_blocks, Some((mask_blocks, mask_info, mask_coords)))
+            } else {
+                (
+                    self.blocks_for(level, BlockKind::Data, ifd, &coords, &work)
+                        .await?,
+                    None,
+                )
+            };
         // Foreground blocks are resolved — speculatively warm the surrounding
         // block ring in the background. It overlaps the stitch/warp/render
         // below and turns the neighbouring XYZ tiles' cold misses into hits.
-        self.maybe_spawn_prefetch(level, (tx0, tx1), (ty0, ty1));
+        self.maybe_spawn_prefetch(level, tx_range, ty_range);
         #[cfg(feature = "perf-tracing")]
         let blocks_done = started.elapsed();
         #[cfg(feature = "perf-tracing")]
@@ -890,11 +903,17 @@ impl CogReader {
                     let stitched =
                         crate::io::window::stitch_with_info(&refs, &coords2, &info, co, ro, w, h)?;
                     let mask = match &mask_blocks {
-                        Some((mask_blocks, mask_info)) => {
+                        Some((mask_blocks, mask_info, mask_coords)) => {
                             let refs: Vec<&async_tiff::Array> =
                                 mask_blocks.iter().map(|b| b.array()).collect();
                             Some(crate::io::window::stitch_mask_with_info(
-                                &refs, &coords2, mask_info, co, ro, w, h,
+                                &refs,
+                                mask_coords,
+                                mask_info,
+                                co,
+                                ro,
+                                w,
+                                h,
                             )?)
                         }
                         None => None,

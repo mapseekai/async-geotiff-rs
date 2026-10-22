@@ -12,6 +12,14 @@ pub(crate) fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 // Adapt the checked-in tiny RGB TIFF to exactly cover WorldCRS84Quad 0/0/0.
 // Optional constant samples make expected reducer outputs independent of render helpers.
 pub(crate) fn world_fixture(shift: f64, samples: Option<[u8; 3]>) -> Vec<u8> {
+    georeferenced_fixture(4326, [-180.0 + shift, -90.0, shift, 90.0], samples)
+}
+
+pub(crate) fn georeferenced_fixture(
+    epsg: u16,
+    bounds: [f64; 4],
+    samples: Option<[u8; 3]>,
+) -> Vec<u8> {
     let mut bytes = include_bytes!("../fixtures/rgb_nodata.tif").to_vec();
     let mut ifd = 8;
     while ifd != 0 {
@@ -38,19 +46,39 @@ pub(crate) fn world_fixture(shift: f64, samples: Option<[u8; 3]>) -> Vec<u8> {
                     }
                 }
                 33550 => {
-                    for (i, v) in [180.0 / size as f64, 180.0 / size as f64, 0.0]
+                    for (i, v) in [
+                        (bounds[2] - bounds[0]) / size as f64,
+                        (bounds[3] - bounds[1]) / size as f64,
+                        0.0,
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        bytes[value + 8 * i..value + 8 * (i + 1)].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                33922 => {
+                    for (i, v) in [0.0, 0.0, 0.0, bounds[0], bounds[3], 0.0]
                         .iter()
                         .enumerate()
                     {
                         bytes[value + 8 * i..value + 8 * (i + 1)].copy_from_slice(&v.to_le_bytes());
                     }
                 }
-                33922 => {
-                    for (i, v) in [0.0, 0.0, 0.0, -180.0 + shift, 90.0, 0.0]
-                        .iter()
-                        .enumerate()
-                    {
-                        bytes[value + 8 * i..value + 8 * (i + 1)].copy_from_slice(&v.to_le_bytes());
+                34735 => {
+                    for (key, values) in [
+                        (1024u16, (1024u16, if epsg == 4326 { 2u16 } else { 1u16 })),
+                        (2048, (if epsg == 4326 { 2048 } else { 3072 }, epsg)),
+                    ] {
+                        for offset in (value + 8..value + count * 2).step_by(8) {
+                            if u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+                                == key
+                            {
+                                bytes[offset..offset + 2].copy_from_slice(&values.0.to_le_bytes());
+                                bytes[offset + 6..offset + 8]
+                                    .copy_from_slice(&values.1.to_le_bytes());
+                            }
+                        }
                     }
                 }
                 _ => {}

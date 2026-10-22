@@ -256,6 +256,7 @@ impl Resampling {
             .as_ref()
             .is_none_or(|m| mask_contig.is_none() || m.is_standard_layout()));
         let mut sum = 0.0;
+        let mut scale = 1.0;
         let mut total = 0.0;
         for r in r_lo..r_hi {
             for c in c_lo..c_hi {
@@ -275,16 +276,11 @@ impl Resampling {
                 let dy = ((sr + ry).min(r as f64 + 0.5) - (sr - ry).max(r as f64 - 0.5)).max(0.0);
                 let area = dx * dy;
                 if area > 0.0 {
-                    sum += val * area;
-                    total += area;
+                    add_weighted_sum(&mut sum, &mut total, &mut scale, val, area);
                 }
             }
         }
-        if total > 0.0 {
-            sum / total
-        } else {
-            fill
-        }
+        weighted_mean(sum, total, fill)
     }
 
     /// Area-weighted sampling of a four-corner source pixel footprint.
@@ -339,6 +335,7 @@ impl Resampling {
         let mut next = Vec::with_capacity(12);
         let mut total = 0.0;
         let mut sum = 0.0;
+        let mut scale = 1.0;
         for r in r0..r1 {
             for c in c0..c1 {
                 if valid.is_some_and(|m| !m[[r, c]]) {
@@ -392,16 +389,11 @@ impl Resampling {
                 }
                 let area = twice_area.abs() * 0.5;
                 if area > 0.0 {
-                    sum += area * view[[r, c]];
-                    total += area;
+                    add_weighted_sum(&mut sum, &mut total, &mut scale, view[[r, c]], area);
                 }
             }
         }
-        if total > 0.0 {
-            sum / total
-        } else {
-            fill
-        }
+        weighted_mean(sum, total, fill)
     }
 
     /// Majority value over the source footprint `[sc±rx, sr±ry]`. Counts each
@@ -470,6 +462,7 @@ impl Resampling {
         view: ArrayView2<f64>,
         valid: Option<ArrayView2<bool>>,
         corners: [(f64, f64); 4],
+        sample_center: (f64, f64),
         fill: f64,
     ) -> f64 {
         if corners
@@ -488,35 +481,30 @@ impl Resampling {
             .iter()
             .map(|p| p.1)
             .fold(f64::NEG_INFINITY, f64::max);
-        let (sc, sr) = ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5);
-        if corners[0].1 == corners[1].1
-            && corners[2].1 == corners[3].1
-            && corners[0].0 == corners[3].0
-            && corners[1].0 == corners[2].0
-        {
-            return self.sample_mode(
-                view,
-                valid,
-                sc,
-                sr,
-                (xmax - xmin) * 0.5,
-                (ymax - ymin) * 0.5,
-                fill,
-            );
-        }
-        if xmax - xmin < 1.0 && ymax - ymin < 1.0 {
-            return Self::Nearest.sample_masked(view, valid, sc, sr, fill);
-        }
         let (h, w) = view.dim();
         let c0 = (xmin - 1e-10).ceil().clamp(0.0, w as f64) as usize;
         let c1 = ((xmax + 1e-10).floor() + 1.0).clamp(0.0, w as f64) as usize;
         let r0 = (ymin - 1e-10).ceil().clamp(0.0, h as f64) as usize;
         let r1 = ((ymax + 1e-10).floor() + 1.0).clamp(0.0, h as f64) as usize;
+        if c0 >= c1 || r0 >= r1 || (xmax - xmin < 1.0 && ymax - ymin < 1.0) {
+            // Nonlinear projections move the footprint midpoint away from the actual sample.
+            return Self::Nearest.sample_masked(
+                view,
+                valid,
+                sample_center.0,
+                sample_center.1,
+                fill,
+            );
+        }
+        let rectangular = corners[0].1 == corners[1].1
+            && corners[2].1 == corners[3].1
+            && corners[0].0 == corners[3].0
+            && corners[1].0 == corners[2].0;
         let mut centers = 0;
         let value = mode_from_samples(
             (r0..r1)
                 .flat_map(|r| (c0..c1).map(move |c| (r, c)))
-                .filter(|&(r, c)| point_in_footprint((c as f64, r as f64), &corners))
+                .filter(|&(r, c)| rectangular || point_in_footprint((c as f64, r as f64), &corners))
                 .inspect(|_| centers += 1)
                 .filter(|&(r, c)| valid.is_none_or(|m| m[[r, c]]))
                 .map(|(r, c)| view[[r, c]]),
@@ -524,10 +512,38 @@ impl Resampling {
         );
         if centers == 0 {
             // Thin footprints may contain no center; retain nearest fallback.
-            Self::Nearest.sample_masked(view, valid, sc, sr, fill)
+            Self::Nearest.sample_masked(view, valid, sample_center.0, sample_center.1, fill)
         } else {
             value
         }
+    }
+}
+
+fn add_weighted_sum(sum: &mut f64, total: &mut f64, scale: &mut f64, value: f64, weight: f64) {
+    let mut term = value * (weight * *scale);
+    // Scale only on overflow so ordinary sums retain their rounding behavior.
+    if sum.is_finite() && value.is_finite() && weight.is_finite() {
+        while (*sum + term).is_infinite() {
+            *sum *= 0.5;
+            *total *= 0.5;
+            *scale *= 0.5;
+            term = value * (weight * *scale);
+        }
+    }
+    *sum += term;
+    *total += weight * *scale;
+}
+
+fn weighted_mean(sum: f64, total: f64, fill: f64) -> f64 {
+    if total <= 0.0 {
+        return fill;
+    }
+    let mean = sum / total;
+    // Positive weights cannot put a finite-input mean beyond the F64 range.
+    if sum.is_finite() && mean.is_infinite() {
+        mean.signum() * f64::MAX
+    } else {
+        mean
     }
 }
 
@@ -746,6 +762,56 @@ mod tests {
     }
 
     #[test]
+    fn average_preserves_large_finite_values_and_cancellation() {
+        let diamond = [(-0.5, 0.5), (0.5, -0.5), (1.5, 0.5), (0.5, 1.5)];
+        for (pixels, expected) in [
+            (array![[f64::MAX, f64::MAX], [f64::MAX, f64::MAX]], f64::MAX),
+            (
+                array![[-f64::MAX, -f64::MAX], [-f64::MAX, -f64::MAX]],
+                -f64::MAX,
+            ),
+            (array![[1e308, 1e308], [-1e308, -1e308]], 0.0),
+        ] {
+            for value in [
+                Resampling::Average.sample_average(
+                    pixels.view(),
+                    None,
+                    0.5,
+                    0.5,
+                    1.0,
+                    1.0,
+                    f64::NAN,
+                ),
+                Resampling::Average.sample_average_polygon(pixels.view(), None, diamond, f64::NAN),
+            ] {
+                assert!(value.is_finite());
+                assert_relative_eq!(value, expected, epsilon = 1e293);
+            }
+        }
+    }
+
+    #[test]
+    fn average_fractional_weights_keep_extreme_values_finite() {
+        for expected in [f64::MAX, -f64::MAX] {
+            let pixels = ndarray::Array2::from_elem((3, 3), expected);
+            let value = Resampling::Average.sample_average(
+                pixels.view(),
+                None,
+                1.0 / 137.0,
+                1.0 / 139.0,
+                0.5 + 1.0 / 211.0,
+                0.5 + 1.0 / 223.0,
+                f64::NAN,
+            );
+            assert_eq!(value, expected);
+        }
+        let pixels = ndarray::Array2::from_elem((3, 3), f64::INFINITY);
+        assert!(Resampling::Average
+            .sample_average(pixels.view(), None, 1.0, 1.0, 1.0, 1.0, f64::NAN,)
+            .is_infinite());
+    }
+
+    #[test]
     fn average_respects_mask() {
         let a = ndarray::Array2::from_elem((4, 4), 10.0);
         let mut m = ndarray::Array2::from_elem((4, 4), true);
@@ -814,18 +880,30 @@ mod tests {
         let a = array![[9., 2., 9.], [3., 1., 4.], [9., 5., 9.]];
         let corners = [(1., 0.), (2., 1.), (1., 2.), (0., 1.)];
         assert_eq!(
-            Resampling::Mode.sample_mode_polygon(a.view(), None, corners, -1.),
+            Resampling::Mode.sample_mode_polygon(a.view(), None, corners, (1.0, 1.0), -1.),
             1.
         );
         let mut mask = ndarray::Array2::from_elem((3, 3), true);
         mask[[1, 1]] = false;
         assert_eq!(
-            Resampling::Mode.sample_mode_polygon(a.view(), Some(mask.view()), corners, -1.),
+            Resampling::Mode.sample_mode_polygon(
+                a.view(),
+                Some(mask.view()),
+                corners,
+                (1.0, 1.0),
+                -1.
+            ),
             2.
         );
         mask.fill(false);
         assert_eq!(
-            Resampling::Mode.sample_mode_polygon(a.view(), Some(mask.view()), corners, -1.),
+            Resampling::Mode.sample_mode_polygon(
+                a.view(),
+                Some(mask.view()),
+                corners,
+                (1.0, 1.0),
+                -1.
+            ),
             -1.
         );
         assert_eq!(
@@ -833,6 +911,7 @@ mod tests {
                 a.view(),
                 None,
                 corners.map(|(x, y)| (x + 10., y)),
+                (11.0, 1.0),
                 -1.
             ),
             -1.
@@ -843,6 +922,7 @@ mod tests {
                     a.view(),
                     None,
                     corners.map(|(x, y)| (x + shift.0, y + shift.1)),
+                    (1.0 + shift.0, 1.0 + shift.1),
                     -1.
                 ),
                 -1.
@@ -855,7 +935,13 @@ mod tests {
             );
         }
         assert_eq!(
-            Resampling::Mode.sample_mode_polygon(a.view(), None, [(f64::NAN, 0.); 4], -1.),
+            Resampling::Mode.sample_mode_polygon(
+                a.view(),
+                None,
+                [(f64::NAN, 0.); 4],
+                (f64::NAN, 0.0),
+                -1.
+            ),
             -1.
         );
     }
@@ -865,12 +951,12 @@ mod tests {
         let a = array![[9., 1., 9.], [2., 1., 9.], [2., 9., 9.]];
         let corners = [(0.5, -0.5), (1.5, -0.5), (0.5, 2.5), (-0.5, 2.5)];
         assert_eq!(
-            Resampling::Mode.sample_mode_polygon(a.view(), None, corners, -1.),
+            Resampling::Mode.sample_mode_polygon(a.view(), None, corners, (1.0, 1.0), -1.),
             1.
         );
         let thin = [(0., 0.2), (2., 0.2), (2.1, 0.3), (0.1, 0.3)];
         assert_eq!(
-            Resampling::Mode.sample_mode_polygon(a.view(), None, thin, -1.),
+            Resampling::Mode.sample_mode_polygon(a.view(), None, thin, (1.05, 0.25), -1.),
             1.
         );
     }

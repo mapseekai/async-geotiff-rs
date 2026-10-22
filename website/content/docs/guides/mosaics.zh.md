@@ -115,6 +115,12 @@ API、集合与资产 key 在进程启动时固定。HTTP 查询参数无法把�
 启动后打开 <http://127.0.0.1:8080/maplibre>。配置 STAC 时，MapLibre 查看器默认
 选择 mosaic 模式，无需猜测瓦片坐标即可验证目标集合。
 
+自定义认证、代理或超时时，在调用 `build()` 前把配置好的 reqwest 0.11
+`ClientBuilder` 传给 `StacSource::with_http_client_builder`。数据源保留这些配置，
+并强制最多十次同源重定向；跨源跳转在发送凭据前被拒绝，传输错误不包含完整 URL。
+已弃用的 `with_http_client` 现在会在 I/O 前报错，因为已构建客户端的重定向策略无法
+覆盖。`StacSource::new` 的签名保持不变。
+
 ## HTTP 资产策略 {#http-policy}
 
 默认策略允许公网和私网 HTTP(S) 资产，但阻止 loopback、link-local 和云元数据地址。

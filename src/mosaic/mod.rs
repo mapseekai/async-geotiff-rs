@@ -303,6 +303,7 @@ impl<S: MosaicSource> MosaicTiler<S> {
         style: &TileStyle,
         context: &RequestContext,
     ) -> AgResult<Option<Bytes>> {
+        crate::tms::Tms::cached(coord.tms)?.validate_tile(coord.z, coord.x, coord.y)?;
         let mosaic = style.raster.mosaic.as_ref().ok_or_else(|| {
             AgError::query(
                 "/raster:mosaic",
@@ -837,6 +838,29 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none(), "mosaic tile with no assets must return None");
+    }
+
+    #[tokio::test]
+    async fn invalid_coordinates_fail_before_asset_discovery() {
+        struct UnreachableSource;
+        #[async_trait::async_trait]
+        impl MosaicSource for UnreachableSource {
+            async fn assets_for_tile(&self, _: TileCoord) -> AgResult<Vec<AssetRef>> {
+                panic!("invalid coordinates must not reach discovery");
+            }
+        }
+        let mosaic = MosaicTiler::new(UnreachableSource);
+        let style = mosaic_style(PixelSelection::First, &TileStyle::default());
+        for tms in [
+            crate::tms::TileMatrixSet::WebMercatorQuad,
+            crate::tms::TileMatrixSet::WorldCrs84Quad,
+        ] {
+            for (z, x, y) in [(0, 2, 0), (0, 0, 1), (33, 17, 19)] {
+                let coord = TileCoord { tms, z, x, y };
+                assert!(matches!(mosaic.tile(coord, &style).await,
+                    Err(AgError::TileOutOfBounds { z: ez, x: ex, y: ey }) if (ez, ex, ey) == (z, x, y)));
+            }
+        }
     }
 
     #[tokio::test]

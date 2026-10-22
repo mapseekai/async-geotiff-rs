@@ -314,131 +314,134 @@ mod tests {
             "store-opened reader must expose bounds"
         );
     }
-}
 
-#[cfg(test)]
-mod audit_identity_tests {
-    use super::*;
-    #[tokio::test]
-    async fn audit_reader_identity_includes_source_version() {
-        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap());
-        let pool = ReaderPool::builder(8)
-            .backend(Backend::Store(store))
-            .build();
-        let key = "tests/fixtures/rgb_nodata.tif";
-        let first = pool.get_or_open(key, "version1").await.unwrap();
-        let second = pool.get_or_open(key, "version2").await.unwrap();
-        assert!(!Arc::ptr_eq(&first, &second));
-    }
-}
-
-#[cfg(test)]
-mod audit_redirect_tests {
-    use super::*;
-    #[tokio::test]
-    async fn audit_redirect_cannot_escape_validated_host() {
-        use axum::{response::Redirect, routing::get, Router};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let hits = Arc::new(AtomicUsize::new(0));
-        let capture = hits.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let app = Router::new()
-            .route(
-                "/start",
-                get(move || async move { Redirect::temporary(&format!("http://{addr}/blocked")) }),
-            )
-            .route(
-                "/blocked",
-                get(move || {
-                    let hits = capture.clone();
-                    async move {
-                        hits.fetch_add(1, Ordering::SeqCst);
-                        "bad"
-                    }
-                }),
-            );
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let pool = ReaderPool::builder(1)
-            .http_policy(HttpAccessPolicy::default().allow_host("localhost"))
-            .build();
-        assert!(pool
-            .get_or_open(
-                &format!("http://localhost:{}/start", addr.port()),
-                "redirect"
-            )
-            .await
-            .is_err());
-        server.abort();
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            0,
-            "redirect contacted blocked destination"
-        );
-    }
-}
-
-#[cfg(test)]
-mod audit_namespace_tests {
-    use super::*;
-    #[tokio::test]
-    async fn audit_shared_cache_isolates_independent_pools() {
-        let cache = Arc::new(BlockCache::new(CacheConfig::default()));
-        let store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap());
-        for _ in 0..2 {
-            let pool = ReaderPool::builder(1)
-                .backend(Backend::Store(store.clone()))
-                .block_cache(cache.clone())
+    mod identity {
+        use super::*;
+        #[tokio::test]
+        async fn audit_reader_identity_includes_source_version() {
+            let store =
+                Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap());
+            let pool = ReaderPool::builder(8)
+                .backend(Backend::Store(store))
                 .build();
-            pool.get_or_open("tests/fixtures/rgb_nodata.tif", "same-id")
-                .await
-                .unwrap()
-                .read_window(0, 0, 0, 16, 16)
-                .await
-                .unwrap();
+            let key = "tests/fixtures/rgb_nodata.tif";
+            let first = pool.get_or_open(key, "version1").await.unwrap();
+            let second = pool.get_or_open(key, "version2").await.unwrap();
+            assert!(!Arc::ptr_eq(&first, &second));
         }
-        assert_eq!(
-            cache.stats().fetched,
-            2,
-            "independent pools must not assume source IDs share a namespace"
-        );
     }
-}
 
-#[cfg(test)]
-mod snapshot_refresh_tests {
-    use super::*;
-    use object_store::{path::Path, ObjectStoreExt};
-    #[tokio::test]
-    async fn invalidation_opens_a_new_snapshot_without_reusing_old_blocks() {
-        let store = Arc::new(object_store::memory::InMemory::new());
-        let path = Path::from("changing.tif");
-        let mut bytes = include_bytes!("../../tests/fixtures/rgb_nodata.tif").to_vec();
-        store.put(&path, bytes.clone().into()).await.unwrap();
-        let pool = ReaderPool::builder(2)
-            .backend(Backend::Store(store.clone()))
-            .build();
-        let old = pool.get_or_open(path.as_ref(), "logical").await.unwrap();
-        let old_pixel = old.read_window(0, 0, 0, 1, 1).await.unwrap();
-        let ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        let n = u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()) as usize;
-        let entry = (0..n)
-            .map(|i| ifd + 2 + 12 * i)
-            .find(|&i| u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap()) == 324)
-            .unwrap();
-        let offsets = u32::from_le_bytes(bytes[entry + 8..entry + 12].try_into().unwrap()) as usize;
-        let pixel = u32::from_le_bytes(bytes[offsets..offsets + 4].try_into().unwrap()) as usize;
-        bytes[pixel] = 150;
-        store.put(&path, bytes.into()).await.unwrap();
-        assert!(Arc::ptr_eq(
-            &old,
-            &pool.get_or_open(path.as_ref(), "logical").await.unwrap()
-        ));
-        assert!(old.read_window(0, 32, 0, 1, 1).await.is_err());
-        pool.invalidate(path.as_ref(), "logical").await;
-        let fresh = pool.get_or_open(path.as_ref(), "logical").await.unwrap();
-        assert!(!Arc::ptr_eq(&old, &fresh));
-        let new_pixel = fresh.read_window(0, 0, 0, 1, 1).await.unwrap();
-        assert_ne!(old_pixel.pixels.to_f64(), new_pixel.pixels.to_f64());
+    mod redirect {
+        use super::*;
+        #[tokio::test]
+        async fn audit_redirect_cannot_escape_validated_host() {
+            use axum::{response::Redirect, routing::get, Router};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let hits = Arc::new(AtomicUsize::new(0));
+            let capture = hits.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app =
+                Router::new()
+                    .route(
+                        "/start",
+                        get(move || async move {
+                            Redirect::temporary(&format!("http://{addr}/blocked"))
+                        }),
+                    )
+                    .route(
+                        "/blocked",
+                        get(move || {
+                            let hits = capture.clone();
+                            async move {
+                                hits.fetch_add(1, Ordering::SeqCst);
+                                "bad"
+                            }
+                        }),
+                    );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let pool = ReaderPool::builder(1)
+                .http_policy(HttpAccessPolicy::default().allow_host("localhost"))
+                .build();
+            assert!(pool
+                .get_or_open(
+                    &format!("http://localhost:{}/start", addr.port()),
+                    "redirect"
+                )
+                .await
+                .is_err());
+            server.abort();
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "redirect contacted blocked destination"
+            );
+        }
+    }
+
+    mod namespace {
+        use super::*;
+        #[tokio::test]
+        async fn audit_shared_cache_isolates_independent_pools() {
+            let cache = Arc::new(BlockCache::new(CacheConfig::default()));
+            let store =
+                Arc::new(object_store::local::LocalFileSystem::new_with_prefix(".").unwrap());
+            for _ in 0..2 {
+                let pool = ReaderPool::builder(1)
+                    .backend(Backend::Store(store.clone()))
+                    .block_cache(cache.clone())
+                    .build();
+                pool.get_or_open("tests/fixtures/rgb_nodata.tif", "same-id")
+                    .await
+                    .unwrap()
+                    .read_window(0, 0, 0, 16, 16)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                cache.stats().fetched,
+                2,
+                "independent pools must not assume source IDs share a namespace"
+            );
+        }
+    }
+
+    mod snapshot_refresh {
+        use super::*;
+        use object_store::{path::Path, ObjectStoreExt};
+        #[tokio::test]
+        async fn invalidation_opens_a_new_snapshot_without_reusing_old_blocks() {
+            let store = Arc::new(object_store::memory::InMemory::new());
+            let path = Path::from("changing.tif");
+            let mut bytes = include_bytes!("../../tests/fixtures/rgb_nodata.tif").to_vec();
+            store.put(&path, bytes.clone().into()).await.unwrap();
+            let pool = ReaderPool::builder(2)
+                .backend(Backend::Store(store.clone()))
+                .build();
+            let old = pool.get_or_open(path.as_ref(), "logical").await.unwrap();
+            let old_pixel = old.read_window(0, 0, 0, 1, 1).await.unwrap();
+            let ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+            let n = u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()) as usize;
+            let entry = (0..n)
+                .map(|i| ifd + 2 + 12 * i)
+                .find(|&i| u16::from_le_bytes(bytes[i..i + 2].try_into().unwrap()) == 324)
+                .unwrap();
+            let offsets =
+                u32::from_le_bytes(bytes[entry + 8..entry + 12].try_into().unwrap()) as usize;
+            let pixel =
+                u32::from_le_bytes(bytes[offsets..offsets + 4].try_into().unwrap()) as usize;
+            bytes[pixel] = 150;
+            store.put(&path, bytes.into()).await.unwrap();
+            assert!(Arc::ptr_eq(
+                &old,
+                &pool.get_or_open(path.as_ref(), "logical").await.unwrap()
+            ));
+            assert!(old.read_window(0, 32, 0, 1, 1).await.is_err());
+            pool.invalidate(path.as_ref(), "logical").await;
+            let fresh = pool.get_or_open(path.as_ref(), "logical").await.unwrap();
+            assert!(!Arc::ptr_eq(&old, &fresh));
+            let new_pixel = fresh.read_window(0, 0, 0, 1, 1).await.unwrap();
+            assert_ne!(old_pixel.pixels.to_f64(), new_pixel.pixels.to_f64());
+        }
     }
 }

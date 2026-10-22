@@ -163,7 +163,21 @@ impl Tiler {
         let bbox_in_src = if self.reader.src_crs() == &dst_crs {
             dst_bbox
         } else {
-            match Self::reproject_bbox_sync(&dst_bbox, &dst_crs, self.reader.src_crs()) {
+            let mut read_bbox = dst_bbox;
+            if crate::warp::projection::is_epsg(&dst_crs, 4326)
+                && crate::warp::projection::is_epsg(self.reader.src_crs(), 3857)
+                && (dst_bbox.ymin <= -90.0 || dst_bbox.ymax >= 90.0)
+            {
+                // Clip the read plan to actual coverage before projecting singular poles.
+                let [_, south, _, north] = self.reader.wgs84_bounds()?;
+                let pole = 90.0_f64.next_down();
+                read_bbox.ymin = read_bbox.ymin.max(south.max(-pole));
+                read_bbox.ymax = read_bbox.ymax.min(north.min(pole));
+                if read_bbox.ymin >= read_bbox.ymax {
+                    return Ok(None);
+                }
+            }
+            match Self::reproject_bbox_sync(&read_bbox, &dst_crs, self.reader.src_crs()) {
                 Ok(b) => b,
                 Err(AgError::ProjectionDomain(_)) => return Ok(None),
                 Err(e) => return Err(e),
@@ -182,7 +196,7 @@ impl Tiler {
         let level_tr = self.reader.level_transform(level)?;
         let (rc, rr, rw, rh) = level_tr
             .window_for_bbox(&bbox_in_src)
-            .ok_or_else(|| AgError::Warp("source GeoTransform not invertible".into()))?;
+            .ok_or_else(|| AgError::Warp("source pixel window is non-finite, out of range, or its GeoTransform is not invertible".into()))?;
         let same_crs = self.reader.src_crs() == &dst_crs;
         let level_gsd = self.reader.level_gsd(level).unwrap_or(target_gsd);
         let res_matches = level_gsd > 0.0 && ((target_gsd - level_gsd).abs() / level_gsd) < 0.01;
@@ -605,8 +619,14 @@ impl Tiler {
         let ifd = self.reader.data_ifd(level)?;
         let iw = ifd.image_width() as i64;
         let ih = ifd.image_height() as i64;
-        let col_end = (col + w as i64).min(iw);
-        let row_end = (row + h as i64).min(ih);
+        let col_end = col
+            .checked_add_unsigned(w)
+            .ok_or_else(|| AgError::Warp("source column endpoint out of range".into()))?
+            .min(iw);
+        let row_end = row
+            .checked_add_unsigned(h)
+            .ok_or_else(|| AgError::Warp("source row endpoint out of range".into()))?
+            .min(ih);
         let col = col.max(0);
         let row = row.max(0);
         let w = (col_end - col).max(0) as u64;

@@ -126,6 +126,14 @@ After startup, open <http://127.0.0.1:8080/maplibre>. When STAC is configured,
 the MapLibre viewer selects mosaic mode by default and lets you verify the
 configured collection without guessing a tile coordinate.
 
+For custom authentication, proxies or timeouts, pass a configured reqwest 0.11
+`ClientBuilder` to `StacSource::with_http_client_builder` before building it.
+The source retains those settings and enforces at most ten same-origin redirect
+hops. Cross-origin redirects are rejected before sending credentials, and
+transport errors omit full URLs. The deprecated `with_http_client` now fails
+before I/O because an already built client's redirect policy cannot be replaced.
+`StacSource::new` keeps its existing signature.
+
 ## HTTP asset policy {#http-policy}
 
 The default policy allows public and private HTTP(S) assets but blocks

@@ -112,8 +112,8 @@ impl Tms {
 
     /// Bbox of (z, x, y) in the TMS CRS. `y` is XYZ-slippy convention.
     pub fn tile_bbox(&self, z: u8, x: u32, y: u32) -> AgResult<Bbox> {
-        let y_tms = self.slippy_to_tms_y(z, y)?;
-        let bb = self.inner.xy_bounds(&Xyz::new(x.into(), y_tms.into(), z));
+        self.validate_tile(z, x, y)?;
+        let bb = self.inner.xy_bounds(&Xyz::new(x.into(), y.into(), z));
         Ok(Bbox::new(bb.left, bb.bottom, bb.right, bb.top))
     }
 
@@ -124,18 +124,18 @@ impl Tms {
             .ok_or(AgError::TileOutOfBounds { z, x: 0, y: 0 })
     }
 
-    fn slippy_to_tms_y(&self, z: u8, y: u32) -> AgResult<u32> {
-        // WebMercatorQuad and WorldCRS84Quad are NW-origin; no flip.
-        // Helper kept for future SW-origin TMSs.
+    pub(crate) fn validate_tile(&self, z: u8, x: u32, y: u32) -> AgResult<()> {
+        // Both supported matrix sets use a north-west origin.
         let matrix = self
             .inner
             .matrix_z(z)
-            .ok_or(AgError::TileOutOfBounds { z, x: 0, y })?;
+            .ok_or(AgError::TileOutOfBounds { z, x, y })?;
+        let width: u64 = matrix.matrix_width.into();
         let height: u64 = matrix.matrix_height.into();
-        if u64::from(y) >= height {
-            return Err(AgError::TileOutOfBounds { z, x: 0, y });
+        if u64::from(x) >= width || u64::from(y) >= height {
+            return Err(AgError::TileOutOfBounds { z, x, y });
         }
-        Ok(y)
+        Ok(())
     }
 }
 
@@ -158,9 +158,27 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_y_errors() {
-        let tms = Tms::new(TileMatrixSet::WebMercatorQuad).unwrap();
-        assert!(tms.tile_bbox(0, 0, 1).is_err());
+    fn tile_bounds_validate_both_axes_and_preserve_input() {
+        for (set, width) in [
+            (TileMatrixSet::WebMercatorQuad, 1),
+            (TileMatrixSet::WorldCrs84Quad, 2),
+        ] {
+            let tms = Tms::new(set).unwrap();
+            for z in [0, 5] {
+                let width = width << z;
+                let height = 1 << z;
+                assert!(tms.tile_bbox(z, width - 1, height - 1).is_ok());
+                for (x, y) in [(width, 0), (0, height), (width, height)] {
+                    assert!(matches!(tms.tile_bbox(z, x, y),
+                        Err(AgError::TileOutOfBounds { z: ez, x: ex, y: ey })
+                        if (ez, ex, ey) == (z, x, y)));
+                }
+            }
+            for z in [33, u8::MAX] {
+                assert!(matches!(tms.tile_bbox(z, 17, 19),
+                    Err(AgError::TileOutOfBounds { z: ez, x: 17, y: 19 }) if ez == z));
+            }
+        }
     }
 
     #[test]

@@ -24,26 +24,42 @@ pub struct StacSource {
 
 impl StacSource {
     /// Create a bounded source. Automatic proxy discovery is disabled.
-    /// Use `with_http_client` to configure headers, authentication or proxies.
+    /// Use `with_http_client_builder` to configure headers, authentication or proxies.
     pub fn new(
         api_url: &str,
         collections: Vec<String>,
         asset_key: impl Into<String>,
     ) -> AgResult<Self> {
-        url::Url::parse(api_url).map_err(|e| AgError::Mosaic(format!("stac client: {e}")))?;
-        let http = reqwest_stac::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(|e| AgError::Mosaic(format!("stac HTTP client: {e}")))?;
-        Self::with_http_client(api_url, http, collections, asset_key)
+        Self::with_http_client_builder(
+            api_url,
+            reqwest_stac::Client::builder().no_proxy(),
+            collections,
+            asset_key,
+        )
     }
 
-    /// Use the original caller-configured reqwest 0.11 transport, retaining its
-    /// default headers/authentication, proxy and timeout configuration.
-    /// Pagination links must stay on the API origin to avoid leaking credentials.
+    /// A built reqwest client has an opaque redirect policy that cannot be
+    /// overridden. This compatibility entry point fails before any network I/O.
+    #[deprecated(
+        note = "use with_http_client_builder; built clients cannot enforce same-origin redirects"
+    )]
     pub fn with_http_client(
+        _api_url: &str,
+        _http: reqwest_stac::Client,
+        _collections: Vec<String>,
+        _asset_key: impl Into<String>,
+    ) -> AgResult<Self> {
+        Err(AgError::Mosaic(
+            "built HTTP clients cannot enforce STAC redirect origin; use StacSource::with_http_client_builder".into(),
+        ))
+    }
+
+    /// Build a reqwest 0.11 transport retaining default headers, authentication,
+    /// proxies and timeouts. Its redirect policy is replaced with a same-origin
+    /// policy, limited to ten hops, before any request can carry credentials.
+    pub fn with_http_client_builder(
         api_url: &str,
-        http: reqwest_stac::Client,
+        builder: reqwest_stac::ClientBuilder,
         collections: Vec<String>,
         asset_key: impl Into<String>,
     ) -> AgResult<Self> {
@@ -54,6 +70,19 @@ impl StacSource {
                 "stac client requires an HTTP(S) base URL".into(),
             ));
         }
+        let origin = api_url.origin();
+        let http = builder
+            .redirect(reqwest_stac::redirect::Policy::custom(move |attempt| {
+                if attempt.url().origin() != origin {
+                    attempt.error("STAC redirect cannot leave the configured API origin")
+                } else if attempt.previous().len() >= 10 {
+                    attempt.error("STAC redirect limit exceeded")
+                } else {
+                    attempt.follow()
+                }
+            }))
+            .build()
+            .map_err(|e| AgError::Mosaic(format!("stac HTTP client: {}", e.without_url())))?;
         Ok(Self {
             http: Some(http),
             api_url,
@@ -65,9 +94,9 @@ impl StacSource {
     /// Compatibility constructor for an opaque stac-client 0.3 transport.
     /// Discovery returns an error because that client's public methods buffer
     /// responses without a byte bound and do not expose its configured transport.
-    /// Rebuild with `with_http_client`, passing the same reqwest client instead.
+    /// Rebuild with `with_http_client_builder`, carrying over its HTTP settings.
     #[deprecated(
-        note = "use with_http_client; opaque stac-client transport cannot enforce response budgets"
+        note = "use with_http_client_builder; opaque stac-client transport cannot enforce response budgets"
     )]
     pub fn with_client(
         client: Client,
@@ -196,7 +225,7 @@ impl MosaicSource for StacSource {
         options: &DiscoveryOptions,
     ) -> AgResult<DiscoveredAssets> {
         let http = self.http.as_ref().ok_or_else(|| AgError::Mosaic(
-            "opaque stac-client cannot enforce discovery budgets; use StacSource::with_http_client with the original reqwest client".into()))?;
+            "opaque stac-client cannot enforce discovery budgets; use StacSource::with_http_client_builder with the original HTTP settings".into()))?;
         let options = options.clone();
         let request = RequestContext::current();
         let config_bytes = self
@@ -291,9 +320,9 @@ impl MosaicSource for StacSource {
             let mut response = builder
                 .send()
                 .await
-                .map_err(|e| AgError::Mosaic(format!("stac search: {e}")))?
+                .map_err(|e| AgError::Mosaic(format!("stac search: {}", e.without_url())))?
                 .error_for_status()
-                .map_err(|e| AgError::Mosaic(format!("stac search: {e}")))?;
+                .map_err(|e| AgError::Mosaic(format!("stac search: {}", e.without_url())))?;
             let remaining = options.max_total_response_bytes.saturating_sub(total);
             let cap = options.max_response_bytes.min(remaining);
             if response.content_length().is_some_and(|n| n > cap as u64) {
@@ -307,7 +336,7 @@ impl MosaicSource for StacSource {
             while let Some(chunk) = response
                 .chunk()
                 .await
-                .map_err(|e| AgError::Mosaic(format!("stac response: {e}")))?
+                .map_err(|e| AgError::Mosaic(format!("stac response: {}", e.without_url())))?
             {
                 if let Some(request) = &request {
                     request.check()?;
@@ -410,5 +439,442 @@ impl MosaicSource for StacSource {
 }
 
 #[cfg(test)]
-#[path = "stac_test.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use crate::resource::WorkBudget;
+    use axum::{
+        extract::{OriginalUri, State},
+        http::{HeaderMap, Method},
+        response::IntoResponse,
+        routing::any,
+        Router,
+    };
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    type RecordedRequest = (Method, String, Value, bool);
+
+    #[derive(Clone)]
+    struct Fixture {
+        pages: Arc<Mutex<VecDeque<Value>>>,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    }
+    async fn page(
+        State(fixture): State<Fixture>,
+        OriginalUri(uri): OriginalUri,
+        method: Method,
+        headers: HeaderMap,
+        body: bytes::Bytes,
+    ) -> impl IntoResponse {
+        fixture.requests.lock().unwrap().push((
+            method,
+            uri.to_string(),
+            serde_json::from_slice(&body).unwrap_or(Value::Null),
+            headers.get("x-auth").is_some_and(|v| v == "secret"),
+        ));
+        let value = fixture.pages.lock().unwrap().pop_front().unwrap();
+        axum::Json(value)
+    }
+    async fn source(pages: Vec<Value>) -> (StacSource, Fixture, tokio::task::JoinHandle<()>) {
+        let fixture = Fixture {
+            pages: Arc::new(Mutex::new(pages.into())),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/search", any(page))
+            .route("/page", any(page))
+            .with_state(fixture.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut headers = reqwest_stac::header::HeaderMap::new();
+        headers.insert(
+            "x-auth",
+            reqwest_stac::header::HeaderValue::from_static("secret"),
+        );
+        let http = reqwest_stac::Client::builder()
+            .no_proxy()
+            .default_headers(headers);
+        (
+            StacSource::with_http_client_builder(&api_url, http, vec!["test".into()], "data")
+                .unwrap(),
+            fixture,
+            task,
+        )
+    }
+    fn item(href: &str) -> Value {
+        serde_json::json!({"assets":{"data":{"href":href}},"bbox":[-180,-90,180,90]})
+    }
+    fn coord() -> TileCoord {
+        TileCoord {
+            tms: crate::tms::TileMatrixSet::WebMercatorQuad,
+            z: 0,
+            x: 0,
+            y: 0,
+        }
+    }
+    fn options() -> DiscoveryOptions {
+        DiscoveryOptions {
+            max_response_bytes: 4096,
+            max_total_response_bytes: 16384,
+            work_budget: WorkBudget::new(1024 * 1024),
+            ..DiscoveryOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_failures_do_not_expose_url_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for response in [
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{}",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 4096];
+                assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let url = format!("http://user:review-password@{address}/?api_key=review-token");
+            let source = StacSource::new(&url, vec![], "data").unwrap();
+            let error = source
+                .assets_for_tile_with_options(coord(), &options())
+                .await
+                .err()
+                .expect("request must fail");
+            let message = format!("{error:?} {error}");
+            for secret in ["review-password", "review-token", "api_key", "http://"] {
+                assert!(!message.contains(secret), "{message}");
+            }
+            server.await.unwrap();
+            // The listener is now closed, exercising the send-error path too.
+            let error = source
+                .assets_for_tile_with_options(coord(), &options())
+                .await
+                .err()
+                .expect("request must fail");
+            assert!(!format!("{error:?} {error}").contains("review-token"));
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_cannot_send_default_headers_to_another_origin() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let target_hits = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/target", listener.local_addr().unwrap());
+        let target_app = Router::new().route(
+            "/target",
+            any(move || {
+                let hits = target_hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({"features":[]}))
+                }
+            }),
+        );
+        let target_server =
+            tokio::spawn(async move { axum::serve(listener, target_app).await.unwrap() });
+        for pagination in [false, true] {
+            let destination = target.clone();
+            let app = Router::new()
+                .route("/search", any(move || {
+                    let destination = destination.clone();
+                    async move {
+                        if pagination {
+                            axum::Json(serde_json::json!({"features":[],"links":[{"rel":"next","href":"/page"}]})).into_response()
+                        } else {
+                            axum::response::Redirect::temporary(&destination).into_response()
+                        }
+                    }
+                }))
+                .route("/page", any({
+                    let destination = target.clone();
+                    move || {
+                        let destination = destination.clone();
+                        async move { axum::response::Redirect::temporary(&destination) }
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut headers = reqwest_stac::header::HeaderMap::new();
+            headers.insert(
+                "x-api-key",
+                reqwest_stac::header::HeaderValue::from_static("review-token"),
+            );
+            let configured = StacSource::with_http_client_builder(
+                &base,
+                reqwest_stac::Client::builder()
+                    .no_proxy()
+                    .default_headers(headers),
+                vec![],
+                "data",
+            )
+            .unwrap();
+            for source in [StacSource::new(&base, vec![], "data").unwrap(), configured] {
+                let error = source
+                    .assets_for_tile_with_options(coord(), &options())
+                    .await
+                    .err()
+                    .expect("request must fail");
+                assert!(error.to_string().contains("origin"), "{error}");
+                assert_eq!(hits.load(Ordering::SeqCst), 0);
+            }
+            server.abort();
+        }
+        target_server.abort();
+    }
+
+    #[tokio::test]
+    async fn same_origin_redirects_preserve_authentication() {
+        let app = Router::new()
+            .route(
+                "/search",
+                any(|| async { axum::response::Redirect::temporary("/result") }),
+            )
+            .route(
+                "/result",
+                any(|headers: HeaderMap| async move {
+                    assert_eq!(headers.get("x-api-key").unwrap(), "review-token");
+                    axum::Json(serde_json::json!({"features":[item("scene")]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut headers = reqwest_stac::header::HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            reqwest_stac::header::HeaderValue::from_static("review-token"),
+        );
+        let source = StacSource::with_http_client_builder(
+            &base,
+            reqwest_stac::Client::builder()
+                .no_proxy()
+                .default_headers(headers),
+            vec![],
+            "data",
+        )
+        .unwrap();
+        let assets = source
+            .assets_for_tile_with_options(coord(), &options())
+            .await
+            .unwrap();
+        assert_eq!(assets.assets()[0].url, "scene");
+        server.abort();
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn built_client_is_rejected_before_discovery() {
+        let result = StacSource::with_http_client(
+            "http://127.0.0.1:1",
+            reqwest_stac::Client::new(),
+            vec![],
+            "data",
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("with_http_client_builder"));
+    }
+
+    #[tokio::test]
+    async fn pagination_preserves_order_auth_and_post_merge_then_get() {
+        let pages = vec![
+            serde_json::json!({"features":[item("a")],"links":[{"rel":"next","href":"/page","method":"POST","merge":true,"body":{"token":1}}]}),
+            serde_json::json!({"features":[item("a"), item("b")],"links":[{"rel":"next","href":"/page?token=2"}]}),
+            serde_json::json!({"features":[item("c")],"links":[]}),
+        ];
+        let (source, fixture, task) = source(pages).await;
+        let options = options();
+        let out = source
+            .assets_for_tile_with_options(coord(), &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.assets()
+                .iter()
+                .map(|a| a.url.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert!(options.work_budget.used_bytes() > 0);
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|r| r.3));
+        assert_eq!(requests[1].2["collections"], serde_json::json!(["test"]));
+        assert_eq!(requests[1].2["token"], 1);
+        assert_eq!(requests[2].0, Method::GET);
+        assert_eq!(requests[2].1, "/page?token=2");
+        drop(out);
+        assert_eq!(options.work_budget.used_bytes(), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn pages_without_selected_asset_still_follow_next() {
+        let (source, fixture, task) = source(vec![
+            serde_json::json!({"features":[{"assets":{}}],"links":[{"rel":"next","href":"/page"}]}),
+            serde_json::json!({"features":[item("later")]}),
+        ])
+        .await;
+        assert_eq!(
+            source
+                .assets_for_tile_with_options(coord(), &options())
+                .await
+                .unwrap()
+                .assets()[0]
+                .url,
+            "later"
+        );
+        assert_eq!(fixture.requests.lock().unwrap().len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn count_byte_page_and_cycle_limits_fail_without_partial_results() {
+        let cases = [
+            (
+                vec![
+                    serde_json::json!({"features":[item("a"),item("b")],"links":[{"rel":"next","href":"/page"}]}),
+                ],
+                "count",
+            ),
+            (
+                vec![serde_json::json!({"features":[],"padding":"x".repeat(8192)})],
+                "bytes",
+            ),
+            (
+                vec![
+                    serde_json::json!({"features":[],"links":[{"rel":"next","href":"/page"}]}),
+                    serde_json::json!({"features":[],"links":[{"rel":"next","href":"/page"}]}),
+                ],
+                "cycle",
+            ),
+            (
+                vec![serde_json::json!({"features":[],"links":[{"rel":"next","href":"/page"}]})],
+                "pages",
+            ),
+        ];
+        for (pages, kind) in cases {
+            let (source, fixture, task) = source(pages).await;
+            let mut options = options();
+            if kind == "count" {
+                options.max_assets = 1;
+            }
+            if kind == "pages" {
+                options.max_pages = 1;
+            }
+            let error = match source.assets_for_tile_with_options(coord(), &options).await {
+                Err(e) => e,
+                Ok(_) => panic!("limit should reject {kind}"),
+            };
+            assert!(
+                matches!(error, AgError::ResourceLimit(_) | AgError::Mosaic(_)),
+                "{error}"
+            );
+            assert!(fixture.requests.lock().unwrap().len() <= 2);
+            assert_eq!(options.work_budget.used_bytes(), 0);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn opaque_client_fails_closed_before_network_io() {
+        let http = reqwest_stac::Client::builder().no_proxy().build().unwrap();
+        let client = Client::with_client("http://127.0.0.1:1", http).unwrap();
+        #[allow(deprecated)]
+        let source = StacSource::with_client(client, vec![], "data");
+        let error = source.assets_for_tile(coord()).await.unwrap_err();
+        assert!(error.to_string().contains("with_http_client"));
+    }
+
+    #[tokio::test]
+    async fn working_budget_and_total_response_limit_release_leases() {
+        for low_memory in [true, false] {
+            let first =
+                serde_json::json!({"features":[item("a")],"links":[{"rel":"next","href":"/page"}]});
+            let second = serde_json::json!({"features":[item("b")],"padding":"x".repeat(200)});
+            let first_bytes = serde_json::to_vec(&first).unwrap().len();
+            let (source, _, task) = source(vec![first, second]).await;
+            let mut options = options();
+            if low_memory {
+                options.work_budget = WorkBudget::new(1);
+            } else {
+                options.max_total_response_bytes = first_bytes + 100;
+            }
+            assert!(matches!(
+                source.assets_for_tile_with_options(coord(), &options).await,
+                Err(AgError::ResourceLimit(_))
+            ));
+            assert_eq!(options.work_budget.used_bytes(), 0);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_discovery_does_not_leave_cpu_or_request_permits() {
+        use crate::request::{RequestLimiter, RequestOptions};
+        let (source, fixture, task) = source(vec![]).await;
+        let options = DiscoveryOptions {
+            cpu_limiter: crate::blocking::CpuLimiter::new(1),
+            ..options()
+        };
+        let permit = options.cpu_limiter.acquire().await.unwrap();
+        let requests = RequestLimiter::new(1);
+        let request_options = RequestOptions::default();
+        let cancellation = request_options.cancellation.clone();
+        let spawned_requests = requests.clone();
+        let spawned_options = options.clone();
+        let worker = tokio::spawn(async move {
+            spawned_requests
+                .run(
+                    std::time::Duration::from_secs(5),
+                    &request_options,
+                    |_| async move {
+                        source
+                            .assets_for_tile_with_options(coord(), &spawned_options)
+                            .await
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert!(matches!(worker.await.unwrap(), Err(AgError::Cancelled)));
+        assert!(fixture.requests.lock().unwrap().is_empty());
+        assert_eq!(requests.available_permits(), 1);
+        assert_eq!(options.work_budget.used_bytes(), 0);
+        drop(permit);
+        assert_eq!(options.cpu_limiter.available_permits(), 1);
+        task.abort();
+    }
+
+    #[test]
+    fn constructor_rejects_invalid_url() {
+        let result = StacSource::new("not-a-url", vec![], "data");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("stac client"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn constructor_accepts_valid_url() {
+        let src = StacSource::new(
+            "https://planetarycomputer.microsoft.com/api/stac/v1",
+            vec!["sentinel-2-l2a".to_string()],
+            "B04",
+        );
+        assert!(src.is_ok());
+    }
+}

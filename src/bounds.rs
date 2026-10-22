@@ -83,13 +83,20 @@ impl GeoTransform {
     }
 
     /// Pixel window covering the bbox.
-    /// Returns `(col_off, row_off, width, height)`.
+    /// Returns `(col_off, row_off, width, height)`, or `None` when the transform
+    /// is not invertible or the pixel endpoints cannot be represented as `i64`.
     pub fn window_for_bbox(&self, bbox: &Bbox) -> Option<(i64, i64, u64, u64)> {
         let inv = self.inverse()?;
         let (c0, r0) = inv.forward(bbox.xmin, bbox.ymax);
         let (c1, r1) = inv.forward(bbox.xmax, bbox.ymin);
         let (c2, r2) = inv.forward(bbox.xmin, bbox.ymin);
         let (c3, r3) = inv.forward(bbox.xmax, bbox.ymax);
+        if [c0, r0, c1, r1, c2, r2, c3, r3]
+            .iter()
+            .any(|v| !v.is_finite())
+        {
+            return None;
+        }
         // Integer pixel cover of the projected footprint is
         // [floor(min), ceil(max)). Using ceil(max-min) (the raw span)
         // undercounts by 1 px whenever both endpoints are fractional —
@@ -100,10 +107,17 @@ impl GeoTransform {
         let cmax = c0.max(c1).max(c2).max(c3);
         let rmin = r0.min(r1).min(r2).min(r3);
         let rmax = r0.max(r1).max(r2).max(r3);
-        let col_off = cmin.floor() as i64;
-        let row_off = rmin.floor() as i64;
-        let width = (cmax.ceil() - cmin.floor()) as u64;
-        let height = (rmax.ceil() - rmin.floor()) as u64;
+        let endpoints = [cmin.floor(), rmin.floor(), cmax.ceil(), rmax.ceil()];
+        // i64::MAX rounds up to 2^63 as f64, so the upper bound is exclusive.
+        if endpoints
+            .iter()
+            .any(|&v| v < i64::MIN as f64 || v >= i64::MAX as f64)
+        {
+            return None;
+        }
+        let [col_off, row_off, col_end, row_end] = endpoints.map(|v| v as i64);
+        let width = col_end.abs_diff(col_off);
+        let height = row_end.abs_diff(row_off);
         Some((col_off, row_off, width, height))
     }
 }
@@ -120,6 +134,20 @@ mod tests {
     }
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn window_rejects_non_finite_and_unrepresentable_endpoints() {
+        let gt = GeoTransform::from_gdal(&[0.0, 1e-18, 0.0, 0.0, 0.0, -1e-18]);
+        assert!(gt
+            .window_for_bbox(&Bbox::new(-180.0, -90.0, 0.0, 90.0))
+            .is_none());
+        let identity = GeoTransform::from_gdal(&[0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, i64::MAX as f64] {
+            assert!(identity
+                .window_for_bbox(&Bbox::new(0.0, 0.0, value, 1.0))
+                .is_none());
+        }
+    }
 
     #[test]
     fn bbox_from_corners_encloses_all() {

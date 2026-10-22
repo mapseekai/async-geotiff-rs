@@ -16,19 +16,16 @@
 //!     on top of the WGS-84 datum) and (λ, φ) are in radians.
 //! ```
 //!
-//! Latitudes outside ±85.0511287° map to ±∞ on the y axis; we clamp before
-//! `tan().ln()` to match PROJ's behaviour at the WebMercator pole limits.
+//! The square WebMercator tile extent ends at ±85.0511287°, but the projection
+//! remains finite beyond that latitude. Do not clip coordinates to that extent:
+//! doing so would turn out-of-coverage samples into valid edge pixels.
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
 /// Equatorial radius used by EPSG:3857 (spherical Mercator on WGS-84 datum).
 const R: f64 = 6_378_137.0;
-const MAX_MERCATOR_M: f64 = R * PI;
 const DEG_TO_RAD: f64 = PI / 180.0;
 const RAD_TO_DEG: f64 = 180.0 / PI;
-/// `atan(sinh(π))` in degrees — the latitude that maps to y = ±R·π in
-/// WebMercator, beyond which the projection is undefined.
-const MAX_LAT_DEG: f64 = 85.051_128_779_806_59;
 
 /// In-place batch conversion `(lon°, lat°) → (x_m, y_m)` (4326 → 3857).
 ///
@@ -38,7 +35,11 @@ const MAX_LAT_DEG: f64 = 85.051_128_779_806_59;
 pub fn lonlat_to_mercator(pts: &mut [(f64, f64)]) {
     for p in pts.iter_mut() {
         let lon = p.0;
-        let lat = p.1.clamp(-MAX_LAT_DEG, MAX_LAT_DEG);
+        let lat = p.1;
+        if !lon.is_finite() || !lat.is_finite() || lat.abs() >= 90.0 {
+            *p = (f64::NAN, f64::NAN);
+            continue;
+        }
         let lat_rad = lat * DEG_TO_RAD;
         p.0 = R * lon * DEG_TO_RAD;
         p.1 = R * (FRAC_PI_4 + lat_rad * 0.5).tan().ln();
@@ -49,7 +50,7 @@ pub fn lonlat_to_mercator(pts: &mut [(f64, f64)]) {
 pub fn mercator_to_lonlat(pts: &mut [(f64, f64)]) {
     for p in pts.iter_mut() {
         let x = p.0;
-        let y = p.1.clamp(-MAX_MERCATOR_M, MAX_MERCATOR_M);
+        let y = p.1;
         p.0 = (x / R) * RAD_TO_DEG;
         p.1 = (2.0 * (y / R).exp().atan() - FRAC_PI_2) * RAD_TO_DEG;
     }
@@ -77,19 +78,21 @@ mod tests {
     }
 
     #[test]
-    fn pole_clamps_to_max_lat() {
-        let mut pts = [(0.0, 89.9)];
+    fn polar_coordinates_are_not_clipped_to_tile_extent() {
+        let mut pts = [(0.0, 89.9), (0.0, -89.9)];
         lonlat_to_mercator(&mut pts);
-        // y at MAX_LAT_DEG is R*π (the WebMercator "pole" cap).
-        assert_relative_eq!(pts[0].1, R * PI, epsilon = 1.0);
+        assert!(pts[0].1 > R * PI);
+        assert!(pts[1].1 < -R * PI);
+        mercator_to_lonlat(&mut pts);
+        assert_relative_eq!(pts[0].1, 89.9, epsilon = 1e-9);
+        assert_relative_eq!(pts[1].1, -89.9, epsilon = 1e-9);
     }
 
     #[test]
-    fn inverse_clamps_to_webmercator_extent() {
-        let mut pts = [(0.0, R * PI * 2.0), (0.0, -R * PI * 2.0)];
-        mercator_to_lonlat(&mut pts);
-        assert_relative_eq!(pts[0].1, MAX_LAT_DEG, epsilon = 1e-12);
-        assert_relative_eq!(pts[1].1, -MAX_LAT_DEG, epsilon = 1e-12);
+    fn poles_and_invalid_latitudes_are_unmapped() {
+        let mut pts = [(0.0, 90.0), (0.0, -90.0), (0.0, 91.0), (0.0, f64::NAN)];
+        lonlat_to_mercator(&mut pts);
+        assert!(pts.iter().all(|p| p.0.is_nan() && p.1.is_nan()));
     }
 
     #[test]
@@ -124,6 +127,8 @@ mod tests {
             (-122.42, 37.77),
             (10.0, 60.0),
             (-30.0, -45.0),
+            (0.0, 89.9),
+            (0.0, -89.9),
         ];
         let mut expected = samples.clone();
         p.convert_array(&mut expected).unwrap();
@@ -141,7 +146,14 @@ mod tests {
     fn inverse_matches_proj_within_1nrad() {
         use proj::Proj;
         let p = Proj::new_known_crs("EPSG:3857", "EPSG:4326", None).unwrap();
-        let mut samples = vec![(0.0, 0.0), (R * PI, R * PI / 2.0), (-1e7, 5e6), (2e6, -3e6)];
+        let mut samples = vec![
+            (0.0, 0.0),
+            (R * PI, R * PI / 2.0),
+            (-1e7, 5e6),
+            (2e6, -3e6),
+            (0.0, 2.0 * R * PI),
+            (0.0, -2.0 * R * PI),
+        ];
         let mut expected = samples.clone();
         p.convert_array(&mut expected).unwrap();
         mercator_to_lonlat(&mut samples);

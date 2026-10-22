@@ -3,6 +3,7 @@
 mod fixtures;
 
 use async_geotiff::{
+    error::AgError,
     io::{CogReader, ReaderConfig},
     resource::WorkBudget,
     style::TileStyle,
@@ -12,6 +13,111 @@ use async_geotiff::{
 use fixtures::{coord, fixture_store, local_coord, world_fixture};
 use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
 use std::sync::Arc;
+
+#[tokio::test]
+async fn mercator_source_preserves_actual_polar_coverage() {
+    let radius = 6_378_137.0;
+    let extent = std::f64::consts::PI * radius;
+    let polar_extent = radius
+        * (std::f64::consts::FRAC_PI_4 + 89.9_f64.to_radians() * 0.5)
+            .tan()
+            .ln();
+    for (north, polar_alpha) in [(extent, 0), (polar_extent, 255)] {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("world"),
+                fixtures::georeferenced_fixture(
+                    3857,
+                    [-extent, -north, extent, north],
+                    Some([200; 3]),
+                )
+                .into(),
+            )
+            .await
+            .unwrap();
+        let reader = Arc::new(CogReader::open_object_store(store, "world").await.unwrap());
+        for kernel in [
+            "nearest",
+            "bilinear",
+            "cubic",
+            "cubic_spline",
+            "lanczos",
+            "average",
+        ] {
+            let style = TileStyle::from_json(&format!(
+                r#"{{"version":"3.0","renderer":{{"type":"gray","bidx":[1]}},"resampling":{{"read":"{kernel}","reproject":"{kernel}"}}}}"#
+            )).unwrap();
+            assert_eq!(
+                style.resampling(),
+                async_geotiff::warp::Resampling::parse(kernel).unwrap()
+            );
+            let png = Tiler::new(reader.clone())
+                .tile(coord(), &style)
+                .await
+                .unwrap()
+                .unwrap();
+            let image = image::load_from_memory(&png).unwrap().into_rgba8();
+            for row in [0, 255] {
+                for col in 0..256 {
+                    assert_eq!(
+                        image.get_pixel(col, row).0[3],
+                        polar_alpha,
+                        "polar pixel {col},{row}, extent {north}, kernel {kernel}"
+                    );
+                }
+            }
+            for row in [7, 128, 248] {
+                assert_eq!(
+                    image.get_pixel(128, row).0,
+                    [200, 200, 200, 255],
+                    "covered row {row}, extent {north}, kernel {kernel}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn tiny_pixel_scale_returns_a_range_error_without_a_worker_panic() {
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("tiny"),
+            fixtures::georeferenced_fixture(4326, [0.0, -64e-18, 64e-18, 0.0], Some([200; 3]))
+                .into(),
+        )
+        .await
+        .unwrap();
+    let reader = Arc::new(CogReader::open_object_store(store, "tiny").await.unwrap());
+    let style = TileStyle::from_raster_query("version=3.0&type=gray&bidx=1").unwrap();
+    let error = Tiler::new(reader).tile(coord(), &style).await.unwrap_err();
+    assert!(matches!(error, AgError::Warp(ref message)
+        if message.contains("source pixel window") && message.contains("out of range")));
+}
+
+#[tokio::test]
+async fn invalid_tile_coordinates_are_rejected_by_public_tiler() {
+    let reader = Arc::new(
+        CogReader::open_object_store(fixture_store().await, "a")
+            .await
+            .unwrap(),
+    );
+    let tiler = Tiler::new(reader);
+    let style = TileStyle::from_raster_query("version=3.0&type=gray&bidx=1").unwrap();
+    for tms in [
+        async_geotiff::tms::TileMatrixSet::WebMercatorQuad,
+        async_geotiff::tms::TileMatrixSet::WorldCrs84Quad,
+    ] {
+        for (z, x, y) in [(0, 2, 0), (0, 0, 1), (33, 17, 19)] {
+            let coord = TileCoord { tms, z, x, y };
+            assert!(matches!(tiler.tile(coord, &style).await,
+                Err(AgError::TileOutOfBounds { z: ez, x: ex, y: ey }) if (ez, ex, ey) == (z, x, y)));
+            assert!(matches!(tiler.warp_tile(coord, &style).await,
+                Err(AgError::TileOutOfBounds { z: ez, x: ex, y: ey }) if (ez, ex, ey) == (z, x, y)));
+        }
+    }
+}
 
 #[tokio::test]
 async fn passthrough_uses_the_destination_grid() {

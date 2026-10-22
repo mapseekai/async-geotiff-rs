@@ -150,7 +150,7 @@ pub fn convert_batch(src: &Crs, dst: &Crs, pts: &mut [(f64, f64)]) -> AgResult<(
 /// True when `crs` names EPSG:<code> in any of its common spellings.
 /// Zero-allocation: parses the digits instead of formatting three Strings
 /// — `convert_batch` calls this twice per tile on the hot path.
-fn is_epsg(crs: &Crs, code: u32) -> bool {
+pub(crate) fn is_epsg(crs: &Crs, code: u32) -> bool {
     let s = crs.as_str();
     let digits = s
         .strip_prefix("EPSG:")

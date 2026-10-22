@@ -285,6 +285,7 @@ impl MosaicSource for MosaicJsonSource {
                 "MosaicJSON quadkey indexes only support WebMercatorQuad",
             ));
         }
+        crate::tms::Tms::cached(coord.tms)?.validate_tile(coord.z, coord.x, coord.y)?;
         let source = self.clone();
         let options = options.clone();
         let permit = options.cpu_limiter.acquire().await?;
@@ -405,6 +406,25 @@ mod tests {
 
         let all = prefix_key_range(&keys, "");
         assert_eq!(all, 0..keys.len());
+    }
+
+    #[tokio::test]
+    async fn invalid_coordinates_fail_before_quadkey_lookup() {
+        let source = MosaicJsonSource::from_str(DOC).unwrap();
+        for (z, x, y) in [(1, 2, 0), (1, 0, 2), (33, 17, 19), (u8::MAX, 0, 0)] {
+            let coord = TileCoord {
+                tms: TileMatrixSet::WebMercatorQuad,
+                z,
+                x,
+                y,
+            };
+            assert!(matches!(source.assets_for_tile(coord).await,
+                Err(AgError::TileOutOfBounds { z: ez, x: ex, y: ey }) if (ez, ex, ey) == (z, x, y)));
+            assert!(
+                matches!(source.assets_for_tile_with_options(coord, &DiscoveryOptions::default()).await,
+                Err(AgError::TileOutOfBounds { z: ez, x: ex, y: ey }) if (ez, ex, ey) == (z, x, y))
+            );
+        }
     }
 
     #[tokio::test]

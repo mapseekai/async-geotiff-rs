@@ -288,6 +288,96 @@ impl ObjectStore for SnapshotStore {
     }
 }
 
+/// Inspect declared counts before async-tiff allocates tag maps/value vectors.
+pub(crate) async fn preflight_ifd(
+    fetch: &impl async_tiff::metadata::MetadataFetch,
+    offset: u64,
+    bigtiff: bool,
+    endian: async_tiff::reader::Endianness,
+    config: &crate::io::ReaderConfig,
+    remaining: u64,
+) -> crate::error::AgResult<u64> {
+    use crate::error::AgError;
+    let malformed = || AgError::Tiff("invalid or oversized TIFF directory".into());
+    let integer = |bytes: &[u8]| -> u64 {
+        match endian {
+            async_tiff::reader::Endianness::LittleEndian => {
+                bytes.iter().rev().fold(0, |n, &b| (n << 8) | u64::from(b))
+            }
+            async_tiff::reader::Endianness::BigEndian => {
+                bytes.iter().fold(0, |n, &b| (n << 8) | u64::from(b))
+            }
+        }
+    };
+    let header_size = if bigtiff { 8 } else { 2 };
+    let stride = if bigtiff { 20 } else { 12 };
+    let inline = if bigtiff { 8 } else { 4 };
+    let header_end = offset.checked_add(header_size).ok_or_else(malformed)?;
+    let size = config.snapshot_size.unwrap_or(u64::MAX);
+    if header_end > size {
+        return Err(malformed());
+    }
+    let header = fetch
+        .fetch(offset..header_end)
+        .await
+        .map_err(|e| resource_error(&e).unwrap_or_else(malformed))?;
+    if header.len() != header_size as usize {
+        return Err(malformed());
+    }
+    let entries = integer(&header);
+    if entries > config.max_ifd_entries {
+        return Err(malformed());
+    }
+    let table_size = entries
+        .checked_mul(stride)
+        .and_then(|n| n.checked_add(inline))
+        .ok_or_else(malformed)?;
+    let table_end = header_end.checked_add(table_size).ok_or_else(malformed)?;
+    if table_end > size || table_size > config.max_metadata_bytes {
+        return Err(malformed());
+    }
+    let table = fetch
+        .fetch(header_end..table_end)
+        .await
+        .map_err(|e| resource_error(&e).unwrap_or_else(malformed))?;
+    if table.len() != table_size as usize {
+        return Err(malformed());
+    }
+    let mut allocation = entries
+        .checked_mul(
+            (std::mem::size_of::<(async_tiff::tags::Tag, async_tiff::TagValue)>() * 2) as u64,
+        )
+        .ok_or_else(malformed)?;
+    for entry in table[..(entries * stride) as usize].chunks_exact(stride as usize) {
+        let kind = integer(&entry[2..4]);
+        let element_bytes = match kind {
+            1 | 2 | 6 | 7 => 1,
+            3 | 8 => 2,
+            4 | 9 | 11 | 13 => 4,
+            5 | 10 | 12 | 16 | 17 | 18 => 8,
+            _ => return Err(malformed()),
+        };
+        let count = integer(&entry[4..(4 + inline) as usize]);
+        let bytes = count.checked_mul(element_bytes).ok_or_else(malformed)?;
+        if bytes > inline {
+            let pointer = integer(&entry[(4 + inline) as usize..]);
+            if pointer.checked_add(bytes).is_none_or(|end| end > size) {
+                return Err(malformed());
+            }
+        }
+        // Raw vector, TagValue list, and converted IFD arrays can coexist.
+        let values = count
+            .checked_mul((std::mem::size_of::<async_tiff::TagValue>() * 3) as u64)
+            .and_then(|n| n.checked_add(bytes))
+            .ok_or_else(malformed)?;
+        allocation = allocation.checked_add(values).ok_or_else(malformed)?;
+        if allocation > remaining {
+            return Err(malformed());
+        }
+    }
+    Ok(allocation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,196 +499,105 @@ mod tests {
             .is_err());
         assert_eq!(budget.used_bytes(), 0);
     }
-}
 
-#[cfg(test)]
-mod http_tests {
-    use super::*;
-    #[tokio::test]
-    async fn snapshot_requires_strong_validator_and_checks_ignored_conditionals() {
-        use axum::{
-            http::{HeaderMap, StatusCode},
-            routing::get,
-            Router,
-        };
-        use std::sync::atomic::AtomicUsize;
-        let mode = Arc::new(AtomicUsize::new(0));
-        let state = mode.clone();
-        let app = Router::new().route(
-            "/bytes",
-            get(move |headers: HeaderMap| {
-                let state = state.clone();
-                async move {
-                    let mode = state.load(Ordering::SeqCst);
-                    let mut out = HeaderMap::new();
-                    out.insert("content-range", "bytes 0-0/4".parse().unwrap());
-                    match mode {
-                        1 => {
-                            out.insert("etag", "W/\"v1\"".parse().unwrap());
+    mod http {
+        use super::*;
+        #[tokio::test]
+        async fn snapshot_requires_strong_validator_and_checks_ignored_conditionals() {
+            use axum::{
+                http::{HeaderMap, StatusCode},
+                routing::get,
+                Router,
+            };
+            use std::sync::atomic::AtomicUsize;
+            let mode = Arc::new(AtomicUsize::new(0));
+            let state = mode.clone();
+            let app = Router::new().route(
+                "/bytes",
+                get(move |headers: HeaderMap| {
+                    let state = state.clone();
+                    async move {
+                        let mode = state.load(Ordering::SeqCst);
+                        let mut out = HeaderMap::new();
+                        out.insert("content-range", "bytes 0-0/4".parse().unwrap());
+                        match mode {
+                            1 => {
+                                out.insert("etag", "W/\"v1\"".parse().unwrap());
+                            }
+                            2 => {
+                                out.insert("etag", "\"v1\"".parse().unwrap());
+                            }
+                            3 => {
+                                assert_eq!(headers["if-match"], "\"v1\"");
+                                out.insert("etag", "\"v2\"".parse().unwrap());
+                            }
+                            _ => {}
                         }
-                        2 => {
-                            out.insert("etag", "\"v1\"".parse().unwrap());
-                        }
-                        3 => {
-                            assert_eq!(headers["if-match"], "\"v1\"");
-                            out.insert("etag", "\"v2\"".parse().unwrap());
-                        }
-                        _ => {}
+                        (StatusCode::PARTIAL_CONTENT, out, "a")
                     }
-                    (StatusCode::PARTIAL_CONTENT, out, "a")
-                }
-            }),
-        );
-        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
-        let store = Arc::new(
-            object_store::http::HttpBuilder::new()
-                .with_url(format!("http://{addr}/bytes"))
-                .with_client_options(ClientOptions::new().with_allow_http(true))
-                .build()
-                .unwrap(),
-        );
-        let path = Path::from("");
-        let budget = crate::resource::WorkBudget::new(100);
-        assert!(SnapshotStore::open(
-            store.clone(),
-            path.clone(),
-            SnapshotPolicy::RequireValidator,
-            16,
-            16,
-            budget.clone()
-        )
-        .await
-        .is_err());
-        assert!(SnapshotStore::open(
-            store.clone(),
-            path.clone(),
-            SnapshotPolicy::AssumeImmutable,
-            16,
-            16,
-            budget.clone()
-        )
-        .await
-        .is_ok());
-        mode.store(1, Ordering::SeqCst);
-        assert!(SnapshotStore::open(
-            store.clone(),
-            path.clone(),
-            SnapshotPolicy::RequireValidator,
-            16,
-            16,
-            budget.clone()
-        )
-        .await
-        .is_err());
-        mode.store(2, Ordering::SeqCst);
-        let snapshot = SnapshotStore::open(
-            store,
-            path.clone(),
-            SnapshotPolicy::RequireValidator,
-            16,
-            16,
-            budget,
-        )
-        .await
-        .unwrap();
-        snapshot.finish_metadata();
-        mode.store(3, Ordering::SeqCst);
-        assert!(
-            snapshot.get_range(&path, 0..1).await.is_err(),
-            "response validator mismatch must fail even when the server ignores If-Match"
-        );
-        server.abort();
-    }
-}
-
-/// Inspect declared counts before async-tiff allocates tag maps/value vectors.
-pub(crate) async fn preflight_ifd(
-    fetch: &impl async_tiff::metadata::MetadataFetch,
-    offset: u64,
-    bigtiff: bool,
-    endian: async_tiff::reader::Endianness,
-    config: &crate::io::ReaderConfig,
-    remaining: u64,
-) -> crate::error::AgResult<u64> {
-    use crate::error::AgError;
-    let malformed = || AgError::Tiff("invalid or oversized TIFF directory".into());
-    let integer = |bytes: &[u8]| -> u64 {
-        match endian {
-            async_tiff::reader::Endianness::LittleEndian => {
-                bytes.iter().rev().fold(0, |n, &b| (n << 8) | u64::from(b))
-            }
-            async_tiff::reader::Endianness::BigEndian => {
-                bytes.iter().fold(0, |n, &b| (n << 8) | u64::from(b))
-            }
-        }
-    };
-    let header_size = if bigtiff { 8 } else { 2 };
-    let stride = if bigtiff { 20 } else { 12 };
-    let inline = if bigtiff { 8 } else { 4 };
-    let header_end = offset.checked_add(header_size).ok_or_else(malformed)?;
-    let size = config.snapshot_size.unwrap_or(u64::MAX);
-    if header_end > size {
-        return Err(malformed());
-    }
-    let header = fetch
-        .fetch(offset..header_end)
-        .await
-        .map_err(|e| resource_error(&e).unwrap_or_else(malformed))?;
-    if header.len() != header_size as usize {
-        return Err(malformed());
-    }
-    let entries = integer(&header);
-    if entries > config.max_ifd_entries {
-        return Err(malformed());
-    }
-    let table_size = entries
-        .checked_mul(stride)
-        .and_then(|n| n.checked_add(inline))
-        .ok_or_else(malformed)?;
-    let table_end = header_end.checked_add(table_size).ok_or_else(malformed)?;
-    if table_end > size || table_size > config.max_metadata_bytes {
-        return Err(malformed());
-    }
-    let table = fetch
-        .fetch(header_end..table_end)
-        .await
-        .map_err(|e| resource_error(&e).unwrap_or_else(malformed))?;
-    if table.len() != table_size as usize {
-        return Err(malformed());
-    }
-    let mut allocation = entries
-        .checked_mul(
-            (std::mem::size_of::<(async_tiff::tags::Tag, async_tiff::TagValue)>() * 2) as u64,
-        )
-        .ok_or_else(malformed)?;
-    for entry in table[..(entries * stride) as usize].chunks_exact(stride as usize) {
-        let kind = integer(&entry[2..4]);
-        let element_bytes = match kind {
-            1 | 2 | 6 | 7 => 1,
-            3 | 8 => 2,
-            4 | 9 | 11 | 13 => 4,
-            5 | 10 | 12 | 16 | 17 | 18 => 8,
-            _ => return Err(malformed()),
-        };
-        let count = integer(&entry[4..(4 + inline) as usize]);
-        let bytes = count.checked_mul(element_bytes).ok_or_else(malformed)?;
-        if bytes > inline {
-            let pointer = integer(&entry[(4 + inline) as usize..]);
-            if pointer.checked_add(bytes).is_none_or(|end| end > size) {
-                return Err(malformed());
-            }
-        }
-        // Raw vector, TagValue list, and converted IFD arrays can coexist.
-        let values = count
-            .checked_mul((std::mem::size_of::<async_tiff::TagValue>() * 3) as u64)
-            .and_then(|n| n.checked_add(bytes))
-            .ok_or_else(malformed)?;
-        allocation = allocation.checked_add(values).ok_or_else(malformed)?;
-        if allocation > remaining {
-            return Err(malformed());
+                }),
+            );
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = socket.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+            let store = Arc::new(
+                object_store::http::HttpBuilder::new()
+                    .with_url(format!("http://{addr}/bytes"))
+                    .with_client_options(ClientOptions::new().with_allow_http(true))
+                    .build()
+                    .unwrap(),
+            );
+            let path = Path::from("");
+            let budget = crate::resource::WorkBudget::new(100);
+            assert!(SnapshotStore::open(
+                store.clone(),
+                path.clone(),
+                SnapshotPolicy::RequireValidator,
+                16,
+                16,
+                budget.clone()
+            )
+            .await
+            .is_err());
+            assert!(SnapshotStore::open(
+                store.clone(),
+                path.clone(),
+                SnapshotPolicy::AssumeImmutable,
+                16,
+                16,
+                budget.clone()
+            )
+            .await
+            .is_ok());
+            mode.store(1, Ordering::SeqCst);
+            assert!(SnapshotStore::open(
+                store.clone(),
+                path.clone(),
+                SnapshotPolicy::RequireValidator,
+                16,
+                16,
+                budget.clone()
+            )
+            .await
+            .is_err());
+            mode.store(2, Ordering::SeqCst);
+            let snapshot = SnapshotStore::open(
+                store,
+                path.clone(),
+                SnapshotPolicy::RequireValidator,
+                16,
+                16,
+                budget,
+            )
+            .await
+            .unwrap();
+            snapshot.finish_metadata();
+            mode.store(3, Ordering::SeqCst);
+            assert!(
+                snapshot.get_range(&path, 0..1).await.is_err(),
+                "response validator mismatch must fail even when the server ignores If-Match"
+            );
+            server.abort();
         }
     }
-    Ok(allocation)
 }

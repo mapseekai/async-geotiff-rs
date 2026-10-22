@@ -2,9 +2,9 @@
 
 ## Status
 
-Approved design for implementation planning. The target is a publicly reachable
-interactive deployment of the existing Axum example; the already deployed
-Cloudflare Pages project remains the static documentation site.
+Archived on 2026-10-22: the Cloudflare demo implementation, container configuration,
+and deployment workflow were removed. This document records the original design;
+the Cloudflare Pages documentation workflow remains available.
 
 ## Goal
 

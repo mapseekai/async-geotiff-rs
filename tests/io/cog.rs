@@ -4,6 +4,33 @@ use object_store::local::LocalFileSystem;
 use std::sync::Arc;
 
 #[tokio::test]
+async fn internal_masks_use_their_own_block_grid() {
+    for name in ["mask_16_16.tif", "mask_32_16.tif", "mask_16_32.tif"] {
+        let store = Arc::new(LocalFileSystem::new_with_prefix(env!("CARGO_MANIFEST_DIR")).unwrap());
+        let reader = CogReader::open_object_store(store, &format!("tests/fixtures/{name}"))
+            .await
+            .unwrap();
+        for (col, row, width, height) in
+            [(0, 0, 32, 32), (0, 0, 2, 2), (20, 20, 2, 2), (14, 14, 4, 4)]
+        {
+            let image = reader
+                .read_window(0, col, row, width, height)
+                .await
+                .unwrap();
+            let mask = image.mask.as_ref().unwrap();
+            for ((_, x), &valid) in mask.indexed_iter() {
+                assert_eq!(
+                    valid,
+                    col + (x as i64) < 16,
+                    "{name} column {}",
+                    col + x as i64
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn tiled_pixels_overview_and_nodata_match_known_samples() {
     for (name, bands, multiplier) in [
         ("rgb_nodata.tif", 3, 1),

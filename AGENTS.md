@@ -25,7 +25,7 @@ Follow Rust 2021 conventions and rustfmt’s four-space indentation. Use `snake_
 
 Use `#[test]` or `#[tokio::test]`, with behavior-based names and regression coverage. Regenerate checked-in fixtures with `python3 tests/fixtures/generate.py`. Explicitly ignore tests requiring large local imagery, documenting the required filename.
 
-Name tests after their source, never a scenario or review. Private Rust tests stay inline or in adjacent `<source>_test.rs` (`mod_test.rs` for `mod.rs`). Public tests mirror `src/` under `tests/`, with explicit Cargo targets. Each source has at most one standalone test file; inline private tests when a public suite already exists. HTML tests use adjacent `<source>.test.cjs`; shared helpers belong in `tests/support/`. Preserve test cases, feature gates, and historical validation manifests when moving files.
+Name tests after their source, never a scenario or review. Keep each source file’s unit tests in its sole inline `#[cfg(test)] mod tests`; group scenarios inside it and never split same-source unit tests into separate files. Public integration tests mirror `src/` under `tests/`, with explicit Cargo targets. HTML tests use adjacent `<source>.test.cjs`; shared helpers belong in `tests/support/`. Preserve test cases, feature gates, and historical validation manifests when moving files.
 
 Mirror CI’s feature matrix: default, `--no-default-features`, `--no-default-features --features mosaic`, `--features stac,webp,jpeg`, and `--all-features`. Run both target and documentation tests for affected configurations.
 

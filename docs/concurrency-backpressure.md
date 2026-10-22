@@ -14,7 +14,7 @@
 
 ## 回归测试
 
-资源预算单元测试集中在 `src/resource_test.rs`，其中 6 个背压用例验证多阶段竞争、正常并行、有界重试、非资源错误、deadline、显式取消和阻塞任务退出后的许可释放。3 个公开 API 用例分别归属 `tests/tiler.rs` 和 `tests/mosaic/mod.rs`，验证有限预算下的单图、warp、多资产 Mosaic 并发及结果一致性。
+资源预算单元测试集中在 `src/resource.rs` 的内联 `tests` 模块，其中 6 个背压用例验证多阶段竞争、正常并行、有界重试、非资源错误、deadline、显式取消和阻塞任务退出后的许可释放。3 个公开 API 用例分别归属 `tests/tiler.rs` 和 `tests/mosaic/mod.rs`，验证有限预算下的单图、warp、多资产 Mosaic 并发及结果一致性。
 
 ```sh
 cargo test --locked --all-features
