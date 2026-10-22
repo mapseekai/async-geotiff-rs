@@ -14,7 +14,7 @@
 
 ## 回归测试
 
-新增 `src/resource_backpressure_tests.rs` 的 6 个单元测试，验证多阶段竞争、正常并行、有界重试、非资源错误、deadline、显式取消和阻塞任务退出后的许可释放。新增 `tests/concurrency_backpressure.rs` 的 3 个公开 API 测试，验证有限预算下的单图、warp、多资产 Mosaic 并发及结果一致性。
+资源预算单元测试集中在 `src/resource_test.rs`，其中 6 个背压用例验证多阶段竞争、正常并行、有界重试、非资源错误、deadline、显式取消和阻塞任务退出后的许可释放。3 个公开 API 用例分别归属 `tests/tiler.rs` 和 `tests/mosaic/mod.rs`，验证有限预算下的单图、warp、多资产 Mosaic 并发及结果一致性。
 
 ```sh
 cargo test --locked --all-features

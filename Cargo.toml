@@ -79,6 +79,40 @@ inherits = "release"
 debug = true
 strip = false
 
+[[test]]
+name = "io_cog"
+path = "tests/io/cog.rs"
+
+[[test]]
+name = "io_point"
+path = "tests/io/point.rs"
+
+[[test]]
+name = "mosaic"
+path = "tests/mosaic/mod.rs"
+required-features = ["mosaic"]
+
+[[test]]
+name = "mosaic_mosaicjson"
+path = "tests/mosaic/mosaicjson.rs"
+required-features = ["mosaic"]
+
+[[test]]
+name = "render_pipeline"
+path = "tests/render/pipeline.rs"
+
+[[test]]
+name = "style_params"
+path = "tests/style/params.rs"
+
+[[test]]
+name = "style_statistics"
+path = "tests/style/statistics.rs"
+
+[[test]]
+name = "tiler"
+path = "tests/tiler.rs"
+
 [[example]]
 name = "serve"
 required-features = ["mosaic"]

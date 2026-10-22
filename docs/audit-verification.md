@@ -90,7 +90,7 @@ The live demo exposed gaps not covered by the earlier matrix: a one-band
 dataset inherited the viewers' RGB band preset, and raster sources started
 before dataset metadata arrived. All three viewers now default to automatic
 bands, normalize the incompatible legacy RGB preset, and defer tile requests
-until selection/metadata are ready. `node tests/viewer_bootstrap.cjs` tests
+until selection/metadata are ready. `node --test examples/*.test.cjs` tests
 the delayed-startup ordering and runs in CI. The single-band HTTP viewport
 regression also passes.
 

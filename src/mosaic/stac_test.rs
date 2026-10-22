@@ -256,3 +256,21 @@ async fn cancelled_discovery_does_not_leave_cpu_or_request_permits() {
     assert_eq!(options.cpu_limiter.available_permits(), 1);
     task.abort();
 }
+
+#[test]
+fn constructor_rejects_invalid_url() {
+    let result = StacSource::new("not-a-url", vec![], "data");
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("stac client"), "unexpected error: {msg}");
+}
+
+#[test]
+fn constructor_accepts_valid_url() {
+    let src = StacSource::new(
+        "https://planetarycomputer.microsoft.com/api/stac/v1",
+        vec!["sentinel-2-l2a".to_string()],
+        "B04",
+    );
+    assert!(src.is_ok());
+}

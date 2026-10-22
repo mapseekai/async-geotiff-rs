@@ -1,4 +1,3 @@
-// Run with: node tests/viewer_bootstrap.cjs
 // Execute the actual inline viewers with delayed metadata and lightweight map stubs.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -179,11 +178,11 @@ async function check(viewer, method = null, defaultStretch = "none", invalidFiel
   }
   console.log(`${viewer}: delayed metadata, default ${defaultStretch}, explicit ${method ?? "auto"} passed`);
 }
-(async()=>{for(const viewer of ["maplibre","leaflet","openlayers"]) {
+module.exports = async function checkViewer(viewer) {
   await check(viewer);
   await check(viewer, null, "minmax");
   await check(viewer, "none", "minmax");
   for (const invalid of ["{", "null", "[]", "1", '{"raster:tile":null}', '{"raster:mosaic":[]}']) {
     await check(viewer, null, "none", invalid);
   }
-}})().catch(error=>{console.error(error);process.exitCode=1;});
+};

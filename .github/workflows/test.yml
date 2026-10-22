@@ -34,7 +34,7 @@ jobs:
       - name: Check formatting
         run: cargo +stable fmt --all -- --check
       - name: Test viewer startup ordering
-        run: node tests/viewer_bootstrap.cjs
+        run: node --test examples/*.test.cjs
       - name: Check all targets
         run: cargo +stable check --locked --all-targets ${{ matrix.flags }}
       - name: Run unit and integration tests

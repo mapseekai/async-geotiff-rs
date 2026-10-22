@@ -1,30 +1,10 @@
-use async_geotiff::{
-    bounds::{Bbox, GeoTransform},
-    crs::Crs,
-    pixel::{ImageData, PixelData},
-    render::pipeline::render,
-    style::{compile, RasterStyle, TileStyle},
-};
-use ndarray::Array3;
-use serde_json::{json, Value};
+//! Public integration tests for src/style/params.rs.
+#[path = "../support/raster.rs"]
+mod raster;
 
-fn pixels(style: Value, values: &[f64]) -> Vec<u8> {
-    let style = TileStyle::from_json(&style.to_string()).unwrap();
-    let image = ImageData {
-        pixels: PixelData::F64(
-            Array3::from_shape_vec((values.len(), 1, 1), values.to_vec()).unwrap(),
-        ),
-        mask: None,
-        nodata: None,
-        crs: Crs::epsg(3857),
-        bbox: Bbox::new(0., 0., 1., 1.),
-        transform: GeoTransform::from_gdal(&[0., 1., 0., 1., 0., -1.]),
-    };
-    image::load_from_memory(&render(&image, &compile(&style).unwrap()).unwrap())
-        .unwrap()
-        .to_rgba8()
-        .into_raw()
-}
+use async_geotiff::style::{RasterStyle, TileStyle};
+use raster::pixels;
+use serde_json::{json, Value};
 
 #[test]
 fn json_and_q3_share_validation_broadcast_and_pixel_results() {
@@ -44,72 +24,6 @@ fn json_and_q3_share_validation_broadcast_and_pixel_results() {
         TileStyle::from_json(r#"{"version":"3.0","renderer":{"type":"gray","bidx":[1.0]}}"#)
             .is_ok()
     );
-}
-
-#[test]
-fn defaults_gamma_nodata_and_alpha_are_explicit() {
-    let mut style = json!({"version":"3.0","renderer":{"type":"gray","bidx":[1]}});
-    assert_eq!(pixels(style.clone(), &[1.]), [1, 1, 1, 255]);
-    style["stretch"] = json!({"method":"linear","rescale":[[0,1]]});
-    style["effects"] = json!({"color_formula":[{"op":"gamma","value":2}]});
-    style["opacity"] = json!(0.5);
-    assert_eq!(pixels(style.clone(), &[0.25]), [128, 128, 128, 128]);
-    style["nodata"] = json!(0.25);
-    assert_eq!(pixels(style.clone(), &[0.25]), [0, 0, 0, 0]);
-    assert_eq!(pixels(style, &[f64::INFINITY]), [0, 0, 0, 0]);
-}
-
-#[test]
-fn intervals_are_half_open_and_exact_values_are_not_rounded() {
-    let intervals = json!({"version":"3.0","renderer":{"type":"pseudocolor","bidx":[1],"colormap":[[[0,1],[255,0,0,255]],[[1,2],[0,255,0,255]]]}});
-    assert_eq!(pixels(intervals.clone(), &[1.]), [0, 255, 0, 255]);
-    assert_eq!(pixels(intervals, &[2.]), [0, 0, 0, 0]);
-    let exact = json!({"version":"3.0","renderer":{"type":"categorized","bidx":[1],"colormap":{"1":[255,0,0,255]}}});
-    assert_eq!(pixels(exact.clone(), &[1.]), [255, 0, 0, 255]);
-    assert_eq!(pixels(exact, &[1.5]), [0, 0, 0, 0]);
-}
-
-#[test]
-fn colormap_lookup_preserves_numeric_order_signed_zero_and_interval_gaps() {
-    let exact = json!({"version":"3.0","renderer":{"type":"categorized","bidx":[1],
-        "colormap":{"-10":[10,0,0,255],"-2":[20,0,0,255],"0":[30,0,0,255],
-                    "2":[40,0,0,255],"10":[50,0,0,255]}}});
-    for (value, red) in [
-        (-10., 10),
-        (-2., 20),
-        (-0., 30),
-        (0., 30),
-        (2., 40),
-        (10., 50),
-    ] {
-        assert_eq!(pixels(exact.clone(), &[value]), [red, 0, 0, 255]);
-    }
-    for value in [-11., -2.5, 1.5, 11.] {
-        assert_eq!(pixels(exact.clone(), &[value]), [0; 4]);
-    }
-    let intervals = json!({"version":"3.0","renderer":{"type":"pseudocolor","bidx":[1],
-        "colormap":[[[-10,-2],[10,0,0,255]],[[0,2],[20,0,0,255]],[[2,10],[30,0,0,255]]]}});
-    for (value, red) in [
-        (-10., 10),
-        (-2.5, 10),
-        (-0., 20),
-        (1.5, 20),
-        (2., 30),
-        (9.5, 30),
-    ] {
-        assert_eq!(pixels(intervals.clone(), &[value]), [red, 0, 0, 255]);
-    }
-    for value in [-11., -2., -1., 10., 11.] {
-        assert_eq!(pixels(intervals.clone(), &[value]), [0; 4]);
-    }
-}
-
-#[test]
-fn expression_and_transparent_range_keep_invalid_pixels_transparent() {
-    let style = json!({"version":"3.0","renderer":{"type":"gray","expression":"(b2-b1)/(b2+b1)"},"stretch":{"method":"linear","rescale":[[-1,1]],"range_policy":"transparent"}});
-    assert_eq!(pixels(style.clone(), &[1., 3.]), [191, 191, 191, 255]);
-    assert_eq!(pixels(style.clone(), &[-1., 1.]), [0, 0, 0, 0]);
-    assert_eq!(pixels(style, &[-1., 3.]), [0, 0, 0, 0]);
 }
 
 #[test]
@@ -164,38 +78,6 @@ async fn compile_cache_separates_protocol_options() {
         .await
         .unwrap();
     assert!(std::sync::Arc::ptr_eq(&x, &z));
-}
-
-#[test]
-fn rgb_expression_solid_invert_and_extreme_ranges() {
-    assert_eq!(
-        pixels(
-            json!({"version":"3.0","renderer":{"type":"rgb","expression":"b3;b2;b1"}}),
-            &[10., 20., 30.]
-        ),
-        [30, 20, 10, 255]
-    );
-    assert_eq!(
-        pixels(
-            json!({"version":"3.0","renderer":{"type":"single_color","bidx":[1],"color":"#ff000080"},"opacity":0.5}),
-            &[0.]
-        ),
-        [255, 0, 0, 64]
-    );
-    assert_eq!(
-        pixels(
-            json!({"version":"3.0","renderer":{"type":"gray","bidx":[1],"renderer_invert":true}}),
-            &[0.]
-        ),
-        [255, 255, 255, 255]
-    );
-    assert_eq!(
-        pixels(
-            json!({"version":"3.0","renderer":{"type":"gray","bidx":[1]},"stretch":{"method":"linear","rescale":[[-1e308,1e308]]}}),
-            &[0.]
-        ),
-        [128, 128, 128, 255]
-    );
 }
 
 #[test]

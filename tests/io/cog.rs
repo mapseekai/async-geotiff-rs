@@ -1,3 +1,4 @@
+//! Public integration tests for src/io/cog.rs.
 use async_geotiff::io::CogReader;
 use object_store::local::LocalFileSystem;
 use std::sync::Arc;

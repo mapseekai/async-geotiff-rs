@@ -279,3 +279,24 @@ async fn cancelled_blocking_job_retains_memory_gate_until_actual_exit() {
     .await
     .unwrap();
 }
+
+#[test]
+fn reservations_are_shared_and_released_only_after_last_owner() {
+    let budget = WorkBudget::new(100);
+    let lease = budget.try_reserve(70).unwrap();
+    assert!(budget.clone().try_reserve(31).is_err());
+    let retained = lease.clone();
+    drop(lease);
+    assert_eq!(budget.used_bytes(), 70);
+    drop(retained);
+    assert_eq!(budget.used_bytes(), 0);
+    assert!(budget.try_reserve(100).is_ok());
+    assert_eq!(budget.peak_bytes(), 100);
+}
+
+#[test]
+fn oversized_and_overflowing_requests_fail_without_charging() {
+    let budget = WorkBudget::new(100);
+    assert!(budget.try_reserve(u64::MAX).is_err());
+    assert_eq!(budget.used_bytes(), 0);
+}

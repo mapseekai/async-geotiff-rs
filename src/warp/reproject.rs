@@ -830,5 +830,5 @@ fn resize_bands<T: bytemuck::Pod + Default + Send + Sync>(
 }
 
 #[cfg(test)]
-#[path = "reproject_tests.rs"]
+#[path = "reproject_test.rs"]
 mod tests;

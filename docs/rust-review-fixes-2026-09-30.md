@@ -20,9 +20,9 @@
 
 ## 规范与职责划分
 
-- `io/cog.rs` 保留 reader facade；block/prefetch 放入私有 `cog_blocks.rs`，测试放入 `cog_tests.rs`。搬迁 helper 的函数体保持原语义。
-- `style/raster.rs` 保留执行和热循环；协议适配放入私有 `raster/compiler.rs`，提取输入及颜色编译 helper；测试放入 `raster/tests.rs`。
-- warp 提取共享控制网格及精确足迹角点计算，测试放入 `reproject_tests.rs`；保留原有 native pixel 性能优化及对应测试。
+- `io/cog.rs` 保留 reader facade；block/prefetch 放入私有 `cog_blocks.rs`。测试归属整理后，私有测试位于 `io/cog.rs` 内，公开 API 测试位于 `tests/io/cog.rs`。搬迁 helper 的函数体保持原语义。
+- `style/raster.rs` 保留执行和热循环；协议适配放入私有 `raster/compiler.rs`，提取输入及颜色编译 helper；私有测试位于源码内，协议与渲染集成测试分别位于 `tests/style/params.rs` 和 `tests/render/pipeline.rs`。
+- warp 提取共享控制网格及精确足迹角点计算，测试放入 `reproject_test.rs`；保留原有 native pixel 性能优化及对应测试。
 - 修正 PixelData 的 planar `(bands,H,W)`、非连续 stride 说明；更新 STAC 分页和预算文档。没有进行无依据的全局重命名或增加 renderer trait。
 
 ## STAC 兼容性
