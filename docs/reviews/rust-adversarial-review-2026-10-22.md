@@ -60,6 +60,10 @@ I/O、Mosaic、STAC 和渲染/数值两个独立复核均为 READY。渲染复�
 
 修复仅为该示例设置 `recursion_limit = "256"`，保持运行逻辑与最低 Rust 版本不变；本机 Rust 1.92 的对应 mosaic 配置检查通过。Rust 1.99 的三处 `fetch_update` 弃用提示保留，以兼容当前 1.92 最低版本。后续完整矩阵与文档构建结果见修复提交的 Actions 记录。
 
+随后 `3bf97af` 的全 feature 编译暴露出 `tests/tiler.rs` 和 `tests/style/statistics.rs` 两个独立测试 crate 的相同深度限制；其他四组配置已通过测试。[全 feature 日志](https://github.com/mapseekai/async-geotiff-rs/actions/runs/39795008951/job/119880021573)。为这两个目标补充相同编译设置，保留全部测试逻辑。运行中还观察到 Ubuntu Azure 软件源的大包下载中断和长时间重试，不能将这种环境耗时计为源码失败。
+
+补齐设置后，本机使用与 CI 相同的 Rust 1.99.1 执行 `cargo +1.99.1 check --locked --all-targets --all-features`、`test --locked --all-targets --all-features` 和 `test --locked --doc --all-features`，均通过：382 项全目标测试、5 项文档测试，零失败，2 项既有大型影像测试忽略。日志保存在上述临时目录的 `rust-1.99.1-*.log` 中。
+
 
 ## 审查过程与覆盖
 

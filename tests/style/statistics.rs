@@ -1,4 +1,7 @@
 //! Public integration tests for src/style/statistics.rs through Tiler.
+// Full-feature Tiler futures exceed Rust 1.99's default layout-query depth.
+#![recursion_limit = "256"]
+
 #[path = "../support/fixtures.rs"]
 mod fixtures;
 
