@@ -1,6 +1,9 @@
 //! Bounded loopback workload. Run through scripts/run_load_audit.py to record RSS.
 //! Synthetic fixtures and local timings do not represent production capacity.
 
+// The nested mosaic workload exceeds the default layout-query depth on newer Rust.
+#![recursion_limit = "256"]
+
 #[cfg(not(feature = "mosaic"))]
 fn main() {
     eprintln!("load_audit requires --features mosaic");

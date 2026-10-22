@@ -54,6 +54,12 @@ I/O、Mosaic、STAC 和渲染/数值两个独立复核均为 READY。渲染复�
 
 以上修复验证不包含生产网络、浏览器视觉、release 配置、长时间压测、专项性能对比或远端 CI；后续远端结果以对应提交的 GitHub Actions 运行记录为准。Multica 连接不可用，修复证据保留在本地报告，未同步外部工单。
 
+### 公开仓库后的 CI 补充
+
+全部工作区变更提交为 `b51a1cc` 后，首轮 Linux CI 使用 Rust 1.99.1，在 `load_audit` 示例的 async 类型布局检查中超过默认递归深度，导致 `cargo check --all-targets` 失败。[失败运行](https://github.com/mapseekai/async-geotiff-rs/actions/runs/39792981110)。本机 `stable` 为 Rust 1.92.0，因此前述本地通过不能覆盖此编译器差异。
+
+修复仅为该示例设置 `recursion_limit = "256"`，保持运行逻辑与最低 Rust 版本不变；本机 Rust 1.92 的对应 mosaic 配置检查通过。Rust 1.99 的三处 `fetch_update` 弃用提示保留，以兼容当前 1.92 最低版本。后续完整矩阵与文档构建结果见修复提交的 Actions 记录。
+
 
 ## 审查过程与覆盖
 
