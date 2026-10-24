@@ -48,16 +48,22 @@ fn invalid(message: &'static str) -> Error {
         source: message.into(),
     }
 }
-/// Preserve overload classification through object_store/async-tiff wrappers.
+/// Preserve request-control errors through object_store/async-tiff wrappers.
 pub(crate) fn resource_error(
     error: &(dyn std::error::Error + 'static),
 ) -> Option<crate::error::AgError> {
+    use crate::error::AgError;
+
     let mut current = Some(error);
     while let Some(error) = current {
-        if let Some(crate::error::AgError::ResourceLimit(message)) =
-            error.downcast_ref::<crate::error::AgError>()
-        {
-            return Some(crate::error::AgError::ResourceLimit(message.clone()));
+        match error.downcast_ref::<AgError>() {
+            Some(AgError::ResourceLimit(message)) => {
+                return Some(AgError::ResourceLimit(message.clone()));
+            }
+            Some(AgError::Overloaded) => return Some(AgError::Overloaded),
+            Some(AgError::DeadlineExceeded) => return Some(AgError::DeadlineExceeded),
+            Some(AgError::Cancelled) => return Some(AgError::Cancelled),
+            _ => {}
         }
         current = error.source();
     }
@@ -381,6 +387,31 @@ pub(crate) async fn preflight_ifd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_control_errors_survive_object_store_wrappers() {
+        use crate::error::AgError;
+
+        for error in [
+            AgError::ResourceLimit("budget exhausted".into()),
+            AgError::Overloaded,
+            AgError::DeadlineExceeded,
+            AgError::Cancelled,
+        ] {
+            let kind = std::mem::discriminant(&error);
+            let message = error.to_string();
+            let wrapped = Error::Generic {
+                store: "test",
+                source: Box::new(error),
+            };
+            let recovered = resource_error(&wrapped).expect("request classification was lost");
+            assert_eq!(std::mem::discriminant(&recovered), kind);
+            assert_eq!(recovered.to_string(), message);
+            let recovered = into_ag_error(wrapped);
+            assert_eq!(std::mem::discriminant(&recovered), kind);
+            assert_eq!(recovered.to_string(), message);
+        }
+    }
 
     #[tokio::test]
     async fn bounded_response_moves_extensions_and_preserves_file_range() {

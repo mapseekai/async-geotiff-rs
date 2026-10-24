@@ -243,6 +243,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn asset_open_preserves_request_control_errors() {
+        for error in [
+            AgError::Overloaded,
+            AgError::DeadlineExceeded,
+            AgError::Cancelled,
+        ] {
+            for http in [false, true] {
+                let recovered =
+                    open_error("https://example.com/data.tif?token=secret", http, &error);
+                assert_eq!(
+                    std::mem::discriminant(&recovered),
+                    std::mem::discriminant(&error)
+                );
+                assert_eq!(recovered.to_string(), error.to_string());
+            }
+        }
+    }
+
+    #[test]
     fn http_open_error_redacts_credentials_and_normalized_transport_urls() {
         for (input, expected) in [
             ("https://audit-user:audit-password@example.com/x.tif", "https://example.com/x.tif"),

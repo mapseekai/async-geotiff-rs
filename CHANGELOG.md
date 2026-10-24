@@ -22,6 +22,8 @@ called out explicitly under a **⚠️ BREAKING** marker.
 
 ### Fixed
 
+- Preserve deadline, cancellation and overload errors through TIFF/snapshot
+  wrappers and mosaic asset opening instead of reporting generic HTTP 500s.
 - Validate independent TIFF mask grids, metadata budgets and conditional
   snapshot reads; avoid mixing pixels from changing objects.
 - Correct polar reprojection coverage and WGS84 bounds, including footprints
