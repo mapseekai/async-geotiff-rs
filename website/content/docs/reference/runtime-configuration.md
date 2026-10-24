@@ -44,6 +44,10 @@ Once the request deadline is reached, it takes precedence over a ready response
 or transport error, including during the initial lazy dataset open. Transport
 errors observed before that deadline keep their existing status.
 
+Deadline, cancellation and overload classifications are preserved through
+mosaic asset opening and wrapped TIFF errors: they return 504, 408 and 503
+respectively, while ordinary HTTP asset errors still use redacted diagnostics.
+
 Prefetch tuning applies to both single-COG entrypoints. Mosaic asset readers
 keep their existing prefetch default of zero; the server does not expose a
 Mosaic prefetch setting.

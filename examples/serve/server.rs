@@ -1296,8 +1296,14 @@ mod tests {
         wait_until(|| tasks.iter().all(|task| task.is_finished())).await;
         for task in tasks {
             let response = task.await.unwrap();
-            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-            assert_eq!(response.text().await.unwrap(), "request deadline exceeded");
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::GATEWAY_TIMEOUT,
+                "{source:?}, attach_first={attach_first}: {body}"
+            );
+            assert_eq!(body, "request deadline exceeded");
         }
         wait_until(|| state.requests.available_permits() == 128).await;
         assert_eq!(state.request_slots.available_permits(), 128);
