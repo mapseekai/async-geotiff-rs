@@ -56,7 +56,7 @@ Q3 请求示例：
 
 MapLibre 的 Source 选择 mosaic 后可以配置阶段和排序通道。资产地址仍由服务端固定，
 JSON/Q3 不携带资产列表。新格式要求显式 mosaic 配置；源 Alpha 波段暂不支持，返回能力错误。
-完整支持范围见[样式指南](../styling/)。
+完整支持范围见[样式指南](/zh/docs/guides/styling/)。
 
 ## 像元选择 {#selection}
 

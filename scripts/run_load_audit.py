@@ -2,7 +2,7 @@
 
 Build separately so compiler memory does not contaminate the workload's peak RSS:
   cargo build --release --locked --example load_audit --features mosaic
-  python3 scripts/run_load_audit.py --output docs/audit-load-results.json
+  python3 scripts/run_load_audit.py --output target/load-audit/results.json
 """
 
 import argparse
@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--profile", default="release")
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--output", type=Path, default=Path("docs/audit-load-results.json"))
+    parser.add_argument("--output", type=Path, default=Path("target/load-audit/results.json"))
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     os.chdir(root)

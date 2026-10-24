@@ -1,9 +1,0 @@
-.git
-.worktrees
-.superpowers
-data
-target
-website/public
-website/resources
-website/.hugo_cache
-website/.hugo_build.lock

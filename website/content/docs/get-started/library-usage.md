@@ -4,26 +4,24 @@ description: Open a COG and render a tile directly from Rust.
 weight: 30
 ---
 
-The repository currently sets `publish = false`, so another local project uses
-a path dependency while developing. Create the application next to the clone,
-then replace the relative path if your directories differ:
+Add the crates.io dependency to your application:
 
 ```bash
-# Starting inside the async-geotiff-rs checkout:
-cd ..
 cargo new async-geotiff-demo
 cd async-geotiff-demo
 ```
 
 ```toml
 [dependencies]
-async-geotiff = { path = "../async-geotiff-rs" }
+async-geotiff = "0.13.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 To avoid the system `libproj` dependency while retaining the mosaic APIs used
 by the example server, set `default-features = false, features = ["mosaic"]` on
-the path dependency. General CRS transformations will then be unavailable.
+the dependency. General CRS transformations will then be unavailable.
+For local development, replace the version with
+`path = "../async-geotiff-rs"`, adjusting the path to your checkout.
 
 ## Render one tile {#render-one-tile}
 

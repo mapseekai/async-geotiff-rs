@@ -1,9 +1,15 @@
-name: Release private crate
+name: Release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_to_crates_io:
+        description: Publish the selected version tag to crates.io
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,9 +26,12 @@ jobs:
 
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev pkg-config libsqlite3-dev sqlite3 libtiff-dev libcurl4-openssl-dev
 
       - name: Install Rust 1.92.0
         run: rustup toolchain install 1.92.0 --profile minimal
@@ -37,7 +46,7 @@ jobs:
               python3 -c 'import json, sys; packages = json.load(sys.stdin)["packages"]; assert len(packages) == 1; print(packages[0]["version"])'
           )"
           expected_tag="v${version}"
-          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
             printf 'Tag %s does not match Cargo.toml version %s (expected %s).\n' "${GITHUB_REF_NAME}" "${version}" "${expected_tag}" >&2
             exit 1
           fi
@@ -46,13 +55,27 @@ jobs:
           printf 'artifact=%s\n' "${artifact}" >> "${GITHUB_OUTPUT}"
 
       - name: Test all features
-        run: cargo +1.92.0 test --all-features --locked
+        run: |
+          cargo +1.92.0 test --all-features --locked --all-targets
+          cargo +1.92.0 test --all-features --locked --doc
+          node --test examples/*.test.cjs
 
       - name: Package source crate
         run: |
           set -euo pipefail
-          cargo +1.92.0 package --locked
+          cargo +1.92.0 publish --dry-run --locked
           test -f "${{ steps.package.outputs.artifact }}"
+
+      - name: Publish to crates.io
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_to_crates_io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo "Set the CARGO_REGISTRY_TOKEN repository secret before publishing." >&2
+            exit 1
+          fi
+          cargo +1.92.0 publish --locked
 
       - name: Create or update GitHub Release
         env:

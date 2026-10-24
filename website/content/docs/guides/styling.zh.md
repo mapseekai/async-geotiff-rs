@@ -151,7 +151,7 @@ before_channels 的排序位置对应去重后按源波段号升序排列的依�
 在合并后执行一次。源 Alpha 波段限制仍适用。
 
 资产列表由 MosaicJSON、STAC 或自定义 MosaicSource 提供，保持在样式之外。
-配置、资源限制与示例见[镶嵌指南](../mosaics/)。
+配置、资源限制与示例见[镶嵌指南](/zh/docs/guides/mosaics/)。
 
 ## 迁移
 

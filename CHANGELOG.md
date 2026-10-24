@@ -5,11 +5,52 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-While the version is `0.0.x` the public API is unstable; **breaking changes
-can land in any release** and are called out explicitly under a
-**⚠️ BREAKING** marker.
+Before 1.0, breaking public API changes increment the minor version and are
+called out explicitly under a **⚠️ BREAKING** marker.
 
 ## [Unreleased]
+
+## [0.13.0] - 2026-10-24
+
+### ⚠️ BREAKING
+
+- Custom STAC HTTP configuration now uses
+  `StacSource::with_http_client_builder` with a reqwest 0.11 `ClientBuilder`.
+  The old built-client constructor returns an error because it cannot enforce
+  same-origin redirects. The builder retains authentication, explicit proxy
+  and timeout settings while enforcing the source redirect policy.
+
+### Fixed
+
+- Validate independent TIFF mask grids, metadata budgets and conditional
+  snapshot reads; avoid mixing pixels from changing objects.
+- Correct polar reprojection coverage and WGS84 bounds, including footprints
+  containing a pole. Validate tile coordinates before dispatch.
+- Apply CubicSpline on exactly aligned grids and keep masks and halo pixels
+  consistent between direct tiles and warp/render calls.
+- Make default point queries follow Alpha-to-mask band visibility, including
+  reordered ExtraSamples and independent masks.
+- Preserve finite extreme values in Average and convolution resampling;
+  accumulate histogram counts without overflowing and handle the 100% endpoint.
+- Pass request limits, timeouts and prefetch settings through local dataset,
+  MosaicJSON and STAC server paths. Preserve admission until CPU work drains.
+- Bound STAC pagination and response metadata; reject unsafe redirects and omit
+  URL credentials, queries and fragments from HTTP asset error diagnostics.
+
+### Changed
+
+- Prepare the first crates.io distribution with explicit package contents,
+  repository/documentation metadata, the MIT license text and docs.rs settings
+  that avoid the native PROJ dependency.
+- Replace yanked transitive lockfile versions with compatible patches:
+  `chacha20` 0.10.2 and `spin` 0.9.9.
+- Update the release workflow to verify the packaged crate, offer explicit
+  crates.io publishing, and trigger the documentation deployment after release.
+- Remove historical reports, benchmark output and the unused Docker ignore
+  file from the current source tree. Keep runtime guidance in the bilingual
+  website, reproducible tests/fixtures, the resampler benchmark and load tool.
+- Document public APIs and refresh English/Chinese installation, migration,
+  operational limits and release instructions.
 
 ## [0.12.0] - 2026-10-19
 
@@ -495,7 +536,9 @@ can land in any release** and are called out explicitly under a
 - PNG output; example axum server with MapLibre / OpenLayers / Leaflet
   viewers and a local `data/*.tif` dataset picker.
 
-[Unreleased]: https://github.com/mapseekai/async-geotiff-rs/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/mapseekai/async-geotiff-rs/compare/v0.13.0...HEAD
+
+[0.13.0]: https://github.com/mapseekai/async-geotiff-rs/releases/tag/v0.13.0
 
 [0.12.0]: https://github.com/mapseekai/async-geotiff-rs/releases/tag/v0.12.0
 

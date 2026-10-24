@@ -47,7 +47,7 @@ HTTP API 属于 `examples/serve.rs`，不会进入库本身的依赖表面。
 或 [Mosaic 1.0.0](https://mapseekai.github.io/raster-style/extensions/raster/mosaic/v1.0.0/schema.json)
 Schema URL。旧的瓦片与镶嵌短参数一律拒绝。
 
-原始 Q3 中 `+` 必须编码为 `%2B`；不能先解码后直接拼接。样式语义与限制见[样式指南](../../guides/styling/)。
+原始 Q3 中 `+` 必须编码为 `%2B`；不能先解码后直接拼接。样式语义与限制见[样式指南](/zh/docs/guides/styling/)。
 
 ## 响应 {#responses}
 

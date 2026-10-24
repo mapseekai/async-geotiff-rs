@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`src/` holds COG reading/caching (`io/`), reprojection (`warp/`), rendering (`render/`), Raster Style validation (`style/`), and mosaics (`mosaic/`). Keep HTTP serving in `examples/serve.rs` and `examples/serve/server.rs`; viewers live in `examples/*.html`. Tests/fixtures belong in `tests/`, benchmarks in `benches/`, technical reports in `docs/`, load-audit tooling in `scripts/`, and bilingual Hugo documentation in `website/`.
+`src/` holds COG reading/caching (`io/`), reprojection (`warp/`), rendering (`render/`), Raster Style validation (`style/`), and mosaics (`mosaic/`). Keep HTTP serving in `examples/serve.rs` and `examples/serve/server.rs`; viewers live in `examples/*.html`. Tests/fixtures belong in `tests/`, benchmarks in `benches/`, load-audit tooling in `scripts/`, and bilingual Hugo documentation in `website/`. Keep generated audit reports under ignored `target/load-audit/`; do not check historical analysis artifacts into the source tree.
 
 ## Build, Test, and Development Commands
 

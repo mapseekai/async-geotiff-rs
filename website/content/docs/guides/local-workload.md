@@ -1,10 +1,17 @@
-# Reproducible local workload
+---
+title: Local workload and benchmarks
+description: Reproduce bounded latency and peak RSS measurements without external services.
+weight: 50
+---
+
+Run these tools from the Git checkout on macOS or Linux. They are development
+tools and do not run when an application depends on this crate.
 
 Build the optimized binary separately from measurement:
 
 ```sh
 cargo build --release --locked --example load_audit --features mosaic
-python3 scripts/run_load_audit.py --samples 32 --concurrency 4 --output docs/audit-load-c4.json
+python3 scripts/run_load_audit.py --samples 32 --concurrency 4 --output target/load-audit/results.json
 ```
 
 Repeat with concurrency 1 or 8 and a different output filename. The wrapper
@@ -54,3 +61,14 @@ These are bounded synthetic measurements on one machine. They do not establish
 production capacity, an adversarial codec memory bound, or behavior under an
 unbounded request stream. Fixture regeneration uses Python's standard library;
 Deflate bytes also depend on the installed zlib implementation.
+
+## Resampler microbenchmark {#resampler}
+
+```sh
+cargo bench --locked --bench resampler_bench
+```
+
+The six cases compare contiguous and strided bilinear sampling, each with and
+without a mask, plus masked and unmasked Average downsampling. This measures
+kernel cost, not HTTP latency or cross-CRS pipeline throughput. Criterion is
+a development dependency and is not a dependency of library consumers.

@@ -32,17 +32,21 @@ The site pins OINK in `go.mod` and `go.sum`. Do not commit generated
 ## Continuous integration
 
 `.github/workflows/docs.yml` runs the same strict production build and uploads
-`public/` as the `async-geotiff-docs` workflow artifact. The repository is
-private and its current GitHub plan does not support Pages, so CI validates and
-packages the site but does not deploy it. Publishing requires making the
-repository public, enabling private-repository Pages on the organization, or
-deploying the artifact to another host.
+`public/` as the `async-geotiff-docs` workflow artifact. The repository is public;
+production documentation is hosted on Cloudflare Pages.
 
 ## Cloudflare Pages releases
 
 `.github/workflows/cloudflare-pages.yml` deploys `website/public` to
-<https://async-geotiff-rs.pages.dev/> whenever a GitHub Release is published.
+<https://async-geotiff-rs.pages.dev/> after the `Release` workflow succeeds,
+or when a GitHub Release is published manually. The completion trigger also
+covers releases created with `GITHUB_TOKEN`, whose release event does not
+trigger another workflow. The deployed source is the successful release's
+exact commit. Manual deployment remains available through `workflow_dispatch`.
 Before the first release, add the repository secret `CLOUDFLARE_API_TOKEN` with
 the minimum Cloudflare permission **Account → Cloudflare Pages → Edit**. The
 workflow passes the account and project IDs explicitly and never stores the
 token in the repository.
+
+See the bilingual [release guide](content/docs/reference/releases.md) for
+package verification and crates.io publication.

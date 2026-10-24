@@ -2,7 +2,7 @@ sections: [hero, cards, cta]
 
 hero:
   align: center
-  eyebrow: 纯 Rust 地理空间基础设施
+  eyebrow: async-geotiff 0.13 · Raster Style 3.0
   title_lines:
     - words: [{ text: 云端栅格， }]
     - words: [{ text: 快速生成 XYZ 瓦片。 }]
@@ -10,6 +10,7 @@ hero:
   actions:
     - { label: 快速开始, url: docs/get-started/, icon: fa-solid fa-rocket, style: primary }
     - { label: 查看 GitHub, url: 'https://github.com/mapseekai/async-geotiff-rs', icon: fa-brands fa-github, style: ghost }
+    - { label: API 文档, url: 'https://docs.rs/async-geotiff', icon: fa-solid fa-code, style: ghost }
 
 cards:
   eyebrow: 从字节到地图瓦片
