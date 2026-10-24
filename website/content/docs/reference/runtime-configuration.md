@@ -40,6 +40,9 @@ a cancelled HTTP request. Increasing the HTTP settings also increases the
 effective library settings; no additional fixed 64-request admission cap or
 30-second total request deadline is retained. Transport connection/read
 timeouts remain independent. Excess requests return 503 and expired requests return 504.
+Once the request deadline is reached, it takes precedence over a ready response
+or transport error, including during the initial lazy dataset open. Transport
+errors observed before that deadline keep their existing status.
 
 Prefetch tuning applies to both single-COG entrypoints. Mosaic asset readers
 keep their existing prefetch default of zero; the server does not expose a

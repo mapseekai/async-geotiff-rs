@@ -394,9 +394,11 @@ async fn request_admission(
     let Ok(_permit) = state.request_slots.clone().try_acquire_owned() else {
         return error_response(AgError::Overloaded);
     };
+    let started = tokio::time::Instant::now();
     match tokio::time::timeout(state.request_timeout, next.run(request)).await {
-        Ok(response) => response,
-        Err(_) => error_response(AgError::DeadlineExceeded),
+        // Tokio can return an already-ready response before polling its expired timer.
+        Ok(response) if started.elapsed() < state.request_timeout => response,
+        _ => error_response(AgError::DeadlineExceeded),
     }
 }
 
@@ -1050,6 +1052,70 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         TestServer { base, task }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_admission_checks_deadline_before_returning_ready_response() {
+        async fn call_app(
+            mut app: impl axum::ServiceExt<
+                axum::extract::Request,
+                Response = Response,
+                Error = std::convert::Infallible,
+            >,
+        ) -> Response {
+            app.call(axum::extract::Request::new(Body::empty()))
+                .await
+                .unwrap()
+        }
+
+        for elapsed in [59, 60, 61] {
+            for status in [StatusCode::OK, StatusCode::INTERNAL_SERVER_ERROR] {
+                let state = AppState::new(
+                    None,
+                    None,
+                    vec![],
+                    "http://127.0.0.1",
+                    Arc::new(BlockCache::new(Default::default())),
+                )
+                .with_request_tuning(1, Duration::from_secs(60));
+                let app = Router::new()
+                    .route(
+                        "/",
+                        get(move || async move {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            status
+                        }),
+                    )
+                    .route_layer(axum::middleware::from_fn_with_state(
+                        state.clone(),
+                        request_admission,
+                    ));
+                let request = call_app(app);
+                tokio::pin!(request);
+                assert!(futures_util::poll!(&mut request).is_pending());
+                tokio::time::advance(Duration::from_secs(elapsed)).await;
+                let response = request.await;
+                let expected = if elapsed < 60 {
+                    status
+                } else {
+                    StatusCode::GATEWAY_TIMEOUT
+                };
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "elapsed={elapsed}, status={status}"
+                );
+                if elapsed >= 60 {
+                    assert_eq!(response.headers()["cache-control"], "no-store");
+                    assert_eq!(response.headers()["access-control-allow-origin"], "*");
+                    let body = axum::body::to_bytes(response.into_body(), 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(body, "request deadline exceeded");
+                }
+                assert_eq!(state.request_slots.available_permits(), 1);
+            }
+        }
     }
 
     #[derive(Clone, Default)]
