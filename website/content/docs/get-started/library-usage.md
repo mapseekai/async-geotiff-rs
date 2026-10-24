@@ -67,6 +67,31 @@ server, without the leading `?`. Save the example as `src/main.rs`, then run
 `cargo run`. The pinned URL is a small, range-capable test COG; replace it
 after verifying the integration.
 
+## Point queries and geographic bounds {#point-and-bounds}
+
+`CogReader::point(x, y, &coord_crs, bidx)` returns a nearest-pixel value without
+rendering. Coordinates use `coord_crs`; a point outside the image returns `None`.
+Band indices are one-based and refer to the bands returned by `read_window`.
+An empty selection returns all of those bands in their existing order.
+
+When no independent TIFF mask is present, the first Alpha sample is promoted
+to the validity mask and removed from the returned bands. Thus ordinary RGBA
+data exposes RGB to point queries. With an independent mask, the reader keeps
+its native bands and uses that mask instead. A masked pixel returns
+`Some(PointValue { valid: false, .. })`, rather than a band-selection error.
+Raster Style's separate restriction on Alpha sources still applies to rendering.
+
+`wgs84_bounds()` gives the geographic envelope used for dataset statistics.
+When a projected footprint contains a pole, the envelope includes that pole
+and spans `[-180, 180]` longitude. An envelope can include space outside the
+actual image; query pixels or use their validity mask to determine coverage.
+
+The low-level `io::stats::Histogram::quantile` API accepts public `u64` bin counts and
+accumulates them without `u64` overflow, including directly constructed
+histograms. The 100th percentile is the upper edge of the last nonempty bin,
+excluding trailing empty bins even when their preceding counts are very large.
+These embedded histograms are not the statistics used by Raster Style.
+
 ## Share memory and CPU budgets {#shared-budgets}
 
 For multiple COGs, create one block cache and give every reader a stable,

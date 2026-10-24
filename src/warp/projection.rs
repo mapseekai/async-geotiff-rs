@@ -21,6 +21,7 @@ use crate::crs::Crs;
 use crate::error::{AgError, AgResult};
 
 #[cfg(feature = "proj")]
+/// A synchronous PROJ transformation with normalized `(x, y)` axis order.
 pub struct Projector {
     inner: proj::Proj,
     src: Crs,
@@ -29,6 +30,7 @@ pub struct Projector {
 
 #[cfg(feature = "proj")]
 impl Projector {
+    /// Construct a transformation, returning an error for an unsupported CRS pair.
     pub fn new(src: &Crs, dst: &Crs) -> AgResult<Self> {
         let inner = proj::Proj::new_known_crs(src.as_str(), dst.as_str(), None)
             .map_err(|e| AgError::Warp(format!("proj init {src}->{dst}: {e}")))?;
@@ -60,9 +62,11 @@ impl Projector {
         })
     }
 
+    /// Source CRS used when constructing the transformation.
     pub fn src(&self) -> &Crs {
         &self.src
     }
+    /// Destination CRS used when constructing the transformation.
     pub fn dst(&self) -> &Crs {
         &self.dst
     }
@@ -163,6 +167,8 @@ pub(crate) fn is_epsg(crs: &Crs, code: u32) -> bool {
 /// projection edges rather than assuming their extrema occur at corners.
 /// Longitude discontinuities produce a broad envelope rather than a wrapped
 /// bbox, so callers using a single rectangle do not discard either side.
+/// A projected footprint containing a geographic pole also includes that
+/// interior latitude extremum and the full longitude range.
 pub(crate) fn reproject_boundary(
     corners: [(f64, f64); 4],
     from: &Crs,
@@ -198,7 +204,82 @@ pub(crate) fn reproject_boundary(
             "boundary has no projectable points".into(),
         ));
     }
+    if is_epsg(to, 4326) && from != to {
+        include_enclosed_poles(&corners, from, to, &mut bounds)?;
+    }
     Ok(bounds)
+}
+
+fn include_enclosed_poles(
+    corners: &[(f64, f64); 4],
+    from: &Crs,
+    geographic: &Crs,
+    bounds: &mut crate::bounds::Bbox,
+) -> AgResult<()> {
+    // Geographic/cylindrical CRSs represent a pole at distinct longitudes.
+    // Only treat it as an interior singularity if those meridians collapse
+    // to one finite source point; a Mercator pole is not projectable at all.
+    let mut poles = [
+        (0.0, -90.0),
+        (90.0, -90.0),
+        (180.0, -90.0),
+        (-90.0, -90.0),
+        (0.0, 90.0),
+        (90.0, 90.0),
+        (180.0, 90.0),
+        (-90.0, 90.0),
+    ];
+    convert_batch_partial(geographic, from, &mut poles)?;
+    for (meridians, latitude) in poles.chunks_exact(4).zip([-90.0, 90.0]) {
+        let pole = meridians[0];
+        let tolerance = 32.0 * f64::EPSILON * pole.0.abs().max(pole.1.abs()).max(1.0);
+        let collapsed = meridians.iter().all(|&(x, y)| {
+            x.is_finite()
+                && y.is_finite()
+                && (x - pole.0).abs() <= tolerance
+                && (y - pole.1).abs() <= tolerance
+        });
+        if collapsed && quadrilateral_contains(corners, pole) {
+            bounds.xmin = -180.0;
+            bounds.xmax = 180.0;
+            bounds.ymin = bounds.ymin.min(latitude);
+            bounds.ymax = bounds.ymax.max(latitude);
+        }
+    }
+    Ok(())
+}
+
+fn quadrilateral_contains(corners: &[(f64, f64); 4], point: (f64, f64)) -> bool {
+    // Callers supply affine raster footprints or rectangle corners, both
+    // convex. Normalize about the point to avoid overflow in cross products.
+    let offsets = corners.map(|(x, y)| (x - point.0, y - point.1));
+    if offsets
+        .iter()
+        .any(|&(x, y)| !x.is_finite() || !y.is_finite())
+    {
+        return false;
+    }
+    let scale = offsets
+        .iter()
+        .flat_map(|&(x, y)| [x.abs(), y.abs()])
+        .fold(0.0, f64::max);
+    if !scale.is_finite() || scale == 0.0 {
+        return false;
+    }
+    let normalized = offsets.map(|(x, y)| (x / scale, y / scale));
+    let (mut positive, mut negative) = (false, false);
+    for edge in 0..4 {
+        let a = normalized[edge];
+        let b = normalized[(edge + 1) % 4];
+        let (left, right) = (a.0 * b.1, a.1 * b.0);
+        let cross = left - right;
+        // Scale the rounding tolerance to this edge's products, not the whole
+        // footprint, so a narrow but nondegenerate raster still contains points.
+        let tolerance = 8.0 * f64::EPSILON * (left.abs() + right.abs());
+        positive |= cross > tolerance;
+        negative |= cross < -tolerance;
+    }
+    positive != negative
 }
 
 /// Preserve projectable points when only part of a grid is outside the CRS
@@ -229,6 +310,7 @@ pub(crate) fn convert_batch_partial(
 }
 
 #[cfg(not(feature = "proj"))]
+/// Return an unsupported-feature error; cached PROJ transforms require `proj`.
 pub fn with_cached<R>(
     _src: &Crs,
     _dst: &Crs,
@@ -238,15 +320,18 @@ pub fn with_cached<R>(
 }
 
 #[cfg(not(feature = "proj"))]
+/// Placeholder for a PROJ transformation when the `proj` feature is disabled.
 pub struct Projector {
     _private: (),
 }
 
 #[cfg(not(feature = "proj"))]
 impl Projector {
+    /// Return an unsupported-feature error because PROJ is unavailable.
     pub fn new(_src: &Crs, _dst: &Crs) -> AgResult<Self> {
         Err(AgError::Warp("crate built without `proj` feature".into()))
     }
+    /// Return an unsupported-feature error because PROJ is unavailable.
     pub fn convert(&self, _pts: &mut [(f64, f64)]) -> AgResult<()> {
         Err(AgError::Warp("crate built without `proj` feature".into()))
     }
@@ -300,6 +385,66 @@ mod tests {
         )
         .unwrap();
         assert!(bbox.ymin < -3_323_160.0, "{}", bbox.ymin);
+    }
+
+    #[test]
+    fn geographic_bounds_include_enclosed_north_and_south_poles() {
+        let square = [(-1e6, -1e6), (1e6, -1e6), (1e6, 1e6), (-1e6, 1e6)];
+        let rotated = [(0.0, -1e6), (1e6, 0.0), (0.0, 1e6), (-1e6, 0.0)];
+        let pole_on_edge = [(0.0, -1e6), (1e6, -1e6), (1e6, 1e6), (0.0, 1e6)];
+        let pole_on_corner = [(0.0, 0.0), (1e6, 0.0), (1e6, 1e6), (0.0, 1e6)];
+        for footprint in [square, rotated, pole_on_edge, pole_on_corner] {
+            for (epsg, pole, offset) in [
+                (3413, 90.0, 0.0),
+                (3031, -90.0, 0.0),
+                // UPS uses a 2,000 km false easting and false northing.
+                (32661, 90.0, 2e6),
+                (32761, -90.0, 2e6),
+            ] {
+                let corners = footprint.map(|(x, y)| (x + offset, y + offset));
+                let bounds =
+                    reproject_boundary(corners, &Crs::epsg(epsg), &Crs::epsg(4326)).unwrap();
+                assert_eq!((bounds.xmin, bounds.xmax), (-180.0, 180.0));
+                if pole > 0.0 {
+                    assert_eq!(bounds.ymax, pole);
+                    assert!(bounds.ymin > 70.0);
+                } else {
+                    assert_eq!(bounds.ymin, pole);
+                    assert!(bounds.ymax < -70.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn geographic_bounds_do_not_add_poles_outside_the_actual_footprint() {
+        let square = [(1e6, 1e6), (2e6, 1e6), (2e6, 2e6), (1e6, 2e6)];
+        // Its axis-aligned envelope includes (0,0), but the diamond does not.
+        let rotated = [
+            (1.1e6, -0.4e6),
+            (2.6e6, 1.1e6),
+            (1.1e6, 2.6e6),
+            (-0.4e6, 1.1e6),
+        ];
+        for corners in [square, rotated] {
+            for epsg in [3413, 3031] {
+                let bounds =
+                    reproject_boundary(corners, &Crs::epsg(epsg), &Crs::epsg(4326)).unwrap();
+                assert!(
+                    bounds.ymin > -90.0 && bounds.ymax < 90.0,
+                    "{epsg}: {bounds:?}"
+                );
+                assert!(bounds.width() < 360.0, "{epsg}: {bounds:?}");
+            }
+        }
+        // Geographic axes keep distinct longitude coordinates at the pole.
+        let bounds = reproject_boundary(
+            [(-10.0, 80.0), (10.0, 80.0), (10.0, 90.0), (-10.0, 90.0)],
+            &Crs::new("OGC:CRS84"),
+            &Crs::epsg(4326),
+        )
+        .unwrap();
+        assert_eq!((bounds.xmin, bounds.xmax), (-10.0, 10.0));
     }
 
     #[test]

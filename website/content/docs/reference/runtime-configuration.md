@@ -13,7 +13,9 @@ contracts, not global library configuration.
 | `ASYNC_GEOTIFF_BLOCK_CACHE_MB` | `512` | Shared decoded-block cache capacity in MiB; must be positive. |
 | `ASYNC_GEOTIFF_MAX_DECODE_TASKS` | available parallelism | Maximum concurrent decode/stitch CPU jobs; must be positive. |
 | `ASYNC_GEOTIFF_MAX_TILE_TASKS` | available parallelism | Maximum concurrent tile warp/render CPU jobs; must be positive. |
-| `ASYNC_GEOTIFF_PREFETCH_RING` | `1` | Number of native-block rings prefetched around a read; `0` disables it. |
+| `ASYNC_GEOTIFF_MAX_IN_FLIGHT_REQUESTS` | `64` | Shared tile request admission limit; must be positive. |
+| `ASYNC_GEOTIFF_REQUEST_TIMEOUT_MS` | `30000` | Tile request timeout, including dataset lookup/opening; must be positive. |
+| `ASYNC_GEOTIFF_PREFETCH_RING` | `1` | Native-block rings prefetched for default/local single-COG readers; `0` disables it. |
 | `ASYNC_GEOTIFF_SLOW_TILE_MS` | unset | Emit a slow-tile warning above this positive millisecond threshold. |
 | `ASYNC_GEOTIFF_MOSAIC` | unset | Path to a MosaicJSON file loaded at startup. |
 | `ASYNC_GEOTIFF_STAC_URL` | unset | Fixed STAC API URL; requires the `stac` feature and the next two variables. |
@@ -30,6 +32,23 @@ process-wide CPU cap. The command-line default COG uses separate limiters;
 lazily selected local datasets share one limiter sized to the larger value;
 mosaics own their own limiter. The example server does not expose environment
 variables for `MosaicConfig` fields such as `max_assets_per_tile`.
+
+The request admission limit and timeout apply to the command-line default COG,
+lazy `?dataset=` selections, MosaicJSON and STAC tiles. These paths share the
+configured library admission limiter, including when running CPU work outlives
+a cancelled HTTP request. Increasing the HTTP settings also increases the
+effective library settings; no additional fixed 64-request admission cap or
+30-second total request deadline is retained. Transport connection/read
+timeouts remain independent. Excess requests return 503 and expired requests return 504.
+
+Prefetch tuning applies to both single-COG entrypoints. Mosaic asset readers
+keep their existing prefetch default of zero; the server does not expose a
+Mosaic prefetch setting.
+
+HTTP mosaic asset errors omit URL userinfo, query strings and fragments from
+their diagnostic labels. Store-backed object keys retain their existing key
+semantics. Keep source credentials in server-side configuration; tile callers
+do not need the original asset URL.
 
 ## Example {#example}
 

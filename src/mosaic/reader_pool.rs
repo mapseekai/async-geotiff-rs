@@ -33,16 +33,39 @@ pub enum Backend {
     Store(Arc<dyn ObjectStore>),
 }
 
-/// Strip the query string from a URL for error messages and logs: presigned
-/// URLs and `?token=…` style auth carry live credentials that must not leak
-/// into log lines or error strings (which often end up in HTTP responses).
-/// Object keys have no query component, so this is a no-op for store mode.
-pub(crate) fn redact_query(addr: &str) -> &str {
-    &addr[..addr.find('?').unwrap_or(addr.len())]
+fn redact_http_url(addr: &str) -> String {
+    let Ok(mut url) = url::Url::parse(addr) else {
+        return "<invalid HTTP URL>".into();
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.set_password(None).is_err()
+        || url.set_username("").is_err()
+    {
+        return "<invalid HTTP URL>".into();
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    url.into()
+}
+
+fn open_error(key: &str, http: bool, error: &AgError) -> AgError {
+    if let Some(resource) = crate::io::snapshot::resource_error(error) {
+        return resource;
+    }
+    if http {
+        // Transport errors can contain normalized URLs that literal replacement misses.
+        AgError::Mosaic(format!(
+            "open asset {}: HTTP asset open failed",
+            redact_http_url(key)
+        ))
+    } else {
+        AgError::Mosaic(format!("open asset {key}: {error}"))
+    }
 }
 
 static NEXT_POOL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[derive(Clone)]
 pub struct ReaderPool {
     work_budget: crate::resource::WorkBudget,
     namespace: u64,
@@ -210,14 +233,7 @@ impl ReaderPool {
             })
             .await
             .map_err(|e: Arc<AgError>| {
-                if let Some(resource) = crate::io::snapshot::resource_error(e.as_ref()) {
-                    return resource;
-                }
-                AgError::Mosaic(format!(
-                    "open asset {}: {}",
-                    redact_query(key),
-                    e.to_string().replace(key, redact_query(key))
-                ))
+                open_error(key, matches!(self.backend, Backend::Http), e.as_ref())
             })
     }
 }
@@ -227,15 +243,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redact_query_strips_credentials() {
-        assert_eq!(
-            redact_query("https://h/x.tif?X-Amz-Signature=s3cr3t"),
-            "https://h/x.tif"
+    fn http_open_error_redacts_credentials_and_normalized_transport_urls() {
+        for (input, expected) in [
+            ("https://audit-user:audit-password@example.com/x.tif", "https://example.com/x.tif"),
+            ("https://example.com/x.tif?token=audit-query", "https://example.com/x.tif"),
+            ("https://audit-user:audit-password@example.com/x.tif?token=audit-query#audit-fragment", "https://example.com/x.tif"),
+            ("https://audit%2Duser:audit%2Dpassword@example.com/x.tif", "https://example.com/x.tif"),
+        ] {
+            assert_eq!(redact_http_url(input), expected);
+            assert_eq!(open_error(input, true, &AgError::Tiff(input.into())).to_string(),
+                format!("mosaic: open asset {expected}: HTTP asset open failed"));
+        }
+        let key = "https://audit-user:audit-password@EXAMPLE.com:443/a/../x.tif?token=audit-query#audit-fragment";
+        assert_eq!(redact_http_url(key), "https://example.com/x.tif");
+        let normalized = url::Url::parse(key).unwrap().to_string();
+        assert_ne!(normalized, key);
+        let inner = AgError::Mosaic(format!("request failed at {normalized}"));
+        let error = open_error(key, true, &inner);
+        for text in [error.to_string(), format!("{error:?}")] {
+            for secret in [
+                "audit-user",
+                "audit-password",
+                "audit-query",
+                "audit-fragment",
+            ] {
+                assert!(!text.contains(secret), "credential leaked: {text}");
+            }
+            assert!(text.contains("https://example.com/x.tif"));
+        }
+        for invalid in ["", "?token=audit-query", "https://audit-password@[bad"] {
+            assert_eq!(redact_http_url(invalid), "<invalid HTTP URL>");
+        }
+        let limit = open_error(
+            key,
+            true,
+            &AgError::ResourceLimit("budget exhausted".into()),
         );
-        assert_eq!(redact_query("https://h/x.tif"), "https://h/x.tif");
-        assert_eq!(redact_query("scenes/a.tif"), "scenes/a.tif");
-        assert_eq!(redact_query(""), "");
-        assert_eq!(redact_query("?token=t"), "");
+        assert!(matches!(limit, AgError::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn store_open_errors_preserve_object_key_semantics() {
+        let key = "scenes/a?not-a-query#not-a-fragment.tif";
+        let error = open_error(key, false, &AgError::Tiff("missing object".into()));
+        assert!(error.to_string().contains(key));
+        assert!(error.to_string().contains("missing object"));
     }
 
     #[tokio::test]
@@ -280,17 +332,26 @@ mod tests {
 
     #[tokio::test]
     async fn default_policy_blocks_loopback_asset() {
+        use futures::FutureExt;
+
         // Default pool policy must reject a loopback asset URL (SSRF guard)
         // before ever attempting to connect, as a redacted Mosaic error.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/x.tif?X-Amz-Signature=s3cr3t",
+            listener.local_addr().unwrap()
+        );
         let pool = ReaderPool::builder(8).build();
-        let msg = match pool
-            .get_or_open("http://127.0.0.1:9000/x.tif?X-Amz-Signature=s3cr3t", "n")
-            .await
-        {
-            Err(e) => e.to_string(),
+        let msg = match pool.get_or_open(&url, "n").await {
+            Err(AgError::Mosaic(msg)) => msg,
+            Err(other) => panic!("expected a redacted Mosaic error, got {other}"),
             Ok(_) => panic!("loopback asset must be rejected by default policy"),
         };
-        assert!(msg.contains("blocked"), "expected policy rejection: {msg}");
+        assert!(
+            listener.accept().now_or_never().is_none(),
+            "blocked asset reached the listener"
+        );
+        assert!(msg.contains("HTTP asset open failed"));
         assert!(!msg.contains("s3cr3t"), "credentials leaked: {msg}");
     }
 

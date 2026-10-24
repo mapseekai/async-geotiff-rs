@@ -14,6 +14,8 @@ use serde_json::Value;
 use stac_client::Client;
 use std::collections::{HashMap, HashSet};
 
+/// Discovers COG assets through a fixed STAC API using bounded, same-origin pagination.
+/// Returned assets preserve server order; repeated asset URLs keep their first priority.
 #[derive(Clone, Debug)]
 pub struct StacSource {
     http: Option<reqwest_stac::Client>,

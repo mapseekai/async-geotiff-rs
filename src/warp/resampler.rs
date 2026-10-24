@@ -2,10 +2,13 @@
 
 use ndarray::ArrayView2;
 
+/// Sampling kernels used when reading or reprojecting a raster grid.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Resampling {
+    /// Select the closest source pixel without interpolating its value.
     #[default]
     Nearest,
+    /// Interpolate the four surrounding pixels with linear weights.
     Bilinear,
     /// Catmull-Rom bicubic (4-tap). Sharper than bilinear, sharper than
     /// Mitchell, default for most XYZ tile servers.
@@ -26,6 +29,7 @@ pub enum Resampling {
 }
 
 impl Resampling {
+    /// Parse a lowercase kernel name; aliases are `bicubic`, `cubicspline`, and `lanczos3`.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "nearest" => Some(Self::Nearest),
@@ -50,7 +54,7 @@ impl Resampling {
         self.sample_masked(view, None, col, row, fill)
     }
 
-    /// Like [`sample`] but skips invalid neighbours and renormalizes weights.
+    /// Like [`Self::sample`] but skips invalid neighbours and renormalizes weights.
     /// Cubic/Lanczos retain signed weights, including negative total support.
     /// Zero total support or a non-finite result returns `fill`.
     #[inline]
@@ -85,13 +89,12 @@ impl Resampling {
         let contig = view.as_slice();
         let get = |r: usize, c: usize| -> f64 {
             match contig {
-                // SAFETY: `ArrayView2::as_slice()` only returns `Some` for
-                // standard contiguous layout, so physical row stride equals
-                // logical width. Callers derive `r`/`c` from `rf`/`cf`, which
-                // are clamped to `[0, h-1]` / `[0, w-1]`, so `r*w_us + c` is
-                // always `< h*w == s.len()`.
                 Some(s) => {
                     debug_assert!(view.is_standard_layout());
+                    // SAFETY: `as_slice()` requires standard contiguous layout,
+                    // so physical row stride equals logical width. Callers clamp
+                    // `r`/`c` to `[0, h-1]` / `[0, w-1]`, making `r*w_us + c`
+                    // strictly less than `h*w == s.len()`.
                     unsafe { *s.get_unchecked(r * w_us + c) }
                 }
                 None => view[[r, c]],
@@ -132,29 +135,20 @@ impl Resampling {
                         _ => 0.0,
                     }
                 };
-                let mut sum = 0.0;
-                let mut total = 0.0;
-                for y in (rf.floor() as i64 - radius + 1)..=(rf.floor() as i64 + radius) {
-                    for x in (cf.floor() as i64 - radius + 1)..=(cf.floor() as i64 + radius) {
-                        let r = y.clamp(0, h - 1) as usize;
-                        let c = x.clamp(0, w - 1) as usize;
-                        if valid.is_some_and(|m| !m[[r, c]]) {
-                            continue;
-                        }
-                        let k = weight(cf - x as f64) * weight(rf - y as f64);
-                        if k == 0.0 {
-                            continue;
-                        }
-                        sum += k * get(r, c);
-                        total += k;
-                    }
-                }
-                let value = sum / total;
-                if total != 0.0 && value.is_finite() {
-                    value
-                } else {
-                    fill
-                }
+                let samples = ((rf.floor() as i64 - radius + 1)..=(rf.floor() as i64 + radius))
+                    .flat_map(|y| {
+                        ((cf.floor() as i64 - radius + 1)..=(cf.floor() as i64 + radius))
+                            .filter_map(move |x| {
+                                let r = y.clamp(0, h - 1) as usize;
+                                let c = x.clamp(0, w - 1) as usize;
+                                if valid.is_some_and(|m| !m[[r, c]]) {
+                                    return None;
+                                }
+                                let k = weight(cf - x as f64) * weight(rf - y as f64);
+                                (k != 0.0).then(|| (get(r, c), k))
+                            })
+                    });
+                convolution_mean(samples, fill)
             }
             Self::Bilinear => {
                 let c0 = cf.floor() as usize;
@@ -547,6 +541,38 @@ fn weighted_mean(sum: f64, total: f64, fill: f64) -> f64 {
     }
 }
 
+fn convolution_mean(samples: impl Iterator<Item = (f64, f64)> + Clone, fill: f64) -> f64 {
+    let (mut sum, mut total, mut scale) = (0.0, 0.0, 1.0);
+    for (value, weight) in samples.clone() {
+        add_weighted_sum(&mut sum, &mut total, &mut scale, value, weight);
+    }
+    if total == 0.0 || !sum.is_finite() {
+        return fill;
+    }
+    let mean = sum / total;
+    if mean.is_finite() {
+        return mean;
+    }
+
+    // Rounding the scaled sum/divisor can overflow even for a constant MAX
+    // field. Retry in units of the largest sample so constant fields have an
+    // exact normalized mean of +/-1. Unlike positive-weight averages, signed
+    // kernels may truly overshoot MAX; preserve that failure instead of clamping.
+    let largest = samples
+        .clone()
+        .map(|(value, _)| value.abs())
+        .fold(0.0, f64::max);
+    let (sum, total) = samples.fold((0.0, 0.0), |(sum, total), (value, weight)| {
+        (sum + (value / largest) * weight, total + weight)
+    });
+    let mean = (sum / total) * largest;
+    if mean.is_finite() {
+        mean
+    } else {
+        fill
+    }
+}
+
 fn point_in_footprint((x, y): (f64, f64), corners: &[(f64, f64); 4]) -> bool {
     let mut inside = false;
     for i in 0..4 {
@@ -622,6 +648,35 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
     use ndarray::array;
+
+    #[test]
+    fn convolution_preserves_extreme_finite_values_and_cancellation() {
+        for kernel in [
+            Resampling::Cubic,
+            Resampling::CubicSpline,
+            Resampling::Lanczos,
+        ] {
+            for expected in [f64::MAX, -f64::MAX] {
+                let values = ndarray::Array2::from_elem((4, 4), expected);
+                let mask = ndarray::Array2::from_shape_fn((4, 4), |(r, c)| (r + c) % 2 == 0);
+                for (col, row) in [
+                    (1.5, 1.5),
+                    (1.0 + 1.0 / 137.0, 1.0 + 1.0 / 139.0),
+                    (0.0, 0.0),
+                ] {
+                    for valid in [None, Some(mask.view())] {
+                        let value = kernel.sample_masked(values.view(), valid, col, row, f64::NAN);
+                        assert!(value.is_finite(), "{kernel:?}, {col},{row}");
+                        assert_relative_eq!(value, expected, max_relative = 1e-14);
+                    }
+                }
+            }
+            let values = array![[f64::MAX, f64::MAX, -f64::MAX, -f64::MAX]];
+            let value = kernel.sample(values.view(), 1.5, 0.0, f64::NAN);
+            assert!(value.is_finite(), "{kernel:?}");
+            assert_relative_eq!(value, 0.0, epsilon = 1e293);
+        }
+    }
 
     #[test]
     fn signed_kernel_support_preserves_valid_samples_and_rejects_zero_support() {

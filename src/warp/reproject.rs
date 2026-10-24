@@ -49,6 +49,12 @@ fn row_src_coords(
     out
 }
 
+/// Reproject all source bands onto a destination rectangle and pixel grid.
+///
+/// Sampling excludes invalid source pixels. Output pixels without valid support
+/// or with unprojectable coordinates are marked invalid. Returns an error for
+/// malformed grids, unsupported CRS transformations, or requests exceeding the
+/// active resource budget.
 pub fn warp(
     src: &ImageData,
     dst_crs: &Crs,
@@ -1125,6 +1131,47 @@ mod tests {
         let out = warp(&src, &src.crs, src.bbox, 1, 1, Resampling::Average).unwrap();
         assert_eq!(out.pixels.to_f64()[[0, 0, 0]], 1e308);
         assert!(out.mask.unwrap()[[0, 0]]);
+    }
+
+    #[test]
+    fn convolution_warp_keeps_extreme_finite_samples_valid() {
+        for kernel in [
+            Resampling::Cubic,
+            Resampling::CubicSpline,
+            Resampling::Lanczos,
+        ] {
+            for value in [f64::MAX, -f64::MAX] {
+                let mut src = dummy_src(Crs::epsg(3857));
+                src.pixels = PixelData::F64(Array3::from_elem((1, 4, 4), value));
+                let out = warp(&src, &src.crs, src.bbox, 1, 1, kernel).unwrap();
+                assert!(out.mask.unwrap()[[0, 0]], "{kernel:?}, {value}");
+                approx::assert_relative_eq!(
+                    out.pixels.to_f64()[[0, 0, 0]],
+                    value,
+                    max_relative = 1e-14
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn convolution_warp_rejects_true_signed_overflow() {
+        for kernel in [Resampling::Cubic, Resampling::Lanczos] {
+            for sign in [-1.0, 1.0] {
+                let mut src = dummy_src(Crs::epsg(3857));
+                src.pixels = PixelData::F64(Array3::from_shape_fn((1, 4, 4), |(_, _, c)| {
+                    sign * if c == 1 || c == 2 {
+                        f64::MAX
+                    } else {
+                        -f64::MAX
+                    }
+                }));
+                // Negative lobes subtract negative MAX values, so the true
+                // interpolated magnitude exceeds MAX despite finite inputs.
+                let out = warp(&src, &src.crs, src.bbox, 1, 1, kernel).unwrap();
+                assert!(!out.mask.unwrap()[[0, 0]], "{kernel:?}, sign {sign}");
+            }
+        }
     }
 
     #[test]

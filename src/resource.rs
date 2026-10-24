@@ -22,6 +22,12 @@ struct State {
     requests: Arc<RwLock<()>>,
 }
 
+/// Byte allowance shared by clones for active buffers and retained reader metadata.
+///
+/// Reservations remain charged until their last handle is dropped, including
+/// after request cancellation while blocking work is still running. Cache
+/// residency and completed images owned by callers have separate lifetimes and
+/// are not covered by this allowance.
 #[derive(Clone, Debug)]
 pub struct WorkBudget(Arc<State>);
 
@@ -43,6 +49,8 @@ struct Lease {
 }
 
 impl WorkBudget {
+    /// Create an independent allowance with an exact byte limit.
+    /// A zero limit permits only zero-byte reservations; it does not disable checks.
     pub fn new(limit_bytes: u64) -> Self {
         Self(Arc::new(State {
             limit: limit_bytes,
@@ -99,16 +107,26 @@ impl WorkBudget {
         GLOBAL.get_or_init(|| Self::new(512 * 1024 * 1024)).clone()
     }
 
+    /// Return the fixed byte limit shared by all clones of this budget.
     pub fn limit_bytes(&self) -> u64 {
         self.0.limit
     }
+    /// Snapshot bytes held by live reservations, including retained reader metadata.
     pub fn used_bytes(&self) -> u64 {
         self.0.used.load(Ordering::Relaxed)
     }
+    /// Snapshot the highest reserved byte total since this budget was created.
     pub fn peak_bytes(&self) -> u64 {
         self.0.peak.load(Ordering::Relaxed)
     }
 
+    /// Reserve bytes immediately without waiting. Cloning the returned handle
+    /// retains the same charge; the final handle's drop releases it.
+    ///
+    /// # Errors
+    /// Returns [`AgError::ResourceLimit`] when the request exceeds the currently
+    /// available allowance or the total cannot be represented. No bytes are
+    /// reserved on failure.
     pub fn try_reserve(&self, bytes: u64) -> AgResult<WorkReservation> {
         let previous = self
             .0
@@ -137,6 +155,7 @@ impl Drop for Lease {
 }
 
 impl WorkReservation {
+    /// Return this reservation's byte charge, shared rather than multiplied by clones.
     pub fn bytes(&self) -> u64 {
         self.0.bytes
     }

@@ -13,12 +13,19 @@ use std::{collections::HashSet, sync::OnceLock};
 /// Zero `max_assets` disables only the count limit; byte/page limits still apply.
 #[derive(Clone, Debug)]
 pub struct DiscoveryOptions {
+    /// Maximum unique assets, default 64; zero disables the count limit only.
     pub max_assets: usize,
+    /// Maximum retained asset/pagination metadata bytes, default 8 MiB.
     pub max_asset_bytes: usize,
+    /// Maximum bytes in one STAC response body, default 1 MiB.
     pub max_response_bytes: usize,
+    /// Maximum cumulative STAC response bytes per discovery, default 8 MiB.
     pub max_total_response_bytes: usize,
+    /// Maximum STAC pages followed per discovery, default 128.
     pub max_pages: usize,
+    /// Shared allowance for active discovery buffers and retained asset metadata.
     pub work_budget: WorkBudget,
+    /// Shared permit pool for blocking discovery planning and parsing.
     pub cpu_limiter: CpuLimiter,
 }
 
@@ -45,12 +52,17 @@ pub struct DiscoveredAssets {
 }
 
 impl DiscoveredAssets {
+    /// Borrow assets in their retained paint order without releasing accounting.
     pub fn assets(&self) -> &[AssetRef] {
         &self.assets
     }
+    /// Take the assets and release their discovery reservations.
+    /// The returned allocation is owned and accounted for by the caller.
     pub fn into_assets(self) -> Vec<AssetRef> {
         self.assets
     }
+    /// Deduplicate by URL, preserve first paint priority and apply discovery limits.
+    /// This checks already materialized input; it cannot bound the caller's allocation.
     pub fn from_assets(assets: Vec<AssetRef>, options: &DiscoveryOptions) -> AgResult<Self> {
         let mut builder = AssetDiscovery::new(options.clone());
         for asset in assets {

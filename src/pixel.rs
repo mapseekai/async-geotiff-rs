@@ -8,24 +8,34 @@ use ndarray::{Array2, Array3};
 /// interleave selected channels when producing encoded image bytes.
 #[derive(Debug, Clone)]
 pub enum PixelData {
+    /// Unsigned 8-bit samples in `(bands, height, width)` order.
     U8(Array3<u8>),
+    /// Unsigned 16-bit samples in `(bands, height, width)` order.
     U16(Array3<u16>),
+    /// Signed 16-bit samples in `(bands, height, width)` order.
     I16(Array3<i16>),
+    /// Unsigned 32-bit samples in `(bands, height, width)` order.
     U32(Array3<u32>),
+    /// Signed 32-bit samples in `(bands, height, width)` order.
     I32(Array3<i32>),
+    /// 32-bit floating-point samples in `(bands, height, width)` order.
     F32(Array3<f32>),
+    /// 64-bit floating-point samples in `(bands, height, width)` order.
     F64(Array3<f64>),
 }
 
 impl PixelData {
+    /// Number of sample bands (the first array axis).
     pub fn bands(&self) -> usize {
         self.shape()[0]
     }
 
+    /// Number of pixel rows (the second array axis).
     pub fn height(&self) -> usize {
         self.shape()[1]
     }
 
+    /// Number of pixel columns (the third array axis).
     pub fn width(&self) -> usize {
         self.shape()[2]
     }
@@ -141,11 +151,18 @@ impl PixelData {
 /// The single data-bearing type passed between io → warp → render.
 #[derive(Debug, Clone)]
 pub struct ImageData {
+    /// Planar sample array. Readers preserve raw values; SCALE/OFFSET is not applied.
     pub pixels: PixelData,
-    pub mask: Option<Array2<bool>>, // true = valid
+    /// Optional `(height, width)` validity mask on the same grid as `pixels`.
+    /// `true` means valid; `None` imposes no mask, though `nodata` still applies.
+    pub mask: Option<Array2<bool>>,
+    /// Axis-aligned extent of this image in `crs` coordinates.
     pub bbox: Bbox,
+    /// Coordinate reference system for `bbox` and `transform`.
     pub crs: Crs,
+    /// Maps pixel-corner coordinates on this image's grid into `crs` coordinates.
     pub transform: GeoTransform,
+    /// Optional raw-sample marker for invalid pixels, before SCALE/OFFSET.
     pub nodata: Option<f64>,
 }
 

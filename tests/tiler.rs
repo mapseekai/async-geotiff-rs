@@ -145,6 +145,123 @@ async fn passthrough_uses_the_destination_grid() {
     assert!((image.bbox.ymin + 90.0).abs() < 1e-12);
 }
 
+#[tokio::test]
+async fn aligned_spline_tiles_keep_convolution_and_halo() {
+    use async_geotiff::{
+        pixel::PixelData,
+        render::render,
+        style::compile,
+        tms::Tms,
+        warp::{warp, Resampling},
+    };
+
+    // Reuse the larger checked-in raster with a grid matching 64px tiles at
+    // zoom 5. Its right/bottom neighbours make a missing halo observable.
+    let mut halo_fixture = include_bytes!("fixtures/rgb_uint16_statistics.tif").to_vec();
+    let ifd = fixtures::u32_at(&halo_fixture, 4) as usize;
+    let entries = u16::from_le_bytes(halo_fixture[ifd..ifd + 2].try_into().unwrap()) as usize;
+    for index in 0..entries {
+        let entry = ifd + 2 + 12 * index;
+        let tag = u16::from_le_bytes(halo_fixture[entry..entry + 2].try_into().unwrap());
+        let offset = fixtures::u32_at(&halo_fixture, entry + 8) as usize;
+        let values: &[f64] = match tag {
+            33550 => &[180.0 / 32.0 / 64.0, 180.0 / 32.0 / 64.0, 0.0],
+            33922 => &[0.0, 0.0, 0.0, -180.0, 90.0, 0.0],
+            _ => continue,
+        };
+        for (i, value) in values.iter().enumerate() {
+            halo_fixture[offset + 8 * i..offset + 8 * (i + 1)]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    let style = TileStyle::from_json(r#"{
+        "version":"3.0","renderer":{"type":"gray","bidx":[1]},
+        "resampling":{"read":"cubic_spline","reproject":"cubic_spline"},
+        "extensions":["https://mapseekai.github.io/raster-style/extensions/raster/tile/v1.0.0/schema.json"],
+        "raster:tile":{"tilesize":64}
+    }"#).unwrap();
+    for (bytes, z, read_size) in [(world_fixture(0.0, None), 0, 64), (halo_fixture, 5, 128)] {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(&ObjectPath::from("a"), bytes.into())
+            .await
+            .unwrap();
+        let reader = Arc::new(CogReader::open_object_store(store, "a").await.unwrap());
+        let mut source = reader
+            .read_window(0, 0, 0, read_size, read_size)
+            .await
+            .unwrap()
+            .as_ref()
+            .clone();
+        // Match the style's dependency set and its F64 interpolation precision.
+        source.pixels = PixelData::F64(source.pixels.band_to_f64(0).insert_axis(ndarray::Axis(0)));
+        let tiler = Tiler::new(reader);
+        let coord = TileCoord { z, ..coord() };
+        let tms = Tms::cached(coord.tms).unwrap();
+        let reference = warp(
+            &source,
+            &tms.crs(),
+            tms.tile_bbox(coord.z, coord.x, coord.y).unwrap(),
+            64,
+            64,
+            Resampling::CubicSpline,
+        )
+        .unwrap();
+        let expected = render(&reference, &compile(&style).unwrap()).unwrap();
+        let actual = tiler.tile(coord, &style).await.unwrap().unwrap();
+        let warped = tiler.warp_tile(coord, &style).await.unwrap().unwrap();
+        let actual = image::load_from_memory(&actual).unwrap().into_rgba8();
+        let expected = image::load_from_memory(&expected).unwrap().into_rgba8();
+        for (x, y, pixel) in actual.enumerate_pixels() {
+            assert_eq!(pixel, expected.get_pixel(x, y), "zoom {z}, pixel {x},{y}");
+        }
+        let warped_render = render(&warped, &compile(&style).unwrap()).unwrap();
+        let warped_render = image::load_from_memory(&warped_render)
+            .unwrap()
+            .into_rgba8();
+        for (x, y, pixel) in actual.enumerate_pixels() {
+            assert_eq!(
+                pixel,
+                warped_render.get_pixel(x, y),
+                "tile/warp zoom {z}, pixel {x},{y}"
+            );
+        }
+        assert_eq!(warped.mask, reference.mask, "zoom {z}");
+        for (actual, expected) in warped
+            .pixels
+            .to_f64()
+            .iter()
+            .zip(reference.pixels.to_f64().iter())
+        {
+            approx::assert_relative_eq!(actual, expected, epsilon = 1e-9, max_relative = 1e-12);
+        }
+    }
+}
+
+#[cfg(feature = "proj")]
+#[tokio::test]
+async fn polar_dataset_bounds_include_the_interior_pole() {
+    for (epsg, expected_pole) in [(3413, 90.0), (3031, -90.0)] {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("polar"),
+                fixtures::georeferenced_fixture(epsg, [-1e6, -1e6, 1e6, 1e6], Some([200; 3]))
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let reader = Arc::new(CogReader::open_object_store(store, "polar").await.unwrap());
+        let bounds = Tiler::new(reader.clone()).wgs84_bounds().unwrap();
+        assert_eq!(bounds, reader.wgs84_bounds().unwrap());
+        assert_eq!((bounds[0], bounds[2]), (-180.0, 180.0));
+        assert_eq!(
+            bounds[if expected_pole > 0.0 { 3 } else { 1 }],
+            expected_pole
+        );
+    }
+}
+
 #[test]
 fn cancelled_decode_keeps_admission_until_job_exits() {
     use async_geotiff::{

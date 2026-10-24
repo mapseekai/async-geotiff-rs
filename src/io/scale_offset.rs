@@ -50,7 +50,9 @@ fn items(xml: &str) -> Vec<(String, usize, String)> {
 /// Per-band GDAL SCALE/OFFSET pair: `physical = raw * scale + offset`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScaleOffset {
+    /// Raw-sample multiplier; missing metadata defaults to `1.0`.
     pub scale: f64,
+    /// Value added after scaling; missing metadata defaults to `0.0`.
     pub offset: f64,
 }
 
@@ -66,6 +68,7 @@ impl ScaleOffset {
         raw * self.scale + self.offset
     }
 
+    /// Test exact equality with scale `1.0` and offset `0.0` (no tolerance).
     pub fn is_identity(self) -> bool {
         self == Self::IDENTITY
     }

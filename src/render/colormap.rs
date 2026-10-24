@@ -26,6 +26,10 @@ const TERRAIN_STOPS: &[(f64, [f64; 4])] = &[
     (1.00, [1.0, 1.0, 1.0, 1.0]),
 ];
 
+/// Build an opaque 256-entry color map, matching its name case-insensitively.
+///
+/// Supports viridis, magma, inferno, plasma, cividis, turbo, greys and terrain.
+/// Unknown names return [`AgError::UnknownColormap`].
 pub fn builtin_lut(name: &str) -> AgResult<Lut> {
     if name.eq_ignore_ascii_case("terrain") {
         return Ok(std::array::from_fn(|i| {

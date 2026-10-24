@@ -80,6 +80,18 @@ HTTP admission and timeout include dataset lookup/opening. Library callers that
 open a `CogReader` directly outside a tile request should apply their own outer
 timeout when an application deadline must include that initial open.
 
+The server passes the configured timeout and a shared library request limiter
+to default, lazy local, MosaicJSON and STAC tile paths. Raising the HTTP values
+does not leave an additional fixed 30-second total request deadline or 64-request
+admission cap. Transport connection/read timeouts remain independent. Running
+CPU work retains its library admission until it drains after HTTP cancellation.
+`ASYNC_GEOTIFF_PREFETCH_RING` applies to default and lazy local single-COG
+readers; mosaic asset readers retain their zero-prefetch default.
+
+HTTP mosaic asset error labels remove URL userinfo, query strings and fragments,
+including when opening is rejected by the access policy. Store-backed asset
+keys retain their existing semantics; they are not interpreted as HTTP URLs.
+
 ## Mosaic ordering and selected bands
 
 MosaicJSON assets retain their listed paint order during deduplication. Prefix

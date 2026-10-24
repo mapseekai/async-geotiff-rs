@@ -19,7 +19,9 @@ use std::time::Duration;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
+/// Default total tiler request deadline, including I/O and queued CPU work: 30 seconds.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Capacity of the process-wide admission pool used by default tilers and mosaics.
 pub const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
 tokio::task_local! {
@@ -29,16 +31,23 @@ tokio::task_local! {
 }
 
 /// Shared admission limit. Defaults share a process-wide pool of 64 requests.
+///
+/// Clones share the same pool. Admission rejects excess requests immediately
+/// with [`AgError::Overloaded`]. A cancelled request's running blocking work
+/// retains its permit until that work exits.
 #[derive(Clone, Debug)]
 pub struct RequestLimiter(Arc<Semaphore>);
 
 impl RequestLimiter {
+    /// Create an independent pool, clamping capacity to `1..=Semaphore::MAX_PERMITS`.
+    /// Use [`Default::default`] to join the process-wide pool instead.
     pub fn new(max_in_flight: usize) -> Self {
         Self(Arc::new(Semaphore::new(
             max_in_flight.clamp(1, Semaphore::MAX_PERMITS),
         )))
     }
 
+    /// Snapshot the currently unoccupied capacity, shared by all clones.
     pub fn available_permits(&self) -> usize {
         self.0.available_permits()
     }
@@ -95,7 +104,11 @@ impl Default for RequestLimiter {
     }
 }
 
-/// Caller-controlled cancellation handle. Cancelling any clone cancels them all.
+/// Caller-controlled, one-shot cancellation handle shared by its clones.
+///
+/// The default is a fresh, uncancelled handle. Cancellation stops waiting for
+/// the request and prevents queued work from starting, but cannot interrupt a
+/// synchronous kernel already running; its resources remain held until it exits.
 #[derive(Clone, Debug)]
 pub struct RequestCancellation(watch::Sender<bool>);
 
@@ -106,9 +119,11 @@ impl Default for RequestCancellation {
 }
 
 impl RequestCancellation {
+    /// Permanently cancel this handle and every clone. Repeated calls are harmless.
     pub fn cancel(&self) {
         self.0.send_replace(true);
     }
+    /// Return whether this handle or any clone has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         *self.0.borrow()
     }
@@ -121,7 +136,12 @@ impl RequestCancellation {
 /// Per-call overrides. `timeout: None` uses the tiler configuration.
 #[derive(Clone, Debug, Default)]
 pub struct RequestOptions {
+    /// Override the total request deadline, including I/O, CPU waits and retries.
+    /// `None` uses the tiler's timeout (30 seconds by default); zero expires
+    /// immediately. Durations outside the clock's range return a query error.
     pub timeout: Option<Duration>,
+    /// Shared cancellation for this call. The default is a fresh uncancelled
+    /// handle; cloning these options links cancellation across those calls.
     pub cancellation: RequestCancellation,
 }
 

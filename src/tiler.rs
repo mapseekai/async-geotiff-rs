@@ -24,6 +24,7 @@ use crate::tms::{TileCoord, Tms};
 
 const PASSTHROUGH_PIXEL_TOLERANCE: f64 = 1e-3;
 
+/// Reads a COG and renders requested tile grids with shared resource limits.
 #[derive(Clone)]
 pub struct Tiler {
     reader: Arc<CogReader>,
@@ -39,6 +40,7 @@ pub struct Tiler {
 /// async, while the CPU-heavy work still runs on Tokio's blocking pool.
 #[derive(Clone, Copy, Debug)]
 pub struct TilerConfig {
+    /// Maximum simultaneous blocking warp/render jobs; zero is treated as one.
     pub max_blocking_tasks: usize,
     /// Maximum admitted public requests; excess requests fail immediately.
     pub max_in_flight_requests: usize,
@@ -202,9 +204,15 @@ impl Tiler {
         let res_matches = level_gsd > 0.0 && ((target_gsd - level_gsd).abs() / level_gsd) < 0.01;
         let aligned = same_crs && res_matches;
         let ts = style.tilesize as usize;
+        let kernel = if same_crs {
+            style.resampling
+        } else {
+            style.reproject
+        };
 
-        // L2 passthrough: exact integer-aligned ts×ts window → skip warp.
-        if aligned {
+        // B-splines smooth even at exact pixel centers, so they still need
+        // convolution and the halo below on an otherwise identical grid.
+        if aligned && kernel != crate::warp::resampler::Resampling::CubicSpline {
             if let Some((pc, pr)) = Self::passthrough_window(&level_tr, &dst_bbox, ts) {
                 if let Ok((iw, ih)) = self.reader.level_dimensions(level) {
                     let in_bounds = pc >= 0
@@ -227,11 +235,6 @@ impl Tiler {
             }
         }
 
-        let kernel = if same_crs {
-            style.resampling
-        } else {
-            style.reproject
-        };
         let halo = match kernel {
             crate::warp::resampler::Resampling::Lanczos => 3,
             crate::warp::resampler::Resampling::Cubic

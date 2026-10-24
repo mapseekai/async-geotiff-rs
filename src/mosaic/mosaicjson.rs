@@ -23,61 +23,97 @@ use crate::tms::{TileCoord, TileMatrixSet};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct MosaicJson {
+    /// MosaicJSON specification version; the source accepts `0.0.3`.
     pub mosaicjson: String,
+    /// Optional human-readable mosaic name.
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional description retained from the document.
     #[serde(default)]
     pub description: Option<String>,
+    /// Producer's dataset version, defaulting to `1.0.0`.
     #[serde(default = "default_version")]
     pub version: String,
+    /// Attribution text retained for consuming applications.
     #[serde(default)]
     pub attribution: Option<String>,
+    /// Declared minimum display zoom and default quadkey index zoom.
     pub minzoom: u8,
+    /// Declared maximum display zoom; source lookup also supports other valid tiles.
     pub maxzoom: u8,
+    /// Fixed length of the quadkeys in `tiles`; defaults to `minzoom`.
     #[serde(default)]
     pub quadkey_zoom: Option<u8>,
+    /// WGS84 mosaic extent `[west, south, east, north]`; defaults to the world.
     #[serde(default = "world_bounds")]
     pub bounds: [f64; 4],
+    /// Suggested `[longitude, latitude, zoom]`, discarded if outside the declared bounds.
     #[serde(default)]
     pub center: Option<[f64; 3]>,
+    /// WebMercator quadkeys mapped to assets in paint order, first asset on top.
     pub tiles: HashMap<String, Vec<String>>,
+    /// Producer's asset type hint, retained without changing transport selection.
     #[serde(default)]
     pub asset_type: Option<String>,
+    /// Literal prefix prepended to every asset location during lookup.
     #[serde(default)]
     pub asset_prefix: Option<String>,
+    /// Optional sample type name; unrecognized names are discarded by the source.
     #[serde(default)]
     pub data_type: Option<String>,
+    /// Producer's RGBA color metadata; rendering uses the supplied Raster Style.
     #[serde(default)]
     pub colormap: BTreeMap<String, [f64; 4]>,
+    /// Retained tile matrix metadata; it does not change the WebMercator index.
     #[serde(default)]
     pub tilematrixset: Option<Value>,
+    /// Producer-defined layer metadata, retained without interpretation.
     #[serde(default)]
     pub layers: BTreeMap<String, Value>,
+    /// Unrecognized top-level extension fields retained for callers.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Recognized MosaicJSON sample type hints; these do not override TIFF metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MosaicDataType {
+    /// Signed 8-bit integer samples.
     Int8,
+    /// Signed 16-bit integer samples.
     Int16,
+    /// Signed 32-bit integer samples.
     Int32,
+    /// Signed 64-bit integer samples.
     Int64,
+    /// Unsigned 8-bit integer samples.
     UInt8,
+    /// Unsigned 16-bit integer samples.
     UInt16,
+    /// Unsigned 32-bit integer samples.
     UInt32,
+    /// Unsigned 64-bit integer samples.
     UInt64,
+    /// Half-precision floating-point samples.
     Float16,
+    /// Single-precision floating-point samples.
     Float32,
+    /// Double-precision floating-point samples.
     Float64,
+    /// Complex samples with signed 16-bit integer components.
     CInt16,
+    /// Complex samples with signed 32-bit integer components.
     CInt32,
+    /// Complex samples with single-precision floating-point components.
     CFloat32,
+    /// Complex samples with double-precision floating-point components.
     CFloat64,
+    /// Explicit producer declaration of another sample type.
     Other,
 }
 
 impl MosaicDataType {
+    /// Parse a lowercase MosaicJSON type name, returning `None` for unknown names.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "int8" => Some(Self::Int8),

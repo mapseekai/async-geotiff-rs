@@ -70,6 +70,11 @@ PNG 是默认编码。WebP 要启用 `webp` feature，声明 Tile 1.0.0 扩展�
 普通数值样式支持现有 nearest、bilinear、cubic、cubic_spline、lanczos、average 核。
 每个依赖波段分别重采样并传播有效性；源 Alpha 波段暂不支持，会在读取像元前报错。
 
+`cubic_spline` 在整数像素中心仍会平滑数据。因此，请求瓦片网格与源网格精确对齐时
+也会执行该核，直接瓦片渲染与 warp 路径保持相同重采样语义。Cubic、CubicSpline
+和 Lanczos 对接近数值上限的有限 F64 常量也保持有效，不会因中间计算溢出而变透明。
+实际非有限样本或无法表示的结果仍然无效。
+
 ## 统计拉伸与曲线
 
 支持全部 7 种方法：`none`、`linear`、`minmax`、`percentile`、`stddev`、

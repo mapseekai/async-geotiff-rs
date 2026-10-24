@@ -24,6 +24,9 @@ pub(crate) fn default_blocking_permits() -> usize {
 /// caches under load.
 ///
 /// Cloning is cheap (an `Arc` bump); all clones draw permits from the same pool.
+/// Each default construction creates an independent pool sized to available
+/// parallelism, or four permits if that information is unavailable. Running
+/// blocking jobs retain their permits after request cancellation until they exit.
 ///
 /// **Deadlock-freedom invariant:** a job must never hold one permit while
 /// awaiting a second from the same limiter. Acquire → `spawn_blocking` → drop
@@ -37,8 +40,8 @@ pub(crate) fn default_blocking_permits() -> usize {
 pub struct CpuLimiter(Arc<Semaphore>);
 
 impl CpuLimiter {
-    /// Build a limiter allowing `permits` concurrent blocking jobs (clamped to
-    /// at least 1).
+    /// Build an independent limiter allowing `permits` concurrent blocking jobs,
+    /// clamped to `1..=tokio::sync::Semaphore::MAX_PERMITS`.
     pub fn new(permits: usize) -> Self {
         Self(Arc::new(Semaphore::new(
             permits.clamp(1, Semaphore::MAX_PERMITS),

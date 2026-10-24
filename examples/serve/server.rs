@@ -21,6 +21,7 @@ use async_geotiff::io::{BlockCache, BlockCacheStats, CogReader, ReaderConfig};
 #[cfg(feature = "stac")]
 use async_geotiff::mosaic::StacSource;
 use async_geotiff::mosaic::{MosaicJsonSource, MosaicTiler};
+use async_geotiff::request::{RequestLimiter, RequestOptions};
 use async_geotiff::resource::WorkBudget;
 use async_geotiff::style::{TileFormat, TileStyle};
 use async_geotiff::tiler::{Tiler, TilerConfig};
@@ -156,11 +157,28 @@ pub enum Mosaic {
 }
 
 impl Mosaic {
-    async fn tile(&self, coord: TileCoord, style: &TileStyle) -> AgResult<Option<bytes::Bytes>> {
+    fn with_request_limiter(self, requests: RequestLimiter) -> Self {
         match self {
-            Self::Json(mosaic) => mosaic.tile(coord, style).await,
+            Self::Json(tiler) => Self::Json(Arc::new(
+                tiler.as_ref().clone().with_request_limiter(requests),
+            )),
             #[cfg(feature = "stac")]
-            Self::Stac(mosaic) => mosaic.tile(coord, style).await,
+            Self::Stac(tiler) => Self::Stac(Arc::new(
+                tiler.as_ref().clone().with_request_limiter(requests),
+            )),
+        }
+    }
+
+    async fn tile(
+        &self,
+        coord: TileCoord,
+        style: &TileStyle,
+        options: &RequestOptions,
+    ) -> AgResult<Option<bytes::Bytes>> {
+        match self {
+            Self::Json(mosaic) => mosaic.tile_with_options(coord, style, options).await,
+            #[cfg(feature = "stac")]
+            Self::Stac(mosaic) => mosaic.tile_with_options(coord, style, options).await,
         }
     }
 }
@@ -184,8 +202,10 @@ pub struct AppState {
     cpu_limiter: CpuLimiter,
     max_decode_tasks: usize,
     max_tile_tasks: usize,
+    prefetch_ring: u8,
     slow_tile_ms: Option<u64>,
     request_slots: Arc<tokio::sync::Semaphore>,
+    requests: RequestLimiter,
     request_timeout: Duration,
     // Independent from tile admission: admitted tiles fetch this origin.
     data_slots: Arc<tokio::sync::Semaphore>,
@@ -203,8 +223,16 @@ impl AppState {
         // Compile the SDK schema and Q3 bindings before accepting requests.
         TileStyle::from_raster_query("version=3.0&type=gray&bidx=1")
             .expect("built-in Raster Style is supported");
+        let requests = RequestLimiter::new(64);
         Self {
-            default_tiler,
+            default_tiler: default_tiler.map(|tiler| {
+                Arc::new(
+                    tiler
+                        .as_ref()
+                        .clone()
+                        .with_request_limiter(requests.clone()),
+                )
+            }),
             data_dir,
             datasets: Arc::new(datasets),
             mosaic: None,
@@ -214,8 +242,10 @@ impl AppState {
             cpu_limiter: CpuLimiter::default(),
             max_decode_tasks: ReaderConfig::default().max_decode_tasks,
             max_tile_tasks: TilerConfig::default().max_blocking_tasks,
+            prefetch_ring: ReaderConfig::default().prefetch_ring,
             slow_tile_ms: None,
             request_slots: Arc::new(tokio::sync::Semaphore::new(64)),
+            requests,
             request_timeout: Duration::from_secs(30),
             data_slots: Arc::new(tokio::sync::Semaphore::new(64)),
             data_budget: WorkBudget::new(MAX_DATA_BUFFER_BYTES),
@@ -227,7 +257,21 @@ impl AppState {
         self.request_slots = Arc::new(tokio::sync::Semaphore::new(
             max_in_flight.clamp(1, tokio::sync::Semaphore::MAX_PERMITS),
         ));
+        self.requests = RequestLimiter::new(max_in_flight);
         self.request_timeout = timeout;
+        self.default_tiler = self.default_tiler.map(|tiler| {
+            Arc::new(
+                tiler
+                    .as_ref()
+                    .clone()
+                    .with_request_limiter(self.requests.clone()),
+            )
+        });
+        self.mosaic = self
+            .mosaic
+            .map(|mosaic| mosaic.with_request_limiter(self.requests.clone()));
+        // Any previously opened dataset must pick up the new request settings.
+        self.tilers.invalidate_all();
         self
     }
 
@@ -235,26 +279,29 @@ impl AppState {
         mut self,
         max_decode_tasks: usize,
         max_tile_tasks: usize,
+        prefetch_ring: u8,
         slow_tile_ms: Option<u64>,
     ) -> Self {
         self.max_decode_tasks = max_decode_tasks.max(1);
         self.max_tile_tasks = max_tile_tasks.max(1);
+        self.prefetch_ring = prefetch_ring;
         // Resize the shared budget to cover the larger of the two phases; every
         // per-dataset reader+tiler draws from this one limiter.
         self.cpu_limiter = CpuLimiter::new(self.max_decode_tasks.max(self.max_tile_tasks));
         self.slow_tile_ms = slow_tile_ms;
+        self.tilers.invalidate_all();
         self
     }
 
     /// Attach a MosaicJSON-backed mosaic, exposed at `/mosaic/tiles/...`.
     pub fn with_mosaic(mut self, mosaic: Arc<MosaicTiler<MosaicJsonSource>>) -> Self {
-        self.mosaic = Some(Mosaic::Json(mosaic));
+        self.mosaic = Some(Mosaic::Json(mosaic).with_request_limiter(self.requests.clone()));
         self
     }
 
     #[cfg(feature = "stac")]
     pub fn with_stac_mosaic(mut self, mosaic: Arc<MosaicTiler<StacSource>>) -> Self {
-        self.mosaic = Some(Mosaic::Stac(mosaic));
+        self.mosaic = Some(Mosaic::Stac(mosaic).with_request_limiter(self.requests.clone()));
         self
     }
 
@@ -274,10 +321,12 @@ impl AppState {
             cfg.source_id = name.to_string();
             cfg.block_cache = Arc::clone(&self.block_cache);
             cfg.max_decode_tasks = self.max_decode_tasks;
+            cfg.prefetch_ring = self.prefetch_ring;
             // Inject the one shared CPU limiter so every dataset's reader+tiler
             // shares a single process-wide CPU budget instead of building its
             // own semaphore per cached dataset.
             cfg.cpu_limiter = Some(self.cpu_limiter.clone());
+            let requests = self.requests.clone();
             return self
                 .tilers
                 .try_get_with(name.to_string(), async move {
@@ -286,7 +335,9 @@ impl AppState {
                         .open_http(&url)
                         .await?;
                     // `Tiler::new` inherits the reader's (now shared) limiter.
-                    Ok::<_, AgError>(Arc::new(Tiler::new(Arc::new(reader))))
+                    Ok::<_, AgError>(Arc::new(
+                        Tiler::new(Arc::new(reader)).with_request_limiter(requests),
+                    ))
                 })
                 .await
                 .map_err(|e: Arc<AgError>| AgError::Tiff(format!("open dataset {name}: {e}")));
@@ -411,7 +462,7 @@ pub async fn tile_handler(
         timer.mark("select_tiler");
 
         let result = tiler
-            .tile(
+            .tile_with_options(
                 TileCoord {
                     tms: tile_matrix_set,
                     z,
@@ -419,6 +470,10 @@ pub async fn tile_handler(
                     y,
                 },
                 &style,
+                &RequestOptions {
+                    timeout: Some(state.request_timeout),
+                    ..Default::default()
+                },
             )
             .await;
         timer.mark("render");
@@ -528,6 +583,10 @@ pub async fn mosaic_tile_handler(
                     y,
                 },
                 &style,
+                &RequestOptions {
+                    timeout: Some(state.request_timeout),
+                    ..Default::default()
+                },
             )
             .await;
         timer.mark("render");
@@ -973,6 +1032,325 @@ fn with_cors(mut response: Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct TestServer {
+        base: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn serve_test_router(app: Router) -> TestServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        TestServer { base, task }
+    }
+
+    #[derive(Clone, Default)]
+    struct OriginGate {
+        blocked: Arc<AtomicBool>,
+        gets: Arc<AtomicUsize>,
+        reached: Arc<tokio::sync::Notify>,
+        released: Arc<tokio::sync::Notify>,
+    }
+
+    async fn gate_origin(
+        State(gate): State<OriginGate>,
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> Response {
+        if request.method() == Method::GET {
+            gate.gets.fetch_add(1, Ordering::SeqCst);
+        }
+        if request.method() != Method::HEAD && gate.blocked.load(Ordering::SeqCst) {
+            gate.reached.notify_one();
+            gate.released.notified().await;
+        }
+        next.run(request).await
+    }
+
+    async fn fixture_origin() -> (TestServer, OriginGate) {
+        let state = AppState::new(
+            None,
+            Some(PathBuf::from("tests/fixtures")),
+            vec!["rgb_nodata.tif".into()],
+            "http://127.0.0.1",
+            Arc::new(BlockCache::new(Default::default())),
+        );
+        let gate = OriginGate::default();
+        let app = Router::new()
+            .route(
+                "/data/{name}",
+                get(data_file_handler).head(data_file_handler),
+            )
+            .route(
+                "/search",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "type": "FeatureCollection", "features": [], "links": []
+                    }))
+                }),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                gate.clone(),
+                gate_origin,
+            ))
+            .with_state(state);
+        (serve_test_router(app).await, gate)
+    }
+
+    fn mosaic_query() -> String {
+        let mut document = raster_style::decode_query("version=3.0&type=gray&bidx=1")
+            .unwrap()
+            .into_value();
+        document["extensions"] = serde_json::json!([raster_style::MOSAIC_SCHEMA_URL]);
+        document["raster:mosaic"] =
+            serde_json::json!({"pixel_selection":"first","stage":"before_channels"});
+        raster_style::encode_query(&raster_style::Style::from_value(document).unwrap()).unwrap()
+    }
+
+    fn json_mosaic(asset: &str) -> Arc<MosaicTiler<MosaicJsonSource>> {
+        let document = serde_json::json!({
+            "mosaicjson": "0.0.3", "minzoom": 0, "maxzoom": 1,
+            "tiles": {"": [asset]}
+        });
+        Arc::new(
+            MosaicTiler::builder(MosaicJsonSource::from_str(&document.to_string()).unwrap())
+                .http_policy(async_geotiff::mosaic::HttpAccessPolicy::permissive())
+                .build(),
+        )
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "readiness deadline exceeded"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TileSource {
+        Lazy,
+        Default,
+        Json,
+        #[cfg(feature = "stac")]
+        Stac,
+    }
+
+    async fn check_request_tuning(source: TileSource, attach_first: bool) {
+        let (origin, gate) = fixture_origin().await;
+        let asset = format!("{}/data/rgb_nodata.tif", origin.base);
+        let default = if matches!(source, TileSource::Default) {
+            Some(Arc::new(Tiler::new(Arc::new(
+                CogReader::open_http(&asset).await.unwrap(),
+            ))))
+        } else {
+            None
+        };
+        let mut state = AppState::new(
+            default,
+            None,
+            vec!["rgb_nodata.tif".into()],
+            &origin.base,
+            Arc::new(BlockCache::new(Default::default())),
+        );
+        let attach = |state: AppState| match source {
+            TileSource::Lazy | TileSource::Default => state,
+            TileSource::Json => state.with_mosaic(json_mosaic(&asset)),
+            #[cfg(feature = "stac")]
+            TileSource::Stac => state.with_stac_mosaic(Arc::new(MosaicTiler::new(
+                StacSource::new(&origin.base, vec![], "data").unwrap(),
+            ))),
+        };
+        if attach_first {
+            state = attach(state);
+        }
+        state = state.with_request_tuning(128, Duration::from_secs(60));
+        if !attach_first {
+            state = attach(state);
+        }
+        let path = match source {
+            TileSource::Lazy => {
+                state.tiler_for(Some("rgb_nodata.tif")).await.unwrap();
+                "/tiles/WebMercatorQuad/0/0/0.png?dataset=rgb_nodata.tif&version=3.0&type=gray&bidx=1".to_owned()
+            }
+            TileSource::Default => {
+                "/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=gray&bidx=1".to_owned()
+            }
+            _ => format!("/mosaic/tiles/WebMercatorQuad/0/0/0.png?{}", mosaic_query()),
+        };
+        let frontend = serve_test_router(router(state.clone())).await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        gate.blocked.store(true, Ordering::SeqCst);
+        tokio::time::pause();
+        // A runnable task prevents automatic clock jumps while real sockets reach the gate.
+        let spinning = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let tasks: Vec<_> = (0..65)
+            .map(|_| {
+                let client = client.clone();
+                let url = format!("{}{path}", frontend.base);
+                tokio::spawn(async move { client.get(url).send().await.unwrap() })
+            })
+            .collect();
+        wait_until(|| {
+            state.requests.available_permits() == 63 || tasks.iter().any(|task| task.is_finished())
+        })
+        .await;
+        assert_eq!(
+            state.requests.available_permits(),
+            63,
+            "{source:?}, attach_first={attach_first}"
+        );
+        assert!(tasks.iter().all(|task| !task.is_finished()));
+        gate.reached.notified().await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tasks.iter().all(|task| !task.is_finished()),
+            "hidden 30-second deadline in {source:?}"
+        );
+        assert_eq!(state.requests.available_permits(), 63);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        wait_until(|| tasks.iter().all(|task| task.is_finished())).await;
+        for task in tasks {
+            let response = task.await.unwrap();
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(response.text().await.unwrap(), "request deadline exceeded");
+        }
+        wait_until(|| state.requests.available_permits() == 128).await;
+        assert_eq!(state.request_slots.available_permits(), 128);
+        gate.blocked.store(false, Ordering::SeqCst);
+        gate.released.notify_waiters();
+        spinning.abort();
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
+    async fn runtime_request_tuning_reaches_lazy_default_and_json_mosaics() {
+        for (source, attach_first) in [
+            (TileSource::Lazy, false),
+            (TileSource::Default, false),
+            (TileSource::Json, false),
+            (TileSource::Json, true),
+        ] {
+            check_request_tuning(source, attach_first).await;
+        }
+    }
+
+    #[cfg(feature = "stac")]
+    #[tokio::test]
+    async fn runtime_request_tuning_reaches_stac_in_both_builder_orders() {
+        for attach_first in [false, true] {
+            check_request_tuning(TileSource::Stac, attach_first).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_prefetch_tuning_controls_lazy_dataset_neighbor_gets() {
+        let (origin, gate) = fixture_origin().await;
+        let mut foreground_gets = 0;
+        for ring in [0, 1] {
+            let cache = Arc::new(BlockCache::new(Default::default()));
+            let state = AppState::new(
+                None,
+                None,
+                vec!["rgb_nodata.tif".into()],
+                &origin.base,
+                cache.clone(),
+            );
+            // Retuning must also update a dataset whose metadata was already cached.
+            state.tiler_for(Some("rgb_nodata.tif")).await.unwrap();
+            let state = state.with_runtime_tuning(2, 2, ring, None);
+            let tiler = state.tiler_for(Some("rgb_nodata.tif")).await.unwrap();
+            gate.gets.store(0, Ordering::SeqCst);
+            let [west, south, east, north] = tiler.wgs84_bounds().unwrap();
+            // A fine tile well inside the fixture's first native block has three neighbors.
+            let lon = west + (east - west) / 8.0;
+            let lat = (north - (north - south) / 8.0).to_radians();
+            let z = 22;
+            let side = 2_f64.powi(i32::from(z));
+            let coord = TileCoord {
+                tms: TileMatrixSet::WebMercatorQuad,
+                z,
+                x: ((lon + 180.0) / 360.0 * side).floor() as u32,
+                y: ((1.0 - lat.tan().asinh() / std::f64::consts::PI) / 2.0 * side).floor() as u32,
+            };
+            let style = TileStyle::from_raster_query("version=3.0&type=gray&bidx=1").unwrap();
+            assert!(tiler.warp_tile(coord, &style).await.unwrap().is_some());
+            if ring == 0 {
+                assert_eq!(cache.stats().decoded, 1);
+                foreground_gets = gate.gets.load(Ordering::SeqCst);
+                assert!(foreground_gets > 0);
+            } else {
+                wait_until(|| cache.stats().decoded == 4).await;
+                assert!(gate.gets.load(Ordering::SeqCst) > foreground_gets);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_mosaic_error_hides_operator_url_credentials() {
+        // The asset URL belongs to the operator; the anonymous request contains only styling.
+        let asset = "https://audit-user:audit-password@127.0.0.1:443/a/../data.tif?token=audit-query#audit-fragment";
+        let document = serde_json::json!({
+            "mosaicjson": "0.0.3", "minzoom": 0, "maxzoom": 1, "tiles": {"": [asset]}
+        });
+        // The default access policy rejects loopback before any origin network access.
+        let mosaic = MosaicTiler::new(MosaicJsonSource::from_str(&document.to_string()).unwrap());
+        let state = AppState::new(
+            None,
+            None,
+            vec![],
+            "http://127.0.0.1",
+            Arc::new(BlockCache::new(Default::default())),
+        )
+        .with_mosaic(Arc::new(mosaic));
+        let server = serve_test_router(router(state)).await;
+        let request_url = format!(
+            "{}/mosaic/tiles/WebMercatorQuad/0/0/0.png?{}",
+            server.base,
+            mosaic_query()
+        );
+        assert!(!request_url.contains("audit-"));
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(request_url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("https://127.0.0.1/data.tif"));
+        for secret in [
+            "audit-user",
+            "audit-password",
+            "audit-query",
+            "audit-fragment",
+        ] {
+            assert!(
+                !body.contains(secret),
+                "credential exposed to anonymous caller: {body}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn data_response_budget_follows_body_bytes_and_uses_independent_slots() {

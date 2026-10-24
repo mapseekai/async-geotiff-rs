@@ -6,6 +6,7 @@ use crate::{
 use bytes::Bytes;
 use std::sync::Arc;
 
+/// Immutable, cheaply cloneable render plan produced by [`crate::style::compile`].
 #[derive(Debug, Clone)]
 pub struct CompiledTileStyle {
     pub(crate) raster: Arc<RasterPlan>,
@@ -15,11 +16,17 @@ pub struct CompiledTileStyle {
 }
 
 impl CompiledTileStyle {
+    /// Resampling kernel requested for reading/resizing source pixels.
     pub fn resampling(&self) -> Resampling {
         self.resampling
     }
 }
 
+/// Apply a compiled style and encode pixels in its requested image format.
+///
+/// This function does not reproject the input. Image bands and mask dimensions
+/// must match the style and pixel grid; incompatible inputs return an error.
+/// Use [`crate::tiler::Tiler`] to read, reproject and render a tile together.
 pub fn render(image: &ImageData, style: &CompiledTileStyle) -> AgResult<Bytes> {
     style
         .raster

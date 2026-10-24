@@ -1,6 +1,7 @@
 #[cfg(feature = "perf-tracing")]
 use std::time::Duration;
 
+/// Include instrumentation tokens only when `perf-tracing` is enabled.
 #[cfg(feature = "perf-tracing")]
 #[macro_export]
 macro_rules! perf_trace {
@@ -9,6 +10,7 @@ macro_rules! perf_trace {
     };
 }
 
+/// Discard instrumentation tokens when `perf-tracing` is disabled.
 #[cfg(not(feature = "perf-tracing"))]
 #[macro_export]
 macro_rules! perf_trace {

@@ -1,14 +1,20 @@
 use raffine::Affine;
 
+/// An axis-aligned rectangle in the coordinate units of its associated CRS.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bbox {
+    /// Minimum x coordinate (west in longitude/latitude order).
     pub xmin: f64,
+    /// Minimum y coordinate (south in longitude/latitude order).
     pub ymin: f64,
+    /// Maximum x coordinate (east in longitude/latitude order).
     pub xmax: f64,
+    /// Maximum y coordinate (north in longitude/latitude order).
     pub ymax: f64,
 }
 
 impl Bbox {
+    /// Store rectangle coordinates without reordering or validating them.
     pub fn new(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Self {
         Self {
             xmin,
@@ -17,9 +23,11 @@ impl Bbox {
             ymax,
         }
     }
+    /// Return `xmax - xmin` in CRS units.
     pub fn width(&self) -> f64 {
         self.xmax - self.xmin
     }
+    /// Return `ymax - ymin` in CRS units.
     pub fn height(&self) -> f64 {
         self.ymax - self.ymin
     }
@@ -61,23 +69,28 @@ impl Bbox {
 pub struct GeoTransform(pub Affine);
 
 impl GeoTransform {
+    /// Construct from GDAL coefficients `[x_origin, x_scale, x_skew, y_origin, y_skew, y_scale]`.
     pub fn from_gdal(gt: &[f64; 6]) -> Self {
         Self(Affine::from_gdal(gt))
     }
 
+    /// Transform pixel coordinates, with integer coordinates at pixel corners.
     #[inline]
     pub fn forward(&self, col: f64, row: f64) -> (f64, f64) {
         self.0 * (col, row)
     }
 
+    /// Shift the pixel-space origin by the given column and row offsets.
     pub fn translated(&self, col_off: f64, row_off: f64) -> Self {
         Self(self.0 * Affine::translation(col_off, row_off))
     }
 
+    /// Scale pixel-space column and row coordinates before mapping to the CRS.
     pub fn scaled(&self, sx: f64, sy: f64) -> Self {
         Self(self.0 * Affine::scale(sx, Some(sy)))
     }
 
+    /// Return the world-to-pixel transform, or `None` for a singular transform.
     pub fn inverse(&self) -> Option<GeoTransform> {
         (!self.0).ok().map(GeoTransform)
     }

@@ -9,6 +9,121 @@ pub(crate) fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
+// A 16x16 RGB TIFF with optional ExtraSamples and an independent mask IFD.
+// The first alpha sample is zero at pixel 0. The independent mask, when
+// present, instead invalidates pixel 1 so tests can distinguish their precedence.
+pub(crate) fn alpha_fixture(extra_samples: &[u16], with_mask: bool) -> Vec<u8> {
+    type Tag = (u16, u16, u32, Vec<u8>);
+
+    fn shorts(tag: u16, values: &[u16]) -> Tag {
+        (
+            tag,
+            3,
+            values.len() as u32,
+            values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+    }
+
+    fn long(tag: u16, value: u32) -> Tag {
+        (tag, 4, 1, value.to_le_bytes().to_vec())
+    }
+
+    fn doubles(tag: u16, values: &[f64]) -> Tag {
+        (
+            tag,
+            12,
+            values.len() as u32,
+            values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+    }
+
+    fn append_ifd(bytes: &mut Vec<u8>, mut tags: Vec<Tag>, pixels: &[u8], has_next: bool) {
+        tags.sort_unstable_by_key(|tag| tag.0);
+        let table_end = bytes.len() + 2 + tags.len() * 12 + 4;
+        let pixel_start = table_end
+            + tags
+                .iter()
+                .filter(|tag| tag.3.len() > 4)
+                .map(|tag| tag.3.len())
+                .sum::<usize>();
+        bytes.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+        let mut payload = Vec::new();
+        for (tag, typ, count, mut value) in tags {
+            if tag == 324 {
+                value = (pixel_start as u32).to_le_bytes().to_vec();
+            }
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&typ.to_le_bytes());
+            bytes.extend_from_slice(&count.to_le_bytes());
+            if value.len() <= 4 {
+                value.resize(4, 0);
+                bytes.extend_from_slice(&value);
+            } else {
+                bytes.extend_from_slice(&((table_end + payload.len()) as u32).to_le_bytes());
+                payload.extend(value);
+            }
+        }
+        let next = if has_next {
+            pixel_start + pixels.len()
+        } else {
+            0
+        };
+        bytes.extend_from_slice(&(next as u32).to_le_bytes());
+        bytes.extend(payload);
+        bytes.extend_from_slice(pixels);
+    }
+
+    fn image_tags(bands: u16, photo: u16, pixel_bytes: u32) -> Vec<Tag> {
+        vec![
+            long(256, 16),
+            long(257, 16),
+            shorts(258, &vec![8; bands as usize]),
+            shorts(259, &[1]),
+            shorts(262, &[photo]),
+            shorts(277, &[bands]),
+            shorts(284, &[1]),
+            long(322, 16),
+            long(323, 16),
+            long(324, 0),
+            long(325, pixel_bytes),
+        ]
+    }
+
+    let mut sample = vec![3, 7, 11];
+    sample.extend(
+        extra_samples
+            .iter()
+            .map(|&kind| if kind == 0 { 41 } else { 255 }),
+    );
+    let mut pixels = sample.repeat(16 * 16);
+    if let Some(alpha) = extra_samples
+        .iter()
+        .position(|&kind| kind == 1 || kind == 2)
+    {
+        pixels[3 + alpha] = 0;
+    }
+    let mut tags = image_tags(sample.len() as u16, 2, pixels.len() as u32);
+    if !extra_samples.is_empty() {
+        tags.push(shorts(338, extra_samples));
+    }
+    tags.push(doubles(33550, &[1.0, 1.0, 0.0]));
+    tags.push(doubles(33922, &[0.0; 6]));
+    tags.push(shorts(
+        34735,
+        &[1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326],
+    ));
+    let mut bytes = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
+    append_ifd(&mut bytes, tags, &pixels, with_mask);
+    if with_mask {
+        let mut mask = vec![255; 16 * 16];
+        mask[1] = 0;
+        let mut tags = image_tags(1, 4, mask.len() as u32);
+        tags.push(long(254, 4));
+        append_ifd(&mut bytes, tags, &mask, false);
+    }
+    bytes
+}
+
 // Adapt the checked-in tiny RGB TIFF to exactly cover WorldCRS84Quad 0/0/0.
 // Optional constant samples make expected reducer outputs independent of render helpers.
 pub(crate) fn world_fixture(shift: f64, samples: Option<[u8; 3]>) -> Vec<u8> {

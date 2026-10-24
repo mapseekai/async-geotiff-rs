@@ -76,6 +76,8 @@ impl Default for MosaicConfig {
 }
 
 /// Renders mosaicked map tiles from multiple COG assets via a [`MosaicSource`].
+/// Clones share the reader cache and resource limits; the source must be cloneable.
+#[derive(Clone)]
 pub struct MosaicTiler<S: MosaicSource> {
     source: S,
     pool: ReaderPool,
@@ -142,16 +144,19 @@ impl<S: MosaicSource> MosaicTilerBuilder<S> {
         self
     }
 
+    /// Share request admission with other tilers, overriding the config's count.
     pub fn request_limiter(mut self, requests: RequestLimiter) -> Self {
         self.requests = Some(requests);
         self
     }
 
+    /// Account discovery, reads and rendering against a caller-owned byte budget.
     pub fn work_budget(mut self, budget: WorkBudget) -> Self {
         self.work_budget = budget;
         self
     }
 
+    /// Construct the tiler and its shared reader pool without opening any assets.
     pub fn build(self) -> MosaicTiler<S> {
         let mut pool = ReaderPool::builder(self.cfg.reader_capacity)
             .backend(self.backend)
@@ -182,6 +187,13 @@ impl<S: MosaicSource> MosaicTiler<S> {
     /// Create a new `MosaicTiler` with default [`MosaicConfig`].
     pub fn new(source: S) -> Self {
         Self::builder(source).build()
+    }
+
+    /// Replace request admission while preserving reader, cache and CPU budgets.
+    /// Existing requests retain their original admission until their work ends.
+    pub fn with_request_limiter(mut self, requests: RequestLimiter) -> Self {
+        self.requests = requests;
+        self
     }
 
     /// Start building a `MosaicTiler` — see [`MosaicTilerBuilder`].

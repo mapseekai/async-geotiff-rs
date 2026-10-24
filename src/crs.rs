@@ -7,14 +7,17 @@
 pub struct Crs(String);
 
 impl Crs {
+    /// Construct an `EPSG:<code>` identifier without checking the CRS registry.
     pub fn epsg(code: u32) -> Self {
         Self(format!("EPSG:{}", code))
     }
 
+    /// Store a CRS definition; transformation construction performs validation.
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 
+    /// Borrow the original CRS identifier or definition.
     pub fn as_str(&self) -> &str {
         &self.0
     }

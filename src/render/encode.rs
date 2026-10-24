@@ -22,9 +22,12 @@ use ndarray::Array3;
 /// disabled fail via [`TileFormat::ensure_available`] or [`encode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TileFormat {
+    /// Lossless RGBA PNG, available in every build.
     #[default]
     Png,
+    /// Lossless RGBA WebP; encoding requires the `webp` feature.
     Webp,
+    /// Lossy JPEG with transparency flattened over black; requires `jpeg`.
     Jpeg,
 }
 
@@ -180,6 +183,10 @@ fn flatten_to_rgb_black(rgba: &Array3<u8>) -> AgResult<Array3<u8>> {
         .expect("flattened RGB length must match the output shape"))
 }
 
+/// Encode an `(height, width, 4)` RGBA array as a lossless PNG.
+///
+/// Non-contiguous arrays are copied to standard layout. A different channel
+/// count or an encoder failure returns an error.
 pub fn encode_png(rgba: &Array3<u8>) -> AgResult<Bytes> {
     let (h, w, c) = (
         rgba.shape()[0] as u32,

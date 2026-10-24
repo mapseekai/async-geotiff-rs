@@ -11,9 +11,10 @@ use crate::warp::projection::with_cached;
 /// Pixel value(s) sampled at a coordinate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointValue {
-    /// One value per requested band, in `bidx` order (or all bands in native
-    /// order when `bidx` is empty). Raw decoded values cast to f64 — scale/
-    /// offset is NOT applied.
+    /// One value per requested output band, in `bidx` order (or every output
+    /// band when `bidx` is empty). Bands follow [`CogReader::read_window`]:
+    /// promoting Alpha to a mask removes that band and preserves the order of
+    /// the others. Values are raw decoded samples cast to f64, without scale/offset.
     pub values: Vec<f64>,
     /// `false` when the pixel is masked or any returned band equals the dataset
     /// nodata sentinel; `true` otherwise.
@@ -74,9 +75,13 @@ impl CogReader {
     ///
     /// `coord_crs` is the CRS of the input coordinate (pass `Crs::epsg(4326)`
     /// for lon/lat); it is reprojected to the dataset's source CRS internally.
-    /// `bidx` is a 1-indexed band selection; an empty slice returns all bands
-    /// in native order. Values are raw decoded samples cast to f64 (no scale/
-    /// offset applied).
+    /// `bidx` selects one-based bands from the same output as [`Self::read_window`];
+    /// an empty slice returns all output bands in order. Without an independent
+    /// mask IFD, the first tagged Alpha band becomes the validity mask and is
+    /// removed; the remaining bands retain their relative order. An independent
+    /// mask takes precedence and leaves all native bands, including Alpha,
+    /// available for selection. Values are raw samples cast to f64, without
+    /// scale/offset.
     ///
     /// Returns `Ok(None)` when the coordinate is outside the dataset extent or
     /// the projection's valid domain. Returns `Err(AgError::query)` when a band
@@ -90,8 +95,9 @@ impl CogReader {
     ) -> AgResult<Option<PointValue>> {
         let (width, height) = self.level_dimensions(0)?;
 
-        // Validate band selection up front (before any read). 1-indexed.
-        let total = self.data_ifd(0)?.samples_per_pixel() as usize;
+        // Validate against the reader's post-promotion band order before any read.
+        let total = self.data_ifd(0)?.samples_per_pixel() as usize
+            - usize::from(self.promoted_alpha_band(0)?.is_some());
         let sel: Vec<usize> = if bidx.is_empty() {
             (0..total).collect()
         } else {
@@ -137,9 +143,8 @@ impl CogReader {
 
         let mut values = Vec::with_capacity(sel.len());
         for &b in &sel {
-            // Defense-in-depth: user `bidx` was already validated against
-            // samples_per_pixel before the read. This guards only against a
-            // decoded band count that disagrees with the IFD (corrupt file).
+            // The expected output count was checked before reading; malformed
+            // decoded data must still return an error rather than index out of bounds.
             if b >= bands {
                 return Err(AgError::query(
                     "bidx",

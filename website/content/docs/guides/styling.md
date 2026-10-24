@@ -77,6 +77,13 @@ Numeric paths support the existing nearest, bilinear, cubic, cubic_spline,
 lanczos, and average kernels. Dependencies are resampled independently, preserving
 validity. Source Alpha bands are currently rejected before pixel reads.
 
+`cubic_spline` smooths even at integer pixel centers. It therefore still runs
+its kernel when the requested tile grid exactly matches the source grid;
+direct tile rendering and the warp path preserve the same resampling semantics.
+Cubic, CubicSpline and Lanczos also preserve finite constant F64 values near
+the numeric limits without making them transparent through intermediate
+overflow. Truly non-finite samples or unrepresentable results remain invalid.
+
 ## Statistical stretch and curves
 
 All seven methods are supported: `none`, `linear`, `minmax`, `percentile`,

@@ -7,11 +7,14 @@ use tile_grid::{tms as registry, Tms as InnerTms, Xyz};
 /// Supported OGC TileMatrixSet identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileMatrixSet {
+    /// Square Web Mercator tiles in EPSG:3857.
     WebMercatorQuad,
+    /// Geographic tiles in longitude/latitude order, two columns at zoom zero.
     WorldCrs84Quad,
 }
 
 impl TileMatrixSet {
+    /// Return the canonical OGC identifier.
     pub fn name(self) -> &'static str {
         match self {
             Self::WebMercatorQuad => "WebMercatorQuad",
@@ -19,6 +22,7 @@ impl TileMatrixSet {
         }
     }
 
+    /// Parse a canonical or all-lowercase name, rejecting unknown matrix sets.
     pub fn parse_name(s: &str) -> AgResult<Self> {
         match s {
             "WebMercatorQuad" | "webmercatorquad" => Ok(Self::WebMercatorQuad),
@@ -27,6 +31,7 @@ impl TileMatrixSet {
         }
     }
 
+    /// Return the CRS used for tile bounds and pixel coordinates.
     pub fn crs(self) -> Crs {
         match self {
             Self::WebMercatorQuad => Crs::epsg(3857),
@@ -56,18 +61,24 @@ impl FromStr for TileMatrixSet {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileCoord {
+    /// Tile matrix set defining the coordinate grid.
     pub tms: TileMatrixSet,
+    /// Zoom level, validated against the matrix set when used.
     pub z: u8,
+    /// Zero-based tile column increasing eastward.
     pub x: u32,
+    /// Zero-based tile row increasing southward from the northern origin.
     pub y: u32,
 }
 
+/// A resolved tile matrix set used to validate addresses and calculate bounds.
 pub struct Tms {
     tile_matrix_set: TileMatrixSet,
     inner: InnerTms,
 }
 
 impl Tms {
+    /// Load a supported matrix set from the bundled registry.
     pub fn new(tile_matrix_set: TileMatrixSet) -> AgResult<Self> {
         let inner = registry()
             .lookup(tile_matrix_set.name())
@@ -102,10 +113,12 @@ impl Tms {
         Ok(cell.get_or_init(|| built))
     }
 
+    /// Return the identifier of this resolved matrix set.
     pub fn tile_matrix_set(&self) -> TileMatrixSet {
         self.tile_matrix_set
     }
 
+    /// Return the CRS used by this matrix set.
     pub fn crs(&self) -> Crs {
         self.tile_matrix_set.crs()
     }

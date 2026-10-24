@@ -6,19 +6,26 @@ use crate::error::AgResult;
 use crate::io::CogReader;
 use ndarray::{Array3, Axis};
 
+/// How a statistics set was obtained; embedded or sampled values may be approximate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Provenance {
+    /// Computed from every valid sample in the supplied domain.
     Exact,
     /// Read from metadata; may contain approximate or inferred fields.
     Embedded,
+    /// Computed from a reduced-resolution overview or a subset of samples.
     Estimated,
 }
 
 /// Equal-width histogram over `[min, max]`. `counts.len()` is the bin count.
 #[derive(Debug, Clone)]
 pub struct Histogram {
+    /// Lower edge of the first bin, in raw sample units.
     pub min: f64,
+    /// Upper edge of the final bin, in raw sample units.
     pub max: f64,
+    /// Counts in ascending equal-width bins. Empty or all-zero counts give
+    /// [`Self::min`] when querying a quantile; their sum may exceed `u64::MAX`.
     pub counts: Vec<u64>,
 }
 
@@ -26,16 +33,28 @@ impl Histogram {
     /// Value at percentile `p` (0..=100) via linear interpolation on the
     /// cumulative count. Robust to the overview-smoothing approximation
     /// (see spec accuracy table). Empty / degenerate → `min`.
+    /// Counts may sum beyond `u64::MAX`; accumulation uses `u128` and only
+    /// the interpolation converts to f64. The 100th percentile is the upper
+    /// edge of the last nonempty bin, excluding any trailing zero-count bins.
     pub fn quantile(&self, p: f64) -> f64 {
-        let total: u64 = self.counts.iter().sum();
+        let total: u128 = self.counts.iter().map(|&count| u128::from(count)).sum();
         if total == 0 || self.max <= self.min || self.counts.is_empty() {
             return self.min;
         }
         let target = (p / 100.0) * total as f64;
         let bin_w = (self.max - self.min) / self.counts.len() as f64;
-        let mut cum = 0u64;
+        if p == 100.0 {
+            // Distinct integer totals can round to the same f64 near u64::MAX.
+            // Locate the endpoint without losing a small final nonempty bin.
+            return self
+                .counts
+                .iter()
+                .rposition(|&count| count != 0)
+                .map_or(self.min, |i| self.min + (i + 1) as f64 * bin_w);
+        }
+        let mut cum = 0u128;
         for (i, &c) in self.counts.iter().enumerate() {
-            let next = cum + c;
+            let next = cum + u128::from(c);
             if (next as f64) >= target {
                 // Fraction into this bin.
                 let into = if c == 0 {
@@ -51,25 +70,36 @@ impl Histogram {
     }
 }
 
+/// Summary of one band's valid raw samples, or values inferred from its metadata.
 #[derive(Debug, Clone)]
 pub struct BandStat {
+    /// Minimum sample or metadata minimum; an empty computed band uses `0.0`.
     pub min: f64,
+    /// Maximum sample or metadata maximum; an empty computed band uses `1.0`.
     pub max: f64,
+    /// Arithmetic mean, or a metadata fallback estimate.
     pub mean: f64,
+    /// Population standard deviation, or a metadata fallback estimate.
     pub stddev: f64,
+    /// Sample distribution used for approximate percentile interpolation.
     pub hist: Histogram,
 }
 
+/// Per-band statistics together with their shared provenance.
 #[derive(Debug, Clone)]
 pub struct DatasetStats {
-    /// Indexed by original (full) band order.
+    /// Band order of the producing operation: embedded metadata follows native
+    /// TIFF sample order; sampled statistics follow the decoded image bands,
+    /// which may omit Alpha promoted to a validity mask.
     pub bands: Vec<BandStat>,
+    /// Whether the values were computed exactly, read from metadata or estimated.
     pub provenance: Provenance,
 }
 
 /// Per-band stats from a planar `(bands, H, W)` f64 array, excluding
-/// `nodata` and non-finite samples. `hist_bins` is the histogram
-/// resolution (256 in production).
+/// `nodata` and non-finite samples. `hist_bins` is the histogram resolution,
+/// clamped to at least one bin. An empty band has min/max `0.0`/`1.0`, zero
+/// mean and deviation, and zero bin counts.
 pub fn band_stats_from_f64(
     arr: &Array3<f64>,
     nodata: Option<f64>,
@@ -146,9 +176,11 @@ pub fn band_stats_from_f64(
 
 /// Parse embedded stats from a COG's GDAL_METADATA XML, falling back to
 /// TIFF `SMin/SMaxSampleValue`. Returns `None` when neither yields a
-/// usable min/max for every band. Histogram comes from
-/// `STATISTICS_HISTOMIN/HISTOMAX/HISTONUMBINS/HISTOBINS` when present,
-/// otherwise a single-bin placeholder (percentile then ≈ min/max).
+/// usable min/max for every band. Histogram bounds come from
+/// `STATISTICS_HISTOMIN/HISTOMAX`; `STATISTICS_HISTOBINS` supplies comma- or
+/// whitespace-separated counts. Absent or unusable counts produce a single-bin
+/// placeholder. `STATISTICS_HISTONUMBINS` is not used; bin count follows the
+/// successfully parsed values.
 pub fn parse_embedded_stats(
     gdal_metadata: Option<&str>,
     smin: Option<&[u16]>,
@@ -270,11 +302,17 @@ pub(crate) fn band_stats_from_image(
     band_stats_from_f64(&arr, image.nodata, hist_bins)
 }
 
-/// Embedded `STATISTICS_*` tags when present; otherwise compute
-/// from the highest (smallest) overview (estimated). `Ok(None)` when the
-/// COG has no overview to fall back to — caller then uses
-/// `stretch::fallback_rescale`. Reads ≈ the top overview only (a few
-/// hundred KB), independent of full-resolution size.
+/// Read embedded `STATISTICS_*` tags or estimate statistics from the smallest
+/// overview. Embedded values retain native TIFF band order; estimates follow
+/// [`CogReader::read_window`] output band order and its mask semantics.
+///
+/// Returns `Ok(None)` when no complete embedded statistics are available and
+/// the COG has no overview, or the smallest overview exceeds 16,777,216 pixels.
+/// Sampled statistics use the reader's CPU limiter and working-memory budget.
+///
+/// # Errors
+/// Propagates metadata, I/O, decoding, window-limit and resource-limit errors.
+/// When called inside a request, its cancellation and deadline also apply.
 pub async fn load_dataset_stats(reader: &CogReader) -> AgResult<Option<DatasetStats>> {
     // 1) Embedded metadata path: tags on the full-res IFD. Scope the IFD
     //    borrow so it ends before the later `read_window` call.
@@ -345,6 +383,58 @@ mod tests {
         assert!((h.quantile(50.0) - 2.0).abs() < 1e-9);
         assert!((h.quantile(0.0) - 0.0).abs() < 1e-9);
         assert!((h.quantile(100.0) - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quantile_accumulates_public_counts_beyond_u64() {
+        let h = Histogram {
+            min: 0.0,
+            max: 4.0,
+            counts: vec![u64::MAX; 4],
+        };
+        for (percentile, expected) in [
+            (0.0, 0.0),
+            (25.0, 1.0),
+            (50.0, 2.0),
+            (75.0, 3.0),
+            (100.0, 4.0),
+        ] {
+            assert!((h.quantile(percentile) - expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn quantile_handles_embedded_counts_beyond_u64() {
+        let xml = r#"<GDALMetadata>
+<Item name="STATISTICS_MINIMUM" sample="0">0</Item>
+<Item name="STATISTICS_MAXIMUM" sample="0">1</Item>
+<Item name="STATISTICS_HISTOMIN" sample="0">0</Item>
+<Item name="STATISTICS_HISTOMAX" sample="0">1</Item>
+<Item name="STATISTICS_HISTONUMBINS" sample="0">2</Item>
+<Item name="STATISTICS_HISTOBINS" sample="0">18446744073709551615,1</Item>
+</GDALMetadata>"#;
+        let stats = parse_embedded_stats(Some(xml), None, None, 1).unwrap();
+        assert_eq!(stats.bands[0].hist.counts, vec![u64::MAX, 1]);
+        assert!((stats.bands[0].hist.quantile(50.0) - 0.25).abs() < 1e-9);
+        assert_eq!(stats.bands[0].hist.quantile(100.0), 1.0);
+    }
+
+    #[test]
+    fn quantile_upper_endpoint_keeps_small_counts_and_excludes_empty_tail() {
+        for counts in [
+            vec![u64::MAX, 1],
+            vec![1, u64::MAX],
+            vec![u64::MAX, 1, 0],
+            vec![1, u64::MAX, 0, 0],
+            vec![1, 1, 0],
+        ] {
+            let histogram = Histogram {
+                min: 0.0,
+                max: counts.len() as f64,
+                counts,
+            };
+            assert_eq!(histogram.quantile(100.0), 2.0);
+        }
     }
 
     #[test]

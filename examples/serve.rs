@@ -284,6 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_runtime_tuning(
         runtime.reader.max_decode_tasks,
         runtime.tiler.max_blocking_tasks,
+        runtime.reader.prefetch_ring,
         runtime.slow_tile_ms,
     )
     .with_request_tuning(

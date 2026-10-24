@@ -5,6 +5,7 @@ use crate::render::pipeline::CompiledTileStyle;
 use crate::warp::resampler::Resampling;
 use std::sync::{Arc, OnceLock};
 
+/// Supported square tile widths/heights in pixels.
 pub const ALLOWED_TILE_SIZES: [u32; 5] = [64, 128, 256, 512, 1024];
 
 /// Validated Raster Style 3.0. Change the JSON/Q3 document and parse again to edit.
@@ -36,17 +37,24 @@ impl Default for TileStyle {
 }
 
 impl TileStyle {
+    /// Requested output encoding, PNG by default.
     pub fn format(&self) -> TileFormat {
         self.format
     }
+    /// Square tile width/height in pixels, 256 by default.
     pub fn tilesize(&self) -> u32 {
         self.tilesize
     }
+    /// Kernel for the read/resize stage; reprojection can use a separate kernel.
     pub fn resampling(&self) -> Resampling {
         self.resampling
     }
 }
 
+/// Share a validated style's immutable plan with a standalone renderer.
+///
+/// Compilation performs no image reads or dataset statistics. The tile pipeline
+/// resolves dataset-dependent stretch settings when rendering through a Tiler.
 pub fn compile(style: &TileStyle) -> AgResult<CompiledTileStyle> {
     Ok(CompiledTileStyle {
         raster: style.raster.clone(),

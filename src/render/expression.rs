@@ -1,5 +1,5 @@
 //! Arithmetic band-math expression: parse `(b5-b4)/(b5+b4)` → RPN, eval per-pixel.
-//! Grammar is arithmetic-only: + - * /, unary minus, parens, float literals, b<N>.
+//! Grammar is arithmetic-only: + - * /, unary minus, parens, float literals, `b<N>`.
 //! Numbers are plain decimals (`2.5`, `0.5`); scientific notation (`1e3`) is not supported.
 
 use crate::error::{AgError, AgResult};
@@ -10,15 +10,27 @@ const MAX_EXPRESSION_TOKENS: usize = 256;
 /// RPN token. `Band(i)` is 0-indexed (source `b1` → `Band(0)`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
+    /// A numeric constant.
     Num(f64),
+    /// A zero-based source band index.
     Band(usize),
+    /// Add the two preceding operands.
     Add,
+    /// Subtract the right operand from the left operand.
     Sub,
+    /// Multiply the two preceding operands.
     Mul,
+    /// Divide the left operand by the right operand.
     Div,
+    /// Negate the preceding operand.
     Neg,
 }
 
+/// Parse arithmetic and one-based band references (`b1`, `b2`, …) into RPN.
+///
+/// Supports parentheses, unary minus and `+`, `-`, `*`, `/`. Invalid syntax,
+/// excessive nesting, more than 4096 input bytes or 256 lexical tokens returns
+/// [`AgError::Query`]. Band availability is checked separately by the caller.
 pub fn parse_expression(input: &str) -> AgResult<Vec<Token>> {
     if input.len() > MAX_EXPRESSION_BYTES {
         return Err(AgError::query("expression", "expression is too long"));

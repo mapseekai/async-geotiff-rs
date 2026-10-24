@@ -89,8 +89,10 @@ const MAX_PREFETCH_TASKS: usize = 2;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ReaderConfig {
-    /// Maximum IFDs and entries per IFD accepted before upstream allocations.
+    /// Maximum IFDs accepted before upstream allocations; defaults to 256.
     pub max_ifds: usize,
+    /// Maximum directory entries per IFD before upstream allocations;
+    /// defaults to 4096. A zero limit rejects nonempty directories.
     pub max_ifd_entries: u64,
     pub(crate) snapshot_size: Option<u64>,
 
@@ -118,6 +120,9 @@ pub struct ReaderConfig {
     pub max_concurrent_reads: usize,
     /// Optional shared foreground read limiter, e.g. across a mosaic pool.
     pub read_limiter: Option<Arc<tokio::sync::Semaphore>>,
+    /// Capacity of the reader's CPU limiter when `cpu_limiter` is `None`.
+    /// Defaults to available parallelism (four if unavailable), clamped to
+    /// `1..=tokio::sync::Semaphore::MAX_PERMITS`. Ignored for an injected limiter.
     pub max_decode_tasks: usize,
     /// Caller-supplied id for this logical source (same id ⇒ shared blocks).
     pub source_id: String,
@@ -125,8 +130,8 @@ pub struct ReaderConfig {
     pub block_cache: Arc<BlockCache>,
     /// Shared CPU-job limiter. When `None`, the reader builds its own sized to
     /// `max_decode_tasks`. Inject the same [`CpuLimiter`] into several readers
-    /// (and their [`Tiler`]s) to bound the whole process/mosaic to one CPU
-    /// budget — see [`crate::blocking::CpuLimiter`]. [`Tiler`]: crate::tiler::Tiler
+    /// (and their [`Tiler`](crate::tiler::Tiler)s) to bound the whole process/mosaic
+    /// to one CPU budget — see [`crate::blocking::CpuLimiter`].
     pub cpu_limiter: Option<CpuLimiter>,
     /// Speculative block prefetch radius, in native COG blocks. After each
     /// `read_window`, the blocks in a ring of this width around the window
@@ -171,6 +176,13 @@ impl ReaderConfig {
     }
 }
 
+/// Asynchronous window and point reader over an immutable TIFF pyramid.
+///
+/// Construct through [`Self::builder`] to configure snapshot verification,
+/// shared caches and resource limits. Level zero is full resolution; subsequent
+/// data levels are overviews. Independent mask IFDs do not count as data levels.
+/// Metadata reservations remain charged for this reader's lifetime, and decoded
+/// blocks may outlive it in a shared cache.
 pub struct CogReader {
     metadata_reservations: Arc<Vec<crate::resource::WorkReservation>>,
     prefetch_tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
@@ -203,7 +215,7 @@ pub struct CogReader {
     /// Shared decoded-block cache (may be shared across readers).
     block_cache: Arc<BlockCache>,
     /// Shared CPU-job limiter, covering decode + stitch here and warp + render
-    /// in the [`Tiler`] built from this reader. [`Tiler`]: crate::tiler::Tiler
+    /// in the [`Tiler`](crate::tiler::Tiler) built from this reader.
     cpu: CpuLimiter,
     /// Ring width (in blocks) for speculative neighbour prefetch; 0 = off.
     prefetch_ring: u8,
@@ -626,17 +638,20 @@ impl CogReader {
             .await
     }
 
-    /// The shared CPU-job limiter backing this reader. A [`Tiler`] built from
+    /// The shared CPU-job limiter backing this reader. A [`Tiler`](crate::tiler::Tiler) built from
     /// this reader reuses it so decode/stitch/warp/render all draw from one CPU
-    /// budget. [`Tiler`]: crate::tiler::Tiler
+    /// budget.
     pub fn cpu_limiter(&self) -> CpuLimiter {
         self.cpu.clone()
     }
 
+    /// Clone the shared byte allowance used for metadata and active read buffers.
+    /// The clone joins the same allowance; it does not create a new budget.
     pub fn work_budget(&self) -> crate::resource::WorkBudget {
         self.work_budget.clone()
     }
 
+    /// Native coordinate reference system parsed from the full-resolution IFD.
     pub fn src_crs(&self) -> &Crs {
         &self.src_crs
     }
@@ -645,14 +660,16 @@ impl CogReader {
         self.statistics_id
     }
 
+    /// Map full-resolution pixel-corner coordinates into the source CRS.
     pub fn transform(&self) -> GeoTransform {
         self.transform
     }
 
     /// Full-resolution image extent in WGS84 lon/lat as
     /// `[west, south, east, north]`. Densifies the raster boundary from the
-    /// source CRS (skipped when already 4326). Used by viewers to fly to
-    /// the dataset.
+    /// source CRS (skipped when already 4326). A projected footprint containing
+    /// a pole includes that latitude and the full `[-180, 180]` longitude range.
+    /// This envelope may include locations outside the actual raster footprint.
     pub fn wgs84_bounds(&self) -> AgResult<[f64; 4]> {
         let (w, h) = self.level_dimensions(0)?;
         let tr = self.transform;
@@ -667,14 +684,20 @@ impl CogReader {
         Ok([bounds.xmin, bounds.ymin, bounds.xmax, bounds.ymax])
     }
 
+    /// Number of reduced-resolution data levels, excluding full resolution and masks.
     pub fn overview_count(&self) -> usize {
         self.data_ifds.len().saturating_sub(1)
     }
 
+    /// Number of data levels, including full resolution at index zero and excluding masks.
     pub fn level_count(&self) -> usize {
         self.data_ifds.len()
     }
 
+    /// Return `(width, height)` in pixels for data `level` (zero is full resolution).
+    ///
+    /// # Errors
+    /// Returns [`AgError::Tiff`] when `level` is outside [`Self::level_count`].
     pub fn level_dimensions(&self, level: usize) -> AgResult<(u32, u32)> {
         let ifd = self.data_ifd(level)?;
         Ok((ifd.image_width(), ifd.image_height()))
@@ -691,6 +714,11 @@ impl CogReader {
         ))
     }
 
+    /// Map the chosen level's pixel corners into the source CRS, scaling the
+    /// full-resolution transform by the ratio of image dimensions on each axis.
+    ///
+    /// # Errors
+    /// Returns [`AgError::Tiff`] when `level` is outside [`Self::level_count`].
     pub fn level_transform(&self, level: usize) -> AgResult<GeoTransform> {
         let (full_w, full_h) = self.level_dimensions(0)?;
         let (level_w, level_h) = self.level_dimensions(level)?;
@@ -706,6 +734,11 @@ impl CogReader {
         Ok(x_res.max(y_res))
     }
 
+    /// Return the larger of the level's two pixel-axis lengths in source CRS units.
+    /// This includes rotation or shear and is not necessarily a distance in metres.
+    ///
+    /// # Errors
+    /// Returns [`AgError::Tiff`] when `level` is outside [`Self::level_count`].
     pub fn level_gsd(&self, level: usize) -> AgResult<f64> {
         match self
             .level_gsds
@@ -742,6 +775,12 @@ impl CogReader {
     /// the shared block cache (single-flight decode on a miss), and the decoded
     /// blocks are stitched into the requested window. Blocks are cached and may
     /// be shared across readers with the same `source_id`.
+    ///
+    /// Without an independent mask IFD, the first tagged Alpha band is removed
+    /// from the pixels and converted to a validity mask; other bands keep their
+    /// relative order. An independent mask takes precedence and preserves all
+    /// native bands, including Alpha. Windows must be nonempty and fully inside
+    /// the selected level. Configured window and working-memory limits also apply.
     #[tracing::instrument(skip(self), fields(level, width, height), err)]
     pub async fn read_window(
         &self,
@@ -865,7 +904,7 @@ impl CogReader {
         // windows are memcpy-bound and cost less than the spawn_blocking
         // dispatch itself, so small outputs stitch inline on the async thread.
         // Estimated stitched output footprint: planar data + 1-byte mask cells.
-        let alpha_idx = self.alpha_bands.get(level).copied().flatten();
+        let alpha_idx = self.promoted_alpha_band(level)?;
         let elem_bytes = data_blocks
             .first()
             .and_then(|b| b.array().data_type())
@@ -1027,6 +1066,15 @@ impl CogReader {
             .ifds()
             .get(idx)
             .ok_or(AgError::MissingGeo("overview IFD"))
+    }
+
+    // Keep point selection consistent with the band's actual removal during stitching.
+    pub(super) fn promoted_alpha_band(&self, level: usize) -> AgResult<Option<usize>> {
+        Ok(if self.mask_ifd(level)?.is_none() {
+            self.alpha_bands.get(level).copied().flatten()
+        } else {
+            None
+        })
     }
 
     fn data_ifd_index(&self, level: usize) -> AgResult<usize> {

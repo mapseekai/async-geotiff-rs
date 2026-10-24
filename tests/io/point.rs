@@ -3,9 +3,88 @@
 mod fixtures;
 
 use async_geotiff::{crs::Crs, io::CogReader};
-use fixtures::{u32_at, world_fixture};
+use fixtures::{alpha_fixture, u32_at, world_fixture};
 use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStoreExt};
 use std::sync::Arc;
+
+#[tokio::test]
+async fn point_selects_output_bands_after_alpha_promotion() {
+    for extra_samples in [&[][..], &[2], &[1, 0], &[0, 2]] {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &ObjectPath::from("alpha"),
+                alpha_fixture(extra_samples, false).into(),
+            )
+            .await
+            .unwrap();
+        let reader = CogReader::open_object_store(store, "alpha").await.unwrap();
+        let mut expected = vec![3.0, 7.0, 11.0];
+        expected.extend(
+            extra_samples
+                .iter()
+                .filter(|&&kind| kind == 0)
+                .map(|_| 41.0),
+        );
+        for col in 0..2 {
+            let value = reader
+                .point(col as f64 + 0.5, -0.5, reader.src_crs(), &[])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(value.values, expected, "ExtraSamples={extra_samples:?}");
+            assert_eq!(value.valid, col != 0 || extra_samples.is_empty());
+        }
+        let last = expected.len() as u32;
+        let value = reader
+            .point(1.5, -0.5, reader.src_crs(), &[last, 1, last])
+            .await
+            .unwrap()
+            .unwrap();
+        let last_value = expected[last as usize - 1];
+        assert_eq!(value.values, vec![last_value, expected[0], last_value]);
+        for bands in [&[0][..], &[last + 1]] {
+            // Invalid selection is rejected even for a point outside the raster.
+            assert!(reader
+                .point(-1.0, 1.0, reader.src_crs(), bands)
+                .await
+                .is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn point_preserves_alpha_when_independent_mask_takes_precedence() {
+    let store = Arc::new(InMemory::new());
+    store
+        .put(
+            &ObjectPath::from("masked"),
+            alpha_fixture(&[2], true).into(),
+        )
+        .await
+        .unwrap();
+    let reader = CogReader::open_object_store(store, "masked").await.unwrap();
+    for (col, alpha, valid) in [(0, 0.0, true), (1, 255.0, false)] {
+        let value = reader
+            .point(col as f64 + 0.5, -0.5, reader.src_crs(), &[])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.values, vec![3.0, 7.0, 11.0, alpha]);
+        assert_eq!(value.valid, valid);
+        let alpha_value = reader
+            .point(col as f64 + 0.5, -0.5, reader.src_crs(), &[4])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(alpha_value.values, vec![alpha]);
+        assert_eq!(alpha_value.valid, valid);
+    }
+    assert!(reader
+        .point(0.5, -0.5, reader.src_crs(), &[5])
+        .await
+        .is_err());
+}
 
 #[tokio::test]
 async fn point_masks_infinite_nodata() {

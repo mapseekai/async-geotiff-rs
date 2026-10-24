@@ -94,22 +94,31 @@ pub(crate) fn validate_window_shape(width: u64, height: u64) -> AgResult<()> {
     Ok(())
 }
 
-/// Plain-data view of the IFD attributes stitch needs. Extracted up front so
-/// `stitch_with_info` can run inside `spawn_blocking` without holding any
-/// `&ImageFileDirectory` borrow into `self`.
+/// Marker for IFD dimensions that have not been checked by [`IfdInfo::validate`].
 #[derive(Clone, Copy, Debug)]
 pub enum UncheckedIfdInfo {}
 
+/// Marker produced after checking that tile and image dimensions are nonzero.
 #[derive(Clone, Copy, Debug)]
 pub enum ValidatedIfdInfo {}
 
+/// Owned IFD layout needed for stitching without borrowing TIFF metadata.
+///
+/// [`Self::validate`] checks tile and image dimensions. It does not validate
+/// decoded array shapes, band counts or subsequent edits to these public fields.
 #[derive(Clone, Copy, Debug)]
 pub struct IfdInfo<State = UncheckedIfdInfo> {
+    /// Width of one internal tile in pixels.
     pub tile_width: u32,
+    /// Height of one internal tile in pixels.
     pub tile_height: u32,
+    /// Number of native sample bands, including extra samples.
     pub bands: usize,
+    /// Whether decoded samples are band-planar or pixel-interleaved.
     pub planar: PlanarConfiguration,
+    /// Width of the full image at this IFD's resolution, in pixels.
     pub image_width: u32,
+    /// Height of the full image at this IFD's resolution, in pixels.
     pub image_height: u32,
     _state: PhantomData<State>,
 }
@@ -129,6 +138,8 @@ impl From<&ImageFileDirectory> for IfdInfo<UncheckedIfdInfo> {
 }
 
 impl IfdInfo<UncheckedIfdInfo> {
+    /// Store the supplied tile dimensions, band layout and image dimensions
+    /// without validating or clamping them. Call [`Self::validate`] before stitching.
     pub fn from_parts(
         tile_width: u32,
         tile_height: u32,
@@ -148,6 +159,11 @@ impl IfdInfo<UncheckedIfdInfo> {
         }
     }
 
+    /// Check nonzero tile and image dimensions and return the checked marker.
+    /// Band counts and decoded array shapes are not checked here.
+    ///
+    /// # Errors
+    /// Returns [`AgError::Tiff`] if any tile or image dimension is zero.
     pub fn validate(self) -> AgResult<IfdInfo<ValidatedIfdInfo>> {
         if self.tile_width == 0 || self.tile_height == 0 {
             return Err(AgError::Tiff("IFD has zero tile dimensions".into()));
@@ -402,6 +418,14 @@ fn stitch_upcast_to_f32<A: Borrow<Array>>(
     Ok(PixelData::F32(out))
 }
 
+/// Stitch the first sample band of each mask tile into a `(height, width)`
+/// validity array, treating nonzero values as valid. `coords` supplies `(tx, ty)`
+/// for each matching array. The requested window uses IFD pixel coordinates;
+/// cells not covered by a supplied tile retain `true`.
+///
+/// # Errors
+/// Returns an error for zero or unrepresentable window dimensions, overflowing
+/// window endpoints, zero IFD dimensions or unsupported sample layout.
 pub fn stitch_mask<A: Borrow<Array>>(
     arrays: &[A],
     coords: &[(usize, usize)],

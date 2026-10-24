@@ -64,7 +64,9 @@ impl Drop for InflightGuard {
 /// Whether a block carries image data or an alpha/validity mask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlockKind {
+    /// Samples from a data IFD, including any native extra sample bands.
     Data,
+    /// Samples from an independent TIFF validity-mask IFD.
     Mask,
 }
 

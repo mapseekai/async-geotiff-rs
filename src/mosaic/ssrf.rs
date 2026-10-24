@@ -17,7 +17,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 
 use crate::error::{AgError, AgResult};
 
-/// Controls which HTTP(S) hosts a [`ReaderPool`](super::ReaderPool) will open,
+/// Controls which HTTP(S) hosts a mosaic's asset readers will open,
 /// to prevent SSRF via attacker-controlled mosaic asset URLs.
 ///
 /// The [`Default`] blocks the crown-jewel SSRF targets (loopback and
