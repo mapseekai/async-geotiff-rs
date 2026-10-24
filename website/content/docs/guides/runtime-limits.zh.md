@@ -47,6 +47,8 @@ weight: 40
 `..Default::default()`。`tile_with_options` 和单源 `warp_tile_with_options`
 接受含单次 timeout、`RequestCancellation` 的 `RequestOptions`。
 `cancel()` 返回 `AgError::Cancelled`；超时返回 `AgError::DeadlineExceeded`。
+到达或超过截止时间后才观察到的结果统一返回 `DeadlineExceeded`，即使底层操作
+已返回成功或传输错误。截止时间前观察到的传输错误保留原有错误。
 
 取消会停止后续阶段并丢弃待完成的 I/O，但不会抢占已执行的 CPU 指令，也不会强制
 终止远端处理。仍在运行的阻塞任务保留准入和内存计账，直至结束。直接打开 reader

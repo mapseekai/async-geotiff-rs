@@ -66,6 +66,9 @@ The default request timeout is 30 seconds, including I/O and permit waits.
 `RequestOptions` containing a per-call timeout and a cloneable
 `RequestCancellation`. Calling `cancel()` on any clone ends the request with
 `AgError::Cancelled`; expiration returns `AgError::DeadlineExceeded`.
+Results observed at or after the deadline return `DeadlineExceeded`, even if
+an underlying operation is ready with a result or transport error. Earlier
+transport failures retain their original error.
 
 Cancellation is cooperative. It stops later pipeline stages and drops pending
 I/O, but does not preempt an arbitrary running CPU instruction or remote server

@@ -40,6 +40,9 @@ a cancelled HTTP request. Increasing the HTTP settings also increases the
 effective library settings; no additional fixed 64-request admission cap or
 30-second total request deadline is retained. Transport connection/read
 timeouts remain independent. Excess requests return 503 and expired requests return 504.
+Once the request deadline is reached, it takes precedence over a ready response
+or transport error, including during the initial lazy dataset open. Transport
+errors observed before that deadline keep their existing status.
 
 Deadline, cancellation and overload classifications are preserved through
 mosaic asset opening and wrapped TIFF errors: they return 504, 408 and 503

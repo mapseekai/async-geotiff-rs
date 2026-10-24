@@ -89,7 +89,10 @@ impl RequestLimiter {
                 deadline,
                 CURRENT_REQUEST.scope(context.clone(), work(context.clone())),
             ) => {
-                result.map_err(|_| AgError::DeadlineExceeded)?
+                let result = result.map_err(|_| AgError::DeadlineExceeded)?;
+                // Tokio polls ready work before its timer, even after the deadline.
+                context.check()?;
+                result
             }
         }
     }
@@ -363,6 +366,60 @@ mod tests {
             .await;
         assert!(matches!(result, Err(AgError::DeadlineExceeded)));
         assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_work_before_deadline_preserves_result() {
+        for fail in [false, true] {
+            let limiter = RequestLimiter::new(1);
+            let result: AgResult<()> = limiter
+                .run(
+                    Duration::from_secs(60),
+                    &RequestOptions::default(),
+                    |_| async {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        if fail {
+                            Err(AgError::Tiff("transport timed out".into()))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .await;
+            if fail {
+                assert!(matches!(result, Err(AgError::Tiff(_))));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(limiter.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_work_after_deadline_returns_deadline_exceeded() {
+        for elapsed in [60, 61] {
+            for fail in [true, false] {
+                let limiter = RequestLimiter::new(1);
+                let options = RequestOptions::default();
+                let request = limiter.run(Duration::from_secs(60), &options, |_| async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    if fail {
+                        Err(AgError::Tiff("transport timed out".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+                tokio::pin!(request);
+                assert!(futures_util::poll!(&mut request).is_pending());
+                tokio::time::advance(Duration::from_secs(elapsed)).await;
+                let result = request.await;
+                assert!(
+                    matches!(result, Err(AgError::DeadlineExceeded)),
+                    "elapsed={elapsed}, fail={fail}: {result:?}"
+                );
+                assert_eq!(limiter.available_permits(), 1);
+            }
+        }
     }
 
     #[tokio::test]
