@@ -50,7 +50,7 @@ and/or [Mosaic 1.0.0](https://mapseekai.github.io/raster-style/extensions/raster
 Schema URLs. The former tile/mosaic short parameters are rejected.
 
 Encode literal `+` as `%2B` in raw Q3. Do not decode before concatenating query
-fragments. See the [styling guide](../../guides/styling/) for semantics and limits.
+fragments. See the [styling guide](/docs/guides/styling/) for semantics and limits.
 
 ## Responses {#responses}
 

@@ -63,7 +63,7 @@ Q3 example:
 In MapLibre, select mosaic under Source to configure stage and ranking.
 Asset locations remain server-bound; JSON/Q3 does not contain the asset list.
 Protocol mosaics require explicit configuration. Source Alpha bands remain
-unsupported and return a capability error. See the [styling guide](../styling/).
+unsupported and return a capability error. See the [styling guide](/docs/guides/styling/).
 
 ## Pixel selection {#selection}
 

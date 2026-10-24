@@ -1,12 +1,25 @@
 # async-geotiff
 
-[English](README.md) | 中文 | [文档站源码](website/)
+[English](https://github.com/mapseekai/async-geotiff-rs/blob/main/README.md) | 中文 | [文档站](https://async-geotiff-rs.pages.dev/zh/) | [API 文档](https://docs.rs/async-geotiff)
 
 一个纯 Rust 异步库，用于读取云端托管的 Cloud-Optimized GeoTIFF（COG），并以 XYZ 地图瓦片形式提供数据，支持 Raster Style 3.0 输入。
 
-**不依赖 GDAL。** 栅格 IO 使用 [`async-tiff`] 与 [`object_store`]；重投影使用可通过 feature 控制、依赖系统 `libproj` 的 [`proj`]；仿射计算使用 [`raffine`]；色带使用 [`colorous`]；重采样使用 [`fast_image_resize`]；PNG 编码使用 [`image`]。
+**不依赖 GDAL。** 栅格 IO 使用 [`async-tiff`](https://docs.rs/async-tiff) 与 [`object_store`](https://docs.rs/object_store)；重投影使用可通过 feature 控制、依赖系统 `libproj` 的 [`proj`](https://docs.rs/proj)；仿射计算使用 [`raffine`](https://docs.rs/raffine)；色带使用 [`colorous`](https://docs.rs/colorous)；重采样使用 [`fast_image_resize`](https://docs.rs/fast_image_resize)；PNG 编码使用 [`image`](https://docs.rs/image)。
 
 ## 快速开始
+
+在应用的 `Cargo.toml` 中添加：
+
+```toml
+[dependencies]
+async-geotiff = "0.13.0"
+```
+
+默认启用 mosaic 和依赖系统 `libproj` 的通用重投影。如不需要原生 PROJ，可使用
+`async-geotiff = { version = "0.13.0", default-features = false, features = ["mosaic"] }`。
+完整应用示例见[作为库使用](https://async-geotiff-rs.pages.dev/zh/docs/get-started/library-usage/)。
+
+以下命令从 Git 仓库运行示例服务。
 
 读取远程 COG：
 
@@ -44,7 +57,7 @@ curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=pse
 `from_raster_query` 和 `from_raster_style`。三个查看器默认生成 Q3。
 新格式必须声明 `version=3.0&type=...`，省略拉伸使用固定 `[0,255]`。
 HTTP 只接受完整 Q3；不支持的规范能力明确报错。
-详见[迁移指南与能力范围](website/content/docs/guides/styling.zh.md)。
+详见[迁移指南与能力范围](https://async-geotiff-rs.pages.dev/zh/docs/guides/styling/)。
 
 ## 波段计算
 
@@ -75,6 +88,17 @@ cargo run --example serve --features stac
 
 三个变量必须同时提供，且与 `ASYNC_GEOTIFF_MOSAIC` 互斥。它们只在进程启动时读取，HTTP 请求参数不能选择 STAC 地址、集合或资产字段。STAC 资产仍使用默认 HTTP 访问策略，并拒绝环回和 link-local 地址，避免 Demo 成为客户端可驱动的公网代理。
 
+STAC 按服务端顺序跟随同源 GET/POST 分页；限制单响应 1 MiB、累计响应 8 MiB、
+128 页及 8 MiB 资产元数据，超限返回错误，不输出不完整结果。资产数量使用
+`MosaicConfig::max_assets_per_tile`；设置为 0 只关闭数量上限。
+
+自定义认证、显式代理或 timeout 使用
+`StacSource::with_http_client_builder(api_url, builder, collections, asset_key)?`，
+传入尚未 `build()` 的 **reqwest 0.11** `ClientBuilder`。它保留配置，并替换重定向
+策略为最多十次同源跳转；跨源跳转在发送凭据前拒绝。旧 `with_http_client`
+入口返回错误，`with_client(stac_client::Client, ...)` 已弃用并在 discovery 时失败。
+迁移时将认证放入 builder 的默认 headers。
+
 ## 样式与迁移
 
 样式统一使用 Raster Style 3.0 JSON/Q3：
@@ -97,8 +121,8 @@ Mosaic 在同一个文档中声明 Mosaic 1.0.0 Schema，并增加 `raster:mosai
 PNG 和无损 WebP 可用于样式输出，后者需要 `webp` feature。
 未知字段、旧参数和暂未实现的能力均报错。
 
-完整字段、迁移映射和能力边界见[样式指南](website/content/docs/guides/styling.zh.md)；
-请求路径和编码见[瓦片 API](website/content/docs/reference/tile-api.zh.md)。
+完整字段、迁移映射和能力边界见[样式指南](https://async-geotiff-rs.pages.dev/zh/docs/guides/styling/)；
+请求路径和编码见[瓦片 API](https://async-geotiff-rs.pages.dev/zh/docs/reference/tile-api/)。
 
 ## 支持的 TileMatrixSet
 
@@ -173,10 +197,12 @@ CPU 密集型解码、拼接、重投影和渲染通过受信号量限制的 `sp
 
 ### 性能说明
 
-大型 COG 的首次／二次请求、浏览器视口和并发实测见 [与 TiTiler 的性能对比](docs/performance-comparison-titiler.md)。
+缓存调优见[生产运行](https://async-geotiff-rs.pages.dev/zh/docs/guides/production/)，
+可复现测量见[本地负载测量](https://async-geotiff-rs.pages.dev/zh/docs/guides/local-workload/)。
+历史机器上的分析报告和原始测量保留在 Git 历史中，不随当前源代码版本分发。
 
 - **缓存容量是最重要的调节项。** 512 MB 通常足够大型 RGB COG 的浏览视口；多数据集服务或大范围平移缩放可以使用 1024 MB。
-- **创建 COG 时优先使用 ZSTD。** 基准测试显示 ZSTD 块解码 P50 约 1.5 ms，DEFLATE 约 4.5 ms（约快 3 倍）；可使用 `gdal_translate -co COMPRESS=ZSTD -co ZSTD_LEVEL=1` 降低读取延迟。
+- **使用自己的影像比较 ZSTD 与 DEFLATE。** 压缩方式、块大小和存储延迟都会影响成本，应先测量有代表性的请求，再选择 COG 创建参数。
 - **`MAX_TILE_TASKS` 保持默认值**（`available_parallelism()`）。只有 profiling 证明默认值造成 CPU 争用时才覆盖它。
 - **并发 single-flight。** 多个请求同时访问同一个未缓存块时，只有第一个请求负责获取和解码，其余请求等待结果；如果所有者因客户端断开而取消，等待者会重新发起 claim，而不是收到 500。
 
@@ -207,4 +233,4 @@ let s = block_cache.stats(); // BlockCacheStats { hits, misses, decoded, fetched
 
 ## 许可证
 
-MIT OR Apache-2.0
+MIT，详见 [LICENSE-MIT](https://github.com/mapseekai/async-geotiff-rs/blob/main/LICENSE-MIT)。

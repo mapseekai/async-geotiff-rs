@@ -15,11 +15,13 @@ RSS. In-flight compressed bytes, decode and warp buffers, encoded responses,
 reader metadata, and mosaic reducer state are additional memory. In particular,
 `Median` retains every contributing image until reduction completes.
 
-The library does not enforce a global request-concurrency limit, so a hard RSS
-bound cannot be derived from cache capacity alone. Bound concurrent tile
-requests at the server or gateway, keep per-tile asset fan-out finite, and size
-the container from load tests that include the largest source windows and
-output tile sizes you permit.
+Default tile entrypoints share a `RequestLimiter` admitting 64 requests and a
+512 MiB `WorkBudget` for active work, separate from decoded-cache residency.
+Custom limiters and budgets can be injected. These accounting limits are not
+a hard RSS ceiling: keep per-tile asset fan-out and retained output buffers
+bounded, and size containers using representative load tests. See
+[runtime limits and source consistency](/docs/guides/runtime-limits/) for defaults,
+bounded memory-pressure retries, cancellation and pinned source snapshots.
 
 Use `BlockCache::stats()` to observe:
 

@@ -1,11 +1,33 @@
 [package]
 name = "async-geotiff"
-version = "0.12.0"
-publish = false
+version = "0.13.0"
+publish = ["crates-io"]
 edition = "2021"
 rust-version = "1.92"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 description = "Async COG → XYZ tile renderer (pure Rust, no GDAL)"
+repository = "https://github.com/mapseekai/async-geotiff-rs"
+homepage = "https://async-geotiff-rs.pages.dev/"
+documentation = "https://docs.rs/async-geotiff"
+readme = "README.md"
+keywords = ["geotiff", "cog", "raster", "tiles", "async"]
+categories = ["science::geo", "asynchronous", "multimedia::images"]
+include = [
+    "/src/**",
+    "/examples/**",
+    "/tests/**",
+    "/benches/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/README.zh-CN.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+]
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["mosaic", "stac", "webp", "jpeg", "perf-tracing"]
 
 [dependencies]
 raster-style     = "=0.4.0"

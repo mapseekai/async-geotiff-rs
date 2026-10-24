@@ -1,6 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="async-geotiff logo">
-  <rect width="64" height="64" rx="14" fill="#0f766e"/>
-  <path d="M15 15h34v34H15z" fill="none" stroke="#fff" stroke-width="3"/>
-  <path d="M15 26h34M15 38h34M26 15v34M38 15v34" stroke="#fff" stroke-width="2" opacity=".7"/>
-  <path d="M20 43l8-9 6 5 10-13 5 5v18H15z" fill="#99f6e4" opacity=".9"/>
+<svg width="288" height="288" viewBox="0 0 288 288" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g clip-path="url(#clip0_29_2)">
+<rect x="3" y="3" width="282" height="282" rx="63" fill="#EAF8EF" stroke="#46B96F" stroke-width="6"/>
+<path d="M172 133L205 165L172 133Z" fill="black"/>
+<path d="M172 133L205 165" stroke="url(#paint0_linear_29_2)" stroke-width="10" stroke-linecap="round"/>
+<path d="M143.829 25C190.363 25.0002 228 62.8743 228 109.961C228 127.362 223.209 143.399 214.655 157.729C214.654 157.732 214.652 157.734 214.65 157.736L192.938 136.726C198.056 128.327 201 118.501 201 108C201 77.0721 175.48 52 144 52C112.52 52 87 77.0721 87 108C87 138.928 112.52 164 144 164C156.025 164 167.18 160.341 176.376 154.095L199.655 176.623C199.966 176.924 200.289 177.204 200.622 177.464C191.672 188.806 181.707 200.05 172.57 211.981C159.91 228.701 149.646 248.832 143.829 263.163C137.67 245.761 125.352 227.336 110.297 207.205C87.7145 177.52 60.0002 147.152 60 109.961C60 62.8742 97.6377 25 143.829 25Z" fill="url(#paint1_linear_29_2)"/>
+<path d="M125 94C126.622 89.3714 130.135 86.5429 135 85" stroke="url(#paint2_linear_29_2)" stroke-width="5" stroke-linecap="round"/>
+<path d="M143.5 144C163.658 144 180 127.658 180 107.5C180 87.3416 163.658 71 143.5 71C123.342 71 107 87.3416 107 107.5C107 127.658 123.342 144 143.5 144Z" stroke="url(#paint3_linear_29_2)" stroke-width="10" stroke-linecap="round"/>
+</g>
+<defs>
+<linearGradient id="paint0_linear_29_2" x1="116.934" y1="72.2594" x2="211.27" y2="179.925" gradientUnits="userSpaceOnUse">
+<stop offset="0.95" stop-color="#3FB572"/>
+</linearGradient>
+<linearGradient id="paint1_linear_29_2" x1="74.7128" y1="26.3647" x2="214.422" y2="262.14" gradientUnits="userSpaceOnUse">
+<stop offset="1" stop-color="#3FB572"/>
+</linearGradient>
+<linearGradient id="paint2_linear_29_2" x1="119.054" y1="72.4" x2="194.631" y2="155.874" gradientUnits="userSpaceOnUse">
+<stop offset="1" stop-color="#3FB572"/>
+</linearGradient>
+<linearGradient id="paint3_linear_29_2" x1="113.833" y1="66.3251" x2="219.916" y2="177.803" gradientUnits="userSpaceOnUse">
+<stop offset="1" stop-color="#3FB572"/>
+</linearGradient>
+<clipPath id="clip0_29_2">
+<rect width="288" height="288" fill="white"/>
+</clipPath>
+</defs>
 </svg>

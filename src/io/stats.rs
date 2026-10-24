@@ -1,6 +1,5 @@
 //! Dataset band statistics: embedded `STATISTICS_*` tags (unverified precision) or a
-//! one-shot top-overview computation (estimated). See
-//! docs/superpowers/specs/2026-05-16-non-uint8-data-stretch-design.md.
+//! one-shot top-overview computation (estimated).
 
 use crate::error::AgResult;
 use crate::io::CogReader;
@@ -32,7 +31,7 @@ pub struct Histogram {
 impl Histogram {
     /// Value at percentile `p` (0..=100) via linear interpolation on the
     /// cumulative count. Robust to the overview-smoothing approximation
-    /// (see spec accuracy table). Empty / degenerate → `min`.
+    /// of a sampled overview. Empty / degenerate → `min`.
     /// Counts may sum beyond `u64::MAX`; accumulation uses `u128` and only
     /// the interpolation converts to f64. The 100th percentile is the upper
     /// edge of the last nonempty bin, excluding any trailing zero-count bins.

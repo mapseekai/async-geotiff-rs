@@ -1,8 +1,8 @@
-# Runtime limits and source consistency
-
-These contracts apply to the audit changes in the working tree. They introduce
-intentional compatibility changes: overload and malformed or mutable sources
-now produce errors instead of unbounded work, partial tiles, or mixed versions.
+---
+title: Runtime limits and source consistency
+description: Working memory, request admission, cancellation and pinned object snapshots.
+weight: 40
+---
 
 ## Active work and memory ownership
 
@@ -12,8 +12,10 @@ clone and inject the same budget through `ReaderConfig::work_budget`,
 `Tiler::with_work_budget`, and `MosaicTiler::builder(...).work_budget(...)`
 when these objects must share an application limit.
 
-Reservations fail immediately with `AgError::ResourceLimit`; they do not queue
-requests waiting for memory. `used_bytes()`, `peak_bytes()` and `limit_bytes()`
+Low-level reservations fail immediately with `AgError::ResourceLimit`. Public
+tile/warp/mosaic requests release the failed attempt, wait for exclusive
+admission, and retry once under the original deadline. Direct `CogReader` calls
+remain fail-fast; individually oversized requests still fail. `used_bytes()`, `peak_bytes()` and `limit_bytes()`
 expose the accounting. Cloned reservations stay live until their last owner is
 dropped, including an already-running blocking job after its caller cancels.
 Managed response buffers retain their byte reservation for the buffer lifetime.
@@ -142,10 +144,3 @@ snapshot, and uncached reads fail if the old version is no longer available.
 New reader/cache identities include the validator and size, preventing stale
 decoded blocks from being reused as new imagery.
 
-## Verification scope
-
-The fixtures cover known UInt8/UInt16 pixels, overviews, nodata, projected data,
-and one small Deflate stream. See [the workload procedure](load-audit.md) for
-latency/RSS measurement scope and [the verification ledger](audit-verification.md)
-for final test results. Synthetic local measurements do not establish production
-capacity or complete malformed-codec coverage.

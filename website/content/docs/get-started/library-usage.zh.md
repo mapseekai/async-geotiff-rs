@@ -4,24 +4,22 @@ description: 直接从 Rust 打开 COG 并渲染瓦片。
 weight: 30
 ---
 
-仓库当前设置了 `publish = false`，因此其他本地项目在开发期需要使用路径依赖。先在
-仓库旁创建应用；如果目录布局不同，请调整相对路径：
+在应用中添加 crates.io 依赖：
 
 ```bash
-# 从 async-geotiff-rs 检出目录开始：
-cd ..
 cargo new async-geotiff-demo
 cd async-geotiff-demo
 ```
 
 ```toml
 [dependencies]
-async-geotiff = { path = "../async-geotiff-rs" }
+async-geotiff = "0.13.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-如果要避免系统 `libproj`，同时保留示例服务使用的 mosaic API，可以在路径依赖上设置
+如果要避免系统 `libproj`，同时保留示例服务使用的 mosaic API，可以在依赖上设置
 `default-features = false, features = ["mosaic"]`；此时无法执行通用 CRS 转换。
+本地开发时可用 `path = "../async-geotiff-rs"` 替换版本号，并按检出位置调整路径。
 
 ## 渲染一张瓦片 {#render-one-tile}
 

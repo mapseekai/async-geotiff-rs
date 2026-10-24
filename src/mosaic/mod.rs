@@ -1,5 +1,4 @@
-//! Multi-source pixel-level mosaic. See
-//! `docs/superpowers/specs/2026-05-18-mosaic-design.md`.
+//! Multi-source pixel-level mosaics with bounded asset discovery and reduction.
 
 pub(crate) mod mosaicjson;
 pub(crate) mod quadkey;

@@ -176,7 +176,7 @@ sources. Gamma, colormaps, and opacity apply once after merging. The source
 Alpha limitation still applies.
 
 Assets remain outside the style, supplied by MosaicJSON, STAC, or a custom
-MosaicSource. See the [mosaic guide](../mosaics/) for configuration and limits.
+MosaicSource. See the [mosaic guide](/docs/guides/mosaics/) for configuration and limits.
 
 ## Migration
 

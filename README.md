@@ -1,17 +1,19 @@
 # async-geotiff
 
-[中文文档](README.zh-CN.md) | English | [Documentation site source](website/)
+[中文文档](https://github.com/mapseekai/async-geotiff-rs/blob/main/README.zh-CN.md) | English | [Documentation](https://async-geotiff-rs.pages.dev/) | [API reference](https://docs.rs/async-geotiff)
 
 Pure-Rust async crate that reads cloud-hosted Cloud-Optimized GeoTIFFs (COGs)
 and serves them as XYZ map tiles with Raster Style 3.0 inputs.
 
-**No GDAL.** All raster IO goes through [`async-tiff`] + [`object_store`].
-Reprojection through [`proj`] (libproj system dep, feature-gated). Affine math
-through [`raffine`] (the author's own Rust port of Python's `affine`).
-Colormaps via [`colorous`]. Resampling via
-[`fast_image_resize`]. PNG encoding via [`image`].
+**No GDAL.** All raster IO goes through [`async-tiff`](https://docs.rs/async-tiff) + [`object_store`](https://docs.rs/object_store).
+Reprojection through [`proj`](https://docs.rs/proj) (libproj system dep, feature-gated). Affine math
+through [`raffine`](https://docs.rs/raffine) (the author's own Rust port of Python's `affine`).
+Colormaps via [`colorous`](https://docs.rs/colorous). Resampling via
+[`fast_image_resize`](https://docs.rs/fast_image_resize). PNG encoding via [`image`](https://docs.rs/image).
 
 ## Quick start
+
+Run these example-server commands from a Git checkout.
 
 ```bash
 cargo run --release --example serve -- https://example.com/cog.tif
@@ -40,7 +42,7 @@ Uses `raster-style = "=0.4.0"`. Rust entrypoints are `TileStyle::from_json`,
 `from_raster_query`, and `from_raster_style`; all three viewers default to Q3.
 New inputs declare `version=3.0&type=...`; omitted stretch uses fixed `[0,255]`.
 HTTP accepts complete Q3 documents only. Unsupported protocol capabilities fail explicitly.
-See the [migration guide and supported subset](website/content/docs/guides/styling.md).
+See the [migration guide and supported subset](https://async-geotiff-rs.pages.dev/docs/guides/styling/).
 
 ## Band math expressions
 
@@ -54,6 +56,17 @@ curl 'http://127.0.0.1:8080/tiles/WebMercatorQuad/0/0/0.png?version=3.0&type=gra
 ```
 
 ## Library usage
+
+```toml
+[dependencies]
+async-geotiff = "0.13.0"
+```
+
+Default features enable mosaics and general reprojection through system
+`libproj`. For a build without native PROJ, use
+`async-geotiff = { version = "0.13.0", default-features = false, features = ["mosaic"] }`.
+See the [library guide](https://async-geotiff-rs.pages.dev/docs/get-started/library-usage/)
+for a complete application, point queries and source consistency.
 
 HTTP serving lives only in `examples/serve.rs`; the library itself does not
 require axum. Downstream applications can use `CogReader`, `Tiler`, or
@@ -125,8 +138,8 @@ provide a linear range for high-bit-depth data. Styles support PNG and lossless
 WebP (with the `webp` feature). Unknown fields, old parameters, and unimplemented
 capabilities return errors.
 
-See the [styling guide](website/content/docs/guides/styling.md) for fields,
-migration, and capabilities, and [tile API](website/content/docs/reference/tile-api.md)
+See the [styling guide](https://async-geotiff-rs.pages.dev/docs/guides/styling/) for fields,
+migration, and capabilities, and [tile API](https://async-geotiff-rs.pages.dev/docs/reference/tile-api/)
 for request paths and encoding.
 
 ## Supported TileMatrixSets
@@ -216,14 +229,17 @@ this automatically via its `ReaderPool`.
 
 ### Performance notes
 
-See the [large-COG performance comparison with TiTiler](docs/performance-comparison-titiler.md) (Chinese) for cold/warm requests, browser viewport loading, and concurrent batches.
+See [production operation](https://async-geotiff-rs.pages.dev/docs/guides/production/)
+for cache sizing and the [local workload guide](https://async-geotiff-rs.pages.dev/docs/guides/local-workload/)
+for reproducible measurements. Historical machine-specific benchmark reports
+are retained in Git history rather than shipped with the source release.
 
 - **Cache capacity is the strongest lever.** 512 MB holds a typical browsing
   viewport for large RGB COGs; use 1024 MB for multi-dataset servers or wide
   pan/zoom sessions.
-- **Prefer ZSTD over DEFLATE when creating COGs.** Benchmarks showed ZSTD
-  block decode at ~1.5 ms P50 vs ~4.5 ms P50 for DEFLATE (≈3× faster). Use
-  `gdal_translate -co COMPRESS=ZSTD -co ZSTD_LEVEL=1` for lowest read latency.
+- **Compare ZSTD and DEFLATE with your imagery.** Compression, tile size and
+  storage latency affect decode cost; measure representative requests before
+  choosing a COG creation profile.
 - **`MAX_TILE_TASKS` should stay at its default (`available_parallelism()`).** Pinning
   it lower inflates warp/encode P95 at high concurrency via scheduling queuing.
   Only override after profiling confirms CPU contention at the default level.
@@ -267,4 +283,4 @@ and record OTel histograms/counters there.
 
 ## License
 
-MIT OR Apache-2.0
+MIT; see [LICENSE-MIT](https://github.com/mapseekai/async-geotiff-rs/blob/main/LICENSE-MIT).

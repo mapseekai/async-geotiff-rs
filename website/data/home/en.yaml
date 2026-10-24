@@ -2,7 +2,7 @@ sections: [hero, cards, cta]
 
 hero:
   align: center
-  eyebrow: Pure-Rust geospatial infrastructure
+  eyebrow: async-geotiff 0.13 · Raster Style 3.0
   title_lines:
     - words: [{ text: Cloud-native rasters. }]
     - words: [{ text: Fast XYZ tiles. }]
@@ -10,6 +10,7 @@ hero:
   actions:
     - { label: Get started, url: docs/get-started/, icon: fa-solid fa-rocket, style: primary }
     - { label: View on GitHub, url: 'https://github.com/mapseekai/async-geotiff-rs', icon: fa-brands fa-github, style: ghost }
+    - { label: API reference, url: 'https://docs.rs/async-geotiff', icon: fa-solid fa-code, style: ghost }
 
 cards:
   eyebrow: From bytes to map tiles

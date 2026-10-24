@@ -44,7 +44,7 @@ params:
   copyright:
     authors: async-geotiff contributors
     from_year: 2026
-  footer_center_info: Pure Rust · No GDAL · Apache-2.0 OR MIT
+  footer_center_info: Pure Rust · No GDAL · MIT
   github_repo: https://github.com/mapseekai/async-geotiff-rs
   github_branch: main
   logo: icons/logo.svg
